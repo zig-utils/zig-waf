@@ -103,6 +103,14 @@ identified non-head member is rejected. Removed rules remain in immutable
 source/evidence storage with their responsible directive ID, but chain heads
 are removed from phase execution indexes before publication.
 
+`SecRuleRemoveByTag` and `SecRuleRemoveByMsg` patterns compile once per
+directive with `zig-regex` and are applied to explicit rule metadata while the
+candidate is built. Invalid patterns fail as `WAF-PLAN-0112`. This preserves
+ModSecurity's regex selector capability; Coraza's narrower case-sensitive
+equality behavior remains a supported subset. Compiled removal matchers are
+released before publication because the effective plan and removal evidence
+contain all request-path state.
+
 Allocation and configured capacity failures remain distinct typed errors.
 
 ## Resource limits and verification

@@ -3,6 +3,7 @@
 const std = @import("std");
 const seclang = @import("seclang/root.zig");
 const rule_config = @import("rule_config.zig");
+const regex = @import("regex");
 
 pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
@@ -545,11 +546,15 @@ const Failure = struct {
     secondary: ?seclang.source.Span = null,
 };
 
-const IdRuleRemoval = struct {
+const RuleRemovalSelector = enum { id, tag, message };
+
+const RuleRemovalOperation = struct {
     directive: DirectiveId,
     source: seclang.source.Span,
+    selector: RuleRemovalSelector,
     intervals_start: u32,
     intervals_count: u32,
+    pattern: ?StringId,
 };
 
 const Compiler = struct {
@@ -572,7 +577,7 @@ const Compiler = struct {
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
-    id_rule_removals: std.ArrayList(IdRuleRemoval) = .empty,
+    rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
     rule_removals: std.ArrayList(RuleRemoval) = .empty,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
@@ -602,7 +607,7 @@ const Compiler = struct {
         self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.id_intervals.deinit(self.allocator);
-        self.id_rule_removals.deinit(self.allocator);
+        self.rule_removal_operations.deinit(self.allocator);
         self.rule_removals.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
@@ -669,8 +674,13 @@ const Compiler = struct {
                 if (self.generic_directives.items.len == self.limits.max_generic_directives)
                     return error.TooManyGenericDirectives;
                 try self.generic_directives.append(self.allocator, directive_id);
-                if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleRemoveById"))
+                if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleRemoveById")) {
                     try self.addIdRuleRemoval(directive_id, directive);
+                } else if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleRemoveByTag")) {
+                    try self.addRegexRuleRemoval(directive_id, directive, .tag);
+                } else if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleRemoveByMsg")) {
+                    try self.addRegexRuleRemoval(directive_id, directive, .message);
+                }
             },
             else => {},
         }
@@ -687,7 +697,7 @@ const Compiler = struct {
     }
 
     fn addIdRuleRemoval(self: *Compiler, directive_id: DirectiveId, directive: seclang.parser.Directive) CompileError!void {
-        if (self.id_rule_removals.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
+        if (self.rule_removal_operations.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
         if (self.id_intervals.items.len == self.limits.max_id_intervals) return error.TooManyIdIntervals;
         var fragments: std.ArrayList([]const u8) = .empty;
         defer fragments.deinit(self.allocator);
@@ -711,11 +721,35 @@ const Compiler = struct {
             return error.TooManyIdIntervals;
         const start = try typedIndex(self.id_intervals.items.len);
         try self.id_intervals.appendSlice(self.allocator, selector.intervals);
-        try self.id_rule_removals.append(self.allocator, .{
+        try self.rule_removal_operations.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
+            .selector = .id,
             .intervals_start = start,
             .intervals_count = try typedIndex(selector.intervals.len),
+            .pattern = null,
+        });
+    }
+
+    fn addRegexRuleRemoval(
+        self: *Compiler,
+        directive_id: DirectiveId,
+        directive: seclang.parser.Directive,
+        selector: RuleRemovalSelector,
+    ) CompileError!void {
+        if (self.rule_removal_operations.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
+        // Preserve malformed arity for WAF-DIRECTIVE validation, as with ID
+        // selectors. A valid remove-by-tag/message directive has one pattern.
+        if (directive.arguments.len != 1) return;
+        const pattern = directive.arguments[0].content();
+        if (pattern.len == 0) return;
+        try self.rule_removal_operations.append(self.allocator, .{
+            .directive = directive_id,
+            .source = directive.physical,
+            .selector = selector,
+            .intervals_start = 0,
+            .intervals_count = 0,
+            .pattern = try self.interner.intern(pattern),
         });
     }
 
@@ -991,12 +1025,26 @@ const Compiler = struct {
         }
     }
 
-    fn applyIdRuleRemovals(self: *Compiler) CompileError!void {
-        for (self.id_rule_removals.items) |removal| {
+    fn applyRuleRemovals(self: *Compiler) CompileError!void {
+        for (self.rule_removal_operations.items) |removal| {
             const intervals = self.id_intervals.items[removal.intervals_start..][0..removal.intervals_count];
+            var compiled_pattern: ?regex.Regex = if (removal.pattern) |pattern|
+                regex.Regex.compile(self.allocator, self.interner.values.items[@backingInt(pattern)]) catch
+                    return self.fail(error.InvalidRuleSelector, removal.source, null)
+            else
+                null;
+            defer if (compiled_pattern) |*value| value.deinit();
+            var matcher = if (compiled_pattern) |*value| value.matcher() else null;
+            defer if (matcher) |*value| value.deinit();
             for (self.rules.items, 0..) |rule, rule_index| {
-                const external_id = rule.external_id orelse continue;
-                if (!matchesIntervals(intervals, external_id)) continue;
+                const selected = switch (removal.selector) {
+                    .id => if (rule.external_id) |external_id| matchesIntervals(intervals, external_id) else false,
+                    .tag => self.ruleActionMatches(rule, "tag", &matcher.?) catch
+                        return self.fail(error.InvalidRuleSelector, removal.source, null),
+                    .message => self.ruleActionMatches(rule, "msg", &matcher.?) catch
+                        return self.fail(error.InvalidRuleSelector, removal.source, null),
+                };
+                if (!selected) continue;
                 if (rule.chain_position != 0)
                     return self.fail(error.PartialChainSelection, removal.source, rule.source);
                 const head: RuleId = @fromBackingInt(@as(u32, @intCast(rule_index)));
@@ -1005,9 +1053,9 @@ const Compiler = struct {
                 try self.rule_removals.append(self.allocator, .{ .directive = removal.directive, .chain_head = head });
                 var member: ?RuleId = head;
                 while (member) |id| {
-                    const selected = &self.rules.items[@backingInt(id)];
-                    selected.removed_by = removal.directive;
-                    member = selected.chain_next;
+                    const selected_rule = &self.rules.items[@backingInt(id)];
+                    selected_rule.removed_by = removal.directive;
+                    member = selected_rule.chain_next;
                 }
             }
         }
@@ -1022,8 +1070,27 @@ const Compiler = struct {
         }
     }
 
+    fn ruleActionMatches(
+        self: *Compiler,
+        rule: Rule,
+        action_name: []const u8,
+        matcher: *regex.Regex.Matcher,
+    ) CompileError!bool {
+        const actions = self.actions.items[rule.actions_start..][0..rule.actions_count];
+        for (actions) |action| {
+            if (!std.ascii.eqlIgnoreCase(self.interner.values.items[@backingInt(action.name)], action_name)) continue;
+            const value = action.value orelse continue;
+            if (matcher.isMatch(unquote(self.interner.values.items[@backingInt(value)])) catch
+                return error.InvalidRuleSelector)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
-        try self.applyIdRuleRemovals();
+        try self.applyRuleRemovals();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
         plan.* = undefined;
@@ -1756,6 +1823,51 @@ test "remove by id rejects partial chain selection with related rule span" {
             try std.testing.expectEqual(parsed.document.directives.items[2].physical, value.primary);
             try std.testing.expectEqual(parsed.document.directives.items[1].physical, value.secondary.?);
         },
+    }
+}
+
+test "remove by tag and message compile zig-regex selectors once per operation" {
+    const input =
+        \\SecRule ARGS @rx "id:1,tag:'attack-dos',msg:'Directory Listing'"
+        \\SecRule ARGS @rx "id:2,tag:'protocol-violation',msg:'Bad framing'"
+        \\SecRule ARGS @rx "id:3,tag:'attack-sqli',msg:'Possible SQL injection'"
+        \\SecRuleRemoveByTag "^attack-dos$"
+        \\SecRuleRemoveByMsg "SQL injection"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "remove-regex.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqualSlices(RuleId, &.{@as(RuleId, @fromBackingInt(1))}, compiled.phaseRules(2));
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(3)), compiled.rules[0].removed_by);
+    try std.testing.expectEqual(@as(?DirectiveId, null), compiled.rules[1].removed_by);
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(4)), compiled.rules[2].removed_by);
+    try std.testing.expectEqualSlices(RuleRemoval, &.{
+        .{ .directive = @fromBackingInt(3), .chain_head = @fromBackingInt(0) },
+        .{ .directive = @fromBackingInt(4), .chain_head = @fromBackingInt(2) },
+    }, compiled.rule_removals);
+}
+
+test "invalid tag and message regexes produce stable plan diagnostics" {
+    const cases = [_][]const u8{
+        "SecRuleRemoveByTag [",
+        "SecRuleRemoveByMsg (",
+    };
+    for (cases) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-removal-regex.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |value| {
+                try std.testing.expectEqual(DiagnosticCode.invalid_rule_selector, value.code);
+                try std.testing.expectEqualStrings("WAF-PLAN-0112", value.code.id());
+            },
+        }
     }
 }
 
