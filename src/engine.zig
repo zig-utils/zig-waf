@@ -451,6 +451,7 @@ pub const TransactionError = error{
     MacroOutputTooLarge,
     MissingCompiledPlan,
     InvalidRuleReference,
+    InvalidRuleChain,
     InvalidMatchContext,
     TooManyCaptures,
     InvalidEnvironmentName,
@@ -491,6 +492,11 @@ pub const MatchContext = struct {
     value: []const u8,
     source: collections.Source,
     captures: []const ?CaptureRange = &.{},
+};
+
+pub const MatchedRule = struct {
+    rule: compiled_plan.RuleId,
+    context: MatchContext,
 };
 
 pub const RuleProjection = struct {
@@ -822,23 +828,40 @@ pub const Transaction = struct {
         return self.applyMatchedRuleMode(rule_id, context, true);
     }
 
+    /// Apply a fully matched chain as one ordered, atomic effect batch. The
+    /// first entry must be the chain head and every compiled `chain_next`
+    /// member must appear exactly once in order.
+    pub fn applyMatchedChain(
+        self: *Transaction,
+        matches: []const MatchedRule,
+    ) TransactionError!LocalEffectOutcome {
+        return self.applyMatchedRules(matches, true);
+    }
+
     fn applyMatchedRuleMode(
         self: *Transaction,
         rule_id: compiled_plan.RuleId,
         context: MatchContext,
         include_persistent: bool,
     ) TransactionError!LocalEffectOutcome {
+        const matches = [_]MatchedRule{.{ .rule = rule_id, .context = context }};
+        return self.applyMatchedRules(&matches, include_persistent);
+    }
+
+    fn applyMatchedRules(
+        self: *Transaction,
+        matches: []const MatchedRule,
+        include_persistent: bool,
+    ) TransactionError!LocalEffectOutcome {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
-        try self.validateMatchContext(context);
         const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
+        try self.validateMatchedChain(plan, matches);
+        const rule_id = matches[0].rule;
+        const context = matches[matches.len - 1].context;
         const rule_index: usize = @backingInt(rule_id);
-        if (rule_index >= plan.rules.len) return error.InvalidRuleReference;
         const selected = plan.rules[rule_index];
         const head_index: usize = @backingInt(selected.chain_head);
-        if (head_index >= plan.rules.len) return error.InvalidRuleReference;
         const head = plan.rules[head_index];
-        if (selected.effects_start + selected.effects_count > plan.nondisruptive_effects.len)
-            return error.InvalidRuleReference;
 
         var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
         defer batch.deinit();
@@ -866,161 +889,166 @@ pub const Transaction = struct {
             .pending_persistent_effects = 0,
         };
         const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
-        for (plan.nondisruptive_effects[selected.effects_start..][0..selected.effects_count]) |effect| {
-            switch (effect.kind) {
-                .capture => {
-                    result.captures_written = try self.stageCaptures(&batch, context);
-                    result.effects_applied += 1;
-                },
-                .log => {
-                    result.log = true;
-                    result.effects_applied += 1;
-                },
-                .nolog => {
-                    result.log = false;
-                    result.effects_applied += 1;
-                },
-                .auditlog => {
-                    result.audit_log = true;
-                    result.effects_applied += 1;
-                },
-                .noauditlog => {
-                    result.audit_log = false;
-                    result.effects_applied += 1;
-                },
-                .setenv => {
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    errdefer self.waf.allocator.free(name);
-                    if (!validEnvironmentName(name)) return error.InvalidEnvironmentName;
-                    const value = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    errdefer self.waf.allocator.free(value);
-                    try batch.putOwned(.env, name, value, source);
-                    result.effects_applied += 1;
-                },
-                .setvar => {
-                    const configured_collection = effect.collection orelse return error.InvalidRuleReference;
-                    if (configured_collection.persistent() and !include_persistent) {
-                        result.pending_persistent_effects += 1;
-                        continue;
-                    }
-                    const collection_name = effectCollectionName(configured_collection);
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    errdefer self.waf.allocator.free(name);
-                    if (name.len == 0) return error.InvalidActionValue;
-                    const operation = effect.operation orelse return error.InvalidRuleReference;
-                    const expanded_operand = if (effect.value) |value|
-                        try self.expandEffectTextStaged(value, &batch, &scalar_batch, plan)
-                    else
-                        null;
-                    defer if (expanded_operand) |value| self.waf.allocator.free(value);
-                    const next = try self.evaluateSetVar(&batch, collection_name, name, operation, expanded_operand);
-                    errdefer if (next) |value| self.waf.allocator.free(value);
-                    if (configured_collection.persistent()) {
-                        const namespace = persistentNamespace(configured_collection).?;
-                        if (!self.persistentNamespaceFailedOpen(namespace)) {
-                            try self.stagePersistentSetVar(namespace, name, operation, expanded_operand);
+        for (matches) |matched| {
+            const member = plan.rules[@backingInt(matched.rule)];
+            if (member.effects_start + member.effects_count > plan.nondisruptive_effects.len)
+                return error.InvalidRuleReference;
+            for (plan.nondisruptive_effects[member.effects_start..][0..member.effects_count]) |effect| {
+                switch (effect.kind) {
+                    .capture => {
+                        result.captures_written = try self.stageCaptures(&batch, matched.context);
+                        result.effects_applied += 1;
+                    },
+                    .log => {
+                        result.log = true;
+                        result.effects_applied += 1;
+                    },
+                    .nolog => {
+                        result.log = false;
+                        result.effects_applied += 1;
+                    },
+                    .auditlog => {
+                        result.audit_log = true;
+                        result.effects_applied += 1;
+                    },
+                    .noauditlog => {
+                        result.audit_log = false;
+                        result.effects_applied += 1;
+                    },
+                    .setenv => {
+                        const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(name);
+                        if (!validEnvironmentName(name)) return error.InvalidEnvironmentName;
+                        const value = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(value);
+                        try batch.putOwned(.env, name, value, source);
+                        result.effects_applied += 1;
+                    },
+                    .setvar => {
+                        const configured_collection = effect.collection orelse return error.InvalidRuleReference;
+                        if (configured_collection.persistent() and !include_persistent) {
+                            result.pending_persistent_effects += 1;
+                            continue;
+                        }
+                        const collection_name = effectCollectionName(configured_collection);
+                        const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(name);
+                        if (name.len == 0) return error.InvalidActionValue;
+                        const operation = effect.operation orelse return error.InvalidRuleReference;
+                        const expanded_operand = if (effect.value) |value|
+                            try self.expandEffectTextStaged(value, &batch, &scalar_batch, plan)
+                        else
+                            null;
+                        defer if (expanded_operand) |value| self.waf.allocator.free(value);
+                        const next = try self.evaluateSetVar(&batch, collection_name, name, operation, expanded_operand);
+                        errdefer if (next) |value| self.waf.allocator.free(value);
+                        if (configured_collection.persistent()) {
+                            const namespace = persistentNamespace(configured_collection).?;
+                            if (!self.persistentNamespaceFailedOpen(namespace)) {
+                                try self.stagePersistentSetVar(namespace, name, operation, expanded_operand);
+                                try batch.putOwned(collection_name, name, next, source);
+                            } else {
+                                self.waf.allocator.free(name);
+                                if (next) |value| self.waf.allocator.free(value);
+                            }
+                        } else {
+                            try batch.putOwned(.tx, name, next, source);
+                        }
+                        result.effects_applied += 1;
+                    },
+                    .initcol => {
+                        if (!include_persistent) {
+                            result.pending_persistent_effects += 1;
+                            continue;
+                        }
+                        const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                            return error.InvalidRuleReference;
+                        const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        defer self.waf.allocator.free(key);
+                        if (key.len == 0) return error.InvalidActionValue;
+                        _ = try self.initializePersistentStaged(&batch, namespace, key);
+                        result.effects_applied += 1;
+                    },
+                    .setuid, .setsid, .setrsc => {
+                        if (!include_persistent) {
+                            result.pending_persistent_effects += 1;
+                            continue;
+                        }
+                        const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                            return error.InvalidRuleReference;
+                        const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(key);
+                        if (key.len == 0) return error.InvalidActionValue;
+                        _ = try self.initializePersistentStaged(&batch, namespace, key);
+                        try scalar_batch.putOwned(bindingScalar(namespace), key, .rule, .request_headers);
+                        result.effects_applied += 1;
+                    },
+                    .expirevar => {
+                        if (!include_persistent) {
+                            result.pending_persistent_effects += 1;
+                            continue;
+                        }
+                        const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                            return error.InvalidRuleReference;
+                        if (self.persistentNamespaceFailedOpen(namespace)) {
+                            result.effects_applied += 1;
+                            continue;
+                        }
+                        const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        defer self.waf.allocator.free(name);
+                        const seconds_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        defer self.waf.allocator.free(seconds_text);
+                        const seconds = action_config.parsePositiveU32(seconds_text) catch return error.InvalidActionValue;
+                        try self.stagePersistentExpiry(namespace, name, seconds);
+                        result.effects_applied += 1;
+                    },
+                    .deprecatevar => {
+                        if (!include_persistent) {
+                            result.pending_persistent_effects += 1;
+                            continue;
+                        }
+                        const configured_collection = effect.collection orelse return error.InvalidRuleReference;
+                        const namespace = persistentNamespace(configured_collection) orelse return error.InvalidRuleReference;
+                        if (self.persistentNamespaceFailedOpen(namespace)) {
+                            result.effects_applied += 1;
+                            continue;
+                        }
+                        const collection_name = effectCollectionName(configured_collection);
+                        const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(name);
+                        if (name.len == 0) return error.InvalidActionValue;
+                        const amount_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        defer self.waf.allocator.free(amount_text);
+                        const period_text = try self.expandEffectTextStaged(effect.auxiliary orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        defer self.waf.allocator.free(period_text);
+                        const amount = action_config.parsePositiveU32(amount_text) catch return error.InvalidActionValue;
+                        const period_seconds = action_config.parsePositiveU32(period_text) catch return error.InvalidActionValue;
+                        const current_text: ?[]const u8 = switch (batch.lookup(collection_name, name)) {
+                            .value => |value| value,
+                            .removed => null,
+                            .missing => if (self.collection_variables.first(collection_name, name)) |value| value.value else null,
+                        };
+                        const period_ns = std.math.mul(i64, @as(i64, period_seconds), std.time.ns_per_s) catch
+                            return error.PersistentTimestampOverflow;
+                        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+                        const deprecation = try session.deprecate(
+                            namespace,
+                            name,
+                            if (current_text) |value| persistent.parseNumericOrZero(value) else null,
+                            amount,
+                            period_ns,
+                            try self.persistentNow(),
+                        );
+                        if (deprecation) |applied| {
+                            const next = try std.fmt.allocPrint(self.waf.allocator, "{d}", .{applied.value});
+                            errdefer self.waf.allocator.free(next);
                             try batch.putOwned(collection_name, name, next, source);
                         } else {
                             self.waf.allocator.free(name);
-                            if (next) |value| self.waf.allocator.free(value);
                         }
-                    } else {
-                        try batch.putOwned(.tx, name, next, source);
-                    }
-                    result.effects_applied += 1;
-                },
-                .initcol => {
-                    if (!include_persistent) {
-                        result.pending_persistent_effects += 1;
-                        continue;
-                    }
-                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
-                        return error.InvalidRuleReference;
-                    const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    defer self.waf.allocator.free(key);
-                    if (key.len == 0) return error.InvalidActionValue;
-                    _ = try self.initializePersistentStaged(&batch, namespace, key);
-                    result.effects_applied += 1;
-                },
-                .setuid, .setsid, .setrsc => {
-                    if (!include_persistent) {
-                        result.pending_persistent_effects += 1;
-                        continue;
-                    }
-                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
-                        return error.InvalidRuleReference;
-                    const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    errdefer self.waf.allocator.free(key);
-                    if (key.len == 0) return error.InvalidActionValue;
-                    _ = try self.initializePersistentStaged(&batch, namespace, key);
-                    try scalar_batch.putOwned(bindingScalar(namespace), key, .rule, .request_headers);
-                    result.effects_applied += 1;
-                },
-                .expirevar => {
-                    if (!include_persistent) {
-                        result.pending_persistent_effects += 1;
-                        continue;
-                    }
-                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
-                        return error.InvalidRuleReference;
-                    if (self.persistentNamespaceFailedOpen(namespace)) {
                         result.effects_applied += 1;
-                        continue;
-                    }
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    defer self.waf.allocator.free(name);
-                    const seconds_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    defer self.waf.allocator.free(seconds_text);
-                    const seconds = action_config.parsePositiveU32(seconds_text) catch return error.InvalidActionValue;
-                    try self.stagePersistentExpiry(namespace, name, seconds);
-                    result.effects_applied += 1;
-                },
-                .deprecatevar => {
-                    if (!include_persistent) {
-                        result.pending_persistent_effects += 1;
-                        continue;
-                    }
-                    const configured_collection = effect.collection orelse return error.InvalidRuleReference;
-                    const namespace = persistentNamespace(configured_collection) orelse return error.InvalidRuleReference;
-                    if (self.persistentNamespaceFailedOpen(namespace)) {
-                        result.effects_applied += 1;
-                        continue;
-                    }
-                    const collection_name = effectCollectionName(configured_collection);
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    errdefer self.waf.allocator.free(name);
-                    if (name.len == 0) return error.InvalidActionValue;
-                    const amount_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    defer self.waf.allocator.free(amount_text);
-                    const period_text = try self.expandEffectTextStaged(effect.auxiliary orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                    defer self.waf.allocator.free(period_text);
-                    const amount = action_config.parsePositiveU32(amount_text) catch return error.InvalidActionValue;
-                    const period_seconds = action_config.parsePositiveU32(period_text) catch return error.InvalidActionValue;
-                    const current_text: ?[]const u8 = switch (batch.lookup(collection_name, name)) {
-                        .value => |value| value,
-                        .removed => null,
-                        .missing => if (self.collection_variables.first(collection_name, name)) |value| value.value else null,
-                    };
-                    const period_ns = std.math.mul(i64, @as(i64, period_seconds), std.time.ns_per_s) catch
-                        return error.PersistentTimestampOverflow;
-                    const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
-                    const deprecation = try session.deprecate(
-                        namespace,
-                        name,
-                        if (current_text) |value| persistent.parseNumericOrZero(value) else null,
-                        amount,
-                        period_ns,
-                        try self.persistentNow(),
-                    );
-                    if (deprecation) |applied| {
-                        const next = try std.fmt.allocPrint(self.waf.allocator, "{d}", .{applied.value});
-                        errdefer self.waf.allocator.free(next);
-                        try batch.putOwned(collection_name, name, next, source);
-                    } else {
-                        self.waf.allocator.free(name);
-                    }
-                    result.effects_applied += 1;
-                },
+                    },
+                }
             }
         }
 
@@ -1719,6 +1747,30 @@ pub const Transaction = struct {
             const offset = std.math.add(usize, context.source.offset, range.start) catch return error.InvalidMatchContext;
             _ = std.math.add(usize, offset, range.end - range.start) catch return error.InvalidMatchContext;
         };
+    }
+
+    fn validateMatchedChain(
+        self: *const Transaction,
+        plan: *const compiled_plan.Plan,
+        matches: []const MatchedRule,
+    ) TransactionError!void {
+        if (matches.len == 0 or matches.len > plan.rules.len) return error.InvalidRuleChain;
+        const head_id = matches[0].rule;
+        const head_index: usize = @backingInt(head_id);
+        if (head_index >= plan.rules.len) return error.InvalidRuleReference;
+        if (plan.rules[head_index].chain_head != head_id) return error.InvalidRuleChain;
+
+        var expected: ?compiled_plan.RuleId = head_id;
+        for (matches) |matched| {
+            if (expected == null or matched.rule != expected.?) return error.InvalidRuleChain;
+            const index: usize = @backingInt(matched.rule);
+            if (index >= plan.rules.len) return error.InvalidRuleReference;
+            const rule = plan.rules[index];
+            if (rule.chain_head != head_id) return error.InvalidRuleChain;
+            try self.validateMatchContext(matched.context);
+            expected = rule.chain_next;
+        }
+        if (expected != null) return error.InvalidRuleChain;
     }
 
     fn stageRuleProjection(
@@ -3188,6 +3240,79 @@ test "match intent count and byte limits fail before transaction publication" {
     try std.testing.expectError(error.MatchIntentStorageLimitExceeded, bytes_tx.applyLocalMatchedRule(@fromBackingInt(0), context));
     try std.testing.expectEqual(@as(usize, 0), bytes_tx.matchIntentCount());
     try std.testing.expect((try bytes_tx.collectionFirst(.tx, "flag")) == null);
+}
+
+test "complete chains apply member effects in order and publish one head intent" {
+    const input =
+        \\SecRule ARGS @rx "id:42,chain,msg:'chain %{TX.order}',logdata:'final=%{TX.order}',nolog,setvar:'tx.order=head'"
+        \\SecRule TX @rx "chain,setvar:'tx.order=%{TX.order}-middle'"
+        \\SecRule REQUEST_URI @rx "capture,auditlog,setvar:'tx.order=%{TX.order}-tail'"
+        \\SecRule ARGS @rx "id:43,chain,setvar:'tx.should_not_commit=1'"
+        \\SecRule TX @rx "setvar:'tx.maximum=+1'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "chain-effects.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/chain", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const capture_ranges = [_]?CaptureRange{.{ .start = 0, .end = 4 }};
+    const matches = [_]MatchedRule{
+        .{ .rule = @fromBackingInt(0), .context = .{
+            .name = "ARGS:first",
+            .value = "head",
+            .source = .{ .origin = .request_body, .offset = 0, .length = 4 },
+        } },
+        .{ .rule = @fromBackingInt(1), .context = .{
+            .name = "TX:order",
+            .value = "head",
+            .source = .{ .origin = .rule, .offset = 0, .length = 4 },
+        } },
+        .{ .rule = @fromBackingInt(2), .context = .{
+            .name = "REQUEST_URI",
+            .value = "tail",
+            .source = .{ .origin = .request_target, .offset = 1, .length = 4 },
+            .captures = &capture_ranges,
+        } },
+    };
+
+    try std.testing.expectError(error.InvalidRuleChain, tx.applyMatchedRule(@fromBackingInt(0), matches[0].context));
+    try std.testing.expectError(error.InvalidRuleChain, tx.applyMatchedChain(matches[0..2]));
+    const reversed = [_]MatchedRule{ matches[0], matches[2], matches[1] };
+    try std.testing.expectError(error.InvalidRuleChain, tx.applyMatchedChain(&reversed));
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+    try std.testing.expect((try tx.collectionFirst(.tx, "order")) == null);
+
+    const outcome = try tx.applyMatchedChain(&matches);
+    try std.testing.expectEqual(@as(usize, 6), outcome.effects_applied);
+    try std.testing.expect(!outcome.log);
+    try std.testing.expect(outcome.audit_log);
+    try std.testing.expectEqualStrings("head-middle-tail", (try tx.collectionFirst(.tx, "order")).?.value);
+    try std.testing.expectEqualStrings("tail", (try tx.collectionFirst(.tx, "0")).?.value);
+    try std.testing.expectEqual(@as(usize, 1), tx.matchIntentCount());
+    const intent = tx.matchIntent(outcome.intent).?;
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), intent.rule);
+    try std.testing.expectEqualStrings("chain head-middle-tail", intent.message.?);
+    try std.testing.expectEqualStrings("final=head-middle-tail", intent.log_data.?);
+    try std.testing.expectEqualStrings("REQUEST_URI", intent.matched_name);
+    try std.testing.expectEqualStrings("tail", intent.matched_value);
+
+    try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", .{ .origin = .rule, .offset = 0, .length = 1 });
+    const failing = [_]MatchedRule{
+        .{ .rule = @fromBackingInt(3), .context = matches[0].context },
+        .{ .rule = @fromBackingInt(4), .context = matches[1].context },
+    };
+    try std.testing.expectError(error.CapacityExceeded, tx.applyMatchedChain(&failing));
+    try std.testing.expect((try tx.collectionFirst(.tx, "should_not_commit")) == null);
+    try std.testing.expectEqual(@as(usize, 1), tx.matchIntentCount());
 }
 
 test "compiled feature discovery is explicit" {
