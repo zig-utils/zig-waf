@@ -320,6 +320,7 @@ pub const Session = struct {
                     .limits = self.limits,
                 }) catch |err| switch (err) {
                     error.Conflict => {
+                        conflictBackoff(attempt);
                         var current = try self.backend.load(
                             self.arena.child_allocator,
                             binding.namespace,
@@ -329,7 +330,6 @@ pub const Session = struct {
                         );
                         binding.revision = current.revision;
                         current.deinit();
-                        conflictBackoff(attempt);
                         continue;
                     },
                     else => return err,
@@ -672,12 +672,13 @@ fn lock(mutex: *std.atomic.Mutex) void {
 }
 
 fn conflictBackoff(attempt: u8) void {
-    if (attempt < 4) {
-        const spins = @as(usize, 1) << @intCast(attempt);
-        for (0..spins) |_| std.atomic.spinLoopHint();
-        return;
-    }
-    std.Thread.yield() catch {};
+    const spin_shift: u6 = @intCast(@min(attempt, 10));
+    const spins = @as(usize, 1) << spin_shift;
+    for (0..spins) |_| std.atomic.spinLoopHint();
+    if (attempt < 3) return;
+    const yield_shift: u6 = @intCast(@min(attempt - 3, 6));
+    const yields = @as(usize, 1) << yield_shift;
+    for (0..yields) |_| std.Thread.yield() catch {};
 }
 
 const MemoryIncrementWorker = struct {
