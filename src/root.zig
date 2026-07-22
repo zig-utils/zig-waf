@@ -29,6 +29,9 @@ pub const Feature = engine.Feature;
 pub const FeatureSet = engine.FeatureSet;
 pub const ClockSample = engine.ClockSample;
 pub const ClockSource = engine.ClockSource;
+pub const MatchContext = engine.MatchContext;
+pub const CaptureRange = engine.CaptureRange;
+pub const RuleProjection = engine.RuleProjection;
 
 test {
     _ = version;

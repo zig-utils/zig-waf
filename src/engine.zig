@@ -62,6 +62,9 @@ pub const Limits = struct {
     max_response_body_bytes: usize = 16 * 1024 * 1024,
     max_scalar_value_bytes: usize = 32 * 1024,
     max_scalar_storage_bytes: usize = 256 * 1024,
+    max_match_name_bytes: usize = 4096,
+    max_match_value_bytes: usize = 1024 * 1024,
+    max_captures: usize = 10,
     collection_limits: collections.Limits = .{},
 
     fn validate(self: Limits) ConfigError!void {
@@ -71,7 +74,11 @@ pub const Limits = struct {
             self.max_request_body_bytes == 0 or
             self.max_response_body_bytes == 0 or
             self.max_scalar_value_bytes == 0 or
-            self.max_scalar_storage_bytes < self.max_scalar_value_bytes)
+            self.max_scalar_storage_bytes < self.max_scalar_value_bytes or
+            self.max_match_name_bytes == 0 or
+            self.max_match_value_bytes == 0 or
+            self.max_captures == 0 or
+            self.max_captures > 10)
         {
             return error.InvalidLimit;
         }
@@ -436,6 +443,10 @@ pub const TransactionError = error{
     TransactionTerminated,
     ClockBeforeUnixEpoch,
     MacroOutputTooLarge,
+    MissingCompiledPlan,
+    InvalidRuleReference,
+    InvalidMatchContext,
+    TooManyCaptures,
     CollectionSizeOverflow,
     PersistentBackendNotConfigured,
     PersistentTimestampOverflow,
@@ -458,6 +469,28 @@ const Lifecycle = enum {
 pub const ArgumentOrigin = enum { query, body, path };
 pub const PersistentInitialization = enum { loaded, already_initialized, failed_open };
 
+pub const CaptureRange = struct {
+    start: usize,
+    end: usize,
+};
+
+/// Borrowed operator-match evidence. Capture indexes correspond directly to
+/// TX.0 through TX.9; null entries represent unmatched optional groups.
+pub const MatchContext = struct {
+    name: []const u8,
+    value: []const u8,
+    source: collections.Source,
+    captures: []const ?CaptureRange = &.{},
+};
+
+pub const RuleProjection = struct {
+    rule: compiled_plan.RuleId,
+    chain_head: compiled_plan.RuleId,
+    external_id: ?u64,
+    severity: ?u8,
+    tags_count: u32,
+};
+
 pub const PersistentFailure = enum {
     unavailable,
     timeout,
@@ -465,6 +498,19 @@ pub const PersistentFailure = enum {
     corrupt_data,
     capacity_exceeded,
 };
+
+const capture_keys = [_][]const u8{ "0", "1", "2", "3", "4", "5", "6", "7", "8", "9" };
+
+fn appendProjectedValue(
+    values: *[8]collections.Value,
+    count: *usize,
+    key: []const u8,
+    value: []const u8,
+    source: collections.Source,
+) void {
+    values[count.*] = .{ .collection = .rule, .key = key, .value = value, .source = source };
+    count.* += 1;
+}
 
 /// Isolated per-request mutable state.
 ///
@@ -496,6 +542,87 @@ pub const Transaction = struct {
 
     pub fn compiledPlan(self: *const Transaction) ?*const compiled_plan.Plan {
         return self.waf.compiledPlan();
+    }
+
+    /// Atomically replace the transaction-local RULE projection with typed
+    /// metadata from the chain head. Macro-bearing text remains in its
+    /// compiled source form here so subsequent effects can resolve RULE.*
+    /// before final event expansion.
+    pub fn projectRuleMetadata(self: *Transaction, rule_id: compiled_plan.RuleId) TransactionError!RuleProjection {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
+        const rule_index: usize = @backingInt(rule_id);
+        if (rule_index >= plan.rules.len) return error.InvalidRuleReference;
+        const selected = plan.rules[rule_index];
+        const head_index: usize = @backingInt(selected.chain_head);
+        if (head_index >= plan.rules.len) return error.InvalidRuleReference;
+        const head = plan.rules[head_index];
+        const metadata = head.metadata;
+        var values: [8]collections.Value = undefined;
+        var count: usize = 0;
+        var id_buffer: [24]u8 = undefined;
+        var severity_buffer: [3]u8 = undefined;
+        var maturity_buffer: [3]u8 = undefined;
+        var accuracy_buffer: [3]u8 = undefined;
+        const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
+        if (head.external_id) |external_id| {
+            const value = std.fmt.bufPrint(&id_buffer, "{d}", .{external_id}) catch unreachable;
+            appendProjectedValue(&values, &count, "id", value, source);
+        }
+        if (metadata.revision) |text| appendProjectedValue(&values, &count, "rev", plan.string(text.value).?, source);
+        if (metadata.message) |text| appendProjectedValue(&values, &count, "msg", plan.string(text.value).?, source);
+        if (metadata.log_data) |text| appendProjectedValue(&values, &count, "logdata", plan.string(text.value).?, source);
+        if (metadata.severity) |severity| {
+            const value = std.fmt.bufPrint(&severity_buffer, "{d}", .{@backingInt(severity)}) catch unreachable;
+            appendProjectedValue(&values, &count, "severity", value, source);
+        }
+        if (metadata.maturity) |maturity| {
+            const value = std.fmt.bufPrint(&maturity_buffer, "{d}", .{maturity}) catch unreachable;
+            appendProjectedValue(&values, &count, "maturity", value, source);
+        }
+        if (metadata.accuracy) |accuracy| {
+            const value = std.fmt.bufPrint(&accuracy_buffer, "{d}", .{accuracy}) catch unreachable;
+            appendProjectedValue(&values, &count, "accuracy", value, source);
+        }
+        if (metadata.version) |text| appendProjectedValue(&values, &count, "ver", plan.string(text.value).?, source);
+        try self.collection_variables.replaceCollection(.rule, values[0..count]);
+        return .{
+            .rule = rule_id,
+            .chain_head = selected.chain_head,
+            .external_id = head.external_id,
+            .severity = if (metadata.severity) |severity| @backingInt(severity) else null,
+            .tags_count = metadata.tags_count,
+        };
+    }
+
+    /// Validate all borrowed ranges first, then atomically replace TX.0–TX.9.
+    /// Unmatched and omitted groups clear stale capture state.
+    pub fn replaceCaptures(self: *Transaction, context: MatchContext) TransactionError!usize {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (context.name.len == 0 or context.name.len > self.waf.config.limits.max_match_name_bytes or
+            context.value.len > self.waf.config.limits.max_match_value_bytes)
+        {
+            return error.InvalidMatchContext;
+        }
+        if (context.captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
+        var values: [10]collections.Value = undefined;
+        var count: usize = 0;
+        for (context.captures, 0..) |maybe_range, capture_index| {
+            const range = maybe_range orelse continue;
+            if (range.start > range.end or range.end > context.value.len) return error.InvalidMatchContext;
+            const offset = std.math.add(usize, context.source.offset, range.start) catch return error.InvalidMatchContext;
+            const length = range.end - range.start;
+            _ = std.math.add(usize, offset, length) catch return error.InvalidMatchContext;
+            values[count] = .{
+                .collection = .tx,
+                .key = capture_keys[capture_index],
+                .value = context.value[range.start..range.end],
+                .source = .{ .origin = context.source.origin, .offset = offset, .length = length },
+            };
+            count += 1;
+        }
+        try self.collection_variables.replaceKeys(.tx, &capture_keys, values[0..count]);
+        return count;
     }
 
     pub fn processConnection(
@@ -1851,6 +1978,75 @@ test "setsid setuid and setrsc bind keys and compatibility scalars" {
     try std.testing.expectEqualStrings("session-1", (try tx.scalar(.session_id)).?.value);
     try std.testing.expectEqualStrings("alice", (try tx.scalar(.user_id)).?.value);
     try std.testing.expectEqualStrings("/account", (try tx.scalar(.resource)).?.value);
+}
+
+test "rule projection uses chain-head metadata and capture replacement is bounded" {
+    const input =
+        \\SecRule ARGS @rx "id:42,chain,msg:'head message',rev:'2',severity:CRITICAL,maturity:9,accuracy:8,ver:'test/1',tag:'one',tag:'two'"
+        \\SecRule TX @rx capture
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "match-projection.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+
+    const projection = try tx.projectRuleMetadata(@fromBackingInt(1));
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), projection.chain_head);
+    try std.testing.expectEqual(@as(?u64, 42), projection.external_id);
+    try std.testing.expectEqual(@as(?u8, 2), projection.severity);
+    try std.testing.expectEqual(@as(u32, 2), projection.tags_count);
+    try std.testing.expectEqualStrings("42", (try tx.collectionFirst(.rule, "id")).?.value);
+    try std.testing.expectEqualStrings("head message", (try tx.collectionFirst(.rule, "msg")).?.value);
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.rule, "severity")).?.value);
+    try std.testing.expectEqualStrings("test/1", (try tx.collectionFirst(.rule, "ver")).?.value);
+
+    const source: collections.Source = .{ .origin = .request_body, .offset = 100, .length = 5 };
+    try tx.setCollectionValue(.tx, "1", "stale", source);
+    try tx.setCollectionValue(.tx, "9", "stale", source);
+    const capture_ranges = [_]?CaptureRange{
+        .{ .start = 0, .end = 5 },
+        null,
+        .{ .start = 2, .end = 3 },
+        .{ .start = 4, .end = 4 },
+    };
+    try std.testing.expectEqual(@as(usize, 3), try tx.replaceCaptures(.{
+        .name = "ARGS:value",
+        .value = "ab\x00cd",
+        .source = source,
+        .captures = &capture_ranges,
+    }));
+    try std.testing.expectEqualSlices(u8, "ab\x00cd", (try tx.collectionFirst(.tx, "0")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.tx, "1")) == null);
+    try std.testing.expectEqualSlices(u8, "\x00", (try tx.collectionFirst(.tx, "2")).?.value);
+    try std.testing.expectEqualStrings("", (try tx.collectionFirst(.tx, "3")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.tx, "9")) == null);
+    try std.testing.expectEqual(@as(usize, 102), (try tx.collectionFirst(.tx, "2")).?.source.offset);
+
+    const invalid = [_]?CaptureRange{.{ .start = 0, .end = 6 }};
+    try std.testing.expectError(error.InvalidMatchContext, tx.replaceCaptures(.{
+        .name = "ARGS:value",
+        .value = "ab\x00cd",
+        .source = source,
+        .captures = &invalid,
+    }));
+    try std.testing.expectEqualSlices(u8, "ab\x00cd", (try tx.collectionFirst(.tx, "0")).?.value);
+    const too_many = [_]?CaptureRange{ null, null, null, null, null, null, null, null, null, null, null };
+    try std.testing.expectError(error.TooManyCaptures, tx.replaceCaptures(.{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = source,
+        .captures = &too_many,
+    }));
 }
 
 test "compiled feature discovery is explicit" {

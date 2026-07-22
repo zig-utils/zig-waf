@@ -317,6 +317,51 @@ pub const Store = struct {
         self.total_bytes += added;
     }
 
+    /// Atomically replace a bounded set of map keys without disturbing other
+    /// entries in the collection. Every staged value must name one of the
+    /// replacement keys; keys omitted from `values` are cleared.
+    pub fn replaceKeys(self: *Store, collection: Name, keys: []const []const u8, values: []const Value) StoreError!void {
+        if (values.len > self.limits.max_entries -| self.entries.items.len)
+            return error.TooManyCollectionEntries;
+        for (keys) |key| if (key.len > self.limits.max_key_bytes) return error.CollectionKeyTooLarge;
+        var added: usize = 0;
+        for (values) |value| {
+            if (value.collection != collection or !containsKey(collection, keys, value.key))
+                return error.InvalidCollectionBatch;
+            try self.validateValue(value, values.len);
+            const item_bytes = value.key.len + value.value.len;
+            if (item_bytes > self.limits.max_total_bytes -| added)
+                return error.CollectionStorageLimitExceeded;
+            added += item_bytes;
+        }
+        if (added > self.limits.max_total_bytes -| self.total_bytes)
+            return error.CollectionStorageLimitExceeded;
+
+        const arena_allocator = self.arena.allocator();
+        try self.entries.ensureUnusedCapacity(arena_allocator, values.len);
+        const staged = try self.arena.child_allocator.alloc(Entry, values.len);
+        defer self.arena.child_allocator.free(staged);
+        var staged_bytes: usize = 0;
+        errdefer self.total_bytes += staged_bytes;
+        for (values, staged) |value, *entry| {
+            const key = try arena_allocator.dupe(u8, value.key);
+            staged_bytes += value.key.len;
+            const owned_value = try arena_allocator.dupe(u8, value.value);
+            staged_bytes += value.value.len;
+            entry.* = .{
+                .collection = value.collection,
+                .key = key,
+                .value = owned_value,
+                .source = value.source,
+            };
+        }
+        for (self.entries.items) |*entry| {
+            if (entry.collection == collection and containsKey(collection, keys, entry.key)) entry.active = false;
+        }
+        for (staged) |entry| self.entries.appendAssumeCapacity(entry);
+        self.total_bytes += added;
+    }
+
     pub fn select(self: *const Store, collection: Name, selector: Selector) Iterator {
         return .{ .store = self, .collection = collection, .selector = selector };
     }
@@ -463,6 +508,11 @@ fn keysEqual(collection: Name, first_key: []const u8, second_key: []const u8) bo
     };
 }
 
+fn containsKey(collection: Name, keys: []const []const u8, key: []const u8) bool {
+    for (keys) |candidate| if (keysEqual(collection, candidate, key)) return true;
+    return false;
+}
+
 fn view(entry: Entry) View {
     return .{ .collection = entry.collection, .key = entry.key, .value = entry.value, .source = entry.source };
 }
@@ -583,6 +633,28 @@ test "collection replacement preserves visible state across allocation failures"
             try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
         }
     }.run, .{});
+}
+
+test "key replacement clears stale values and preserves unrelated entries" {
+    var store = Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    const source: Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try store.add(.tx, "0", "old-zero", source);
+    try store.add(.tx, "1", "old-one", source);
+    try store.add(.tx, "score", "7", source);
+    const keys = [_][]const u8{ "0", "1", "2" };
+    try store.replaceKeys(.tx, &keys, &.{
+        .{ .collection = .tx, .key = "0", .value = "new", .source = source },
+        .{ .collection = .tx, .key = "2", .value = "capture", .source = source },
+    });
+    try std.testing.expectEqualStrings("new", store.first(.tx, "0").?.value);
+    try std.testing.expect(store.first(.tx, "1") == null);
+    try std.testing.expectEqualStrings("capture", store.first(.tx, "2").?.value);
+    try std.testing.expectEqualStrings("7", store.first(.tx, "score").?.value);
+    try std.testing.expectError(error.InvalidCollectionBatch, store.replaceKeys(.tx, &keys, &.{
+        .{ .collection = .tx, .key = "outside", .value = "x", .source = source },
+    }));
+    try std.testing.expectEqualStrings("new", store.first(.tx, "0").?.value);
 }
 
 test "map replacement and removal stay physically bounded" {
