@@ -644,6 +644,36 @@ fn conflictBackoff(attempt: u8) void {
     std.Thread.yield() catch {};
 }
 
+const MemoryIncrementWorker = struct {
+    backend: Backend,
+    limits: Limits,
+    iterations: usize,
+    failures: *std.atomic.Value(usize),
+
+    fn run(self: MemoryIncrementWorker) void {
+        for (0..self.iterations) |_| {
+            var session = Session.init(std.heap.smp_allocator, self.backend, self.limits) catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            defer session.deinit();
+            var snapshot = (session.initialize(.global, "global", 0) catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            }) orelse unreachable;
+            snapshot.deinit();
+            session.add(.global, "counter", 1) catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            _ = session.flush(0) catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+        }
+    }
+};
+
 test "persistent namespace registry maps to collection names" {
     inline for (std.meta.tags(Namespace)) |namespace| {
         try std.testing.expectEqual(namespace, Namespace.parse(@tagName(namespace)).?);
@@ -786,4 +816,24 @@ test "set preserves expiry and expiry-only state stays hidden" {
     var at_expiry = try backend.load(std.testing.allocator, .user, "alice", 10, limits);
     defer at_expiry.deinit();
     try std.testing.expectEqual(@as(usize, 0), at_expiry.values.items.len);
+}
+
+test "in-memory conflict retries preserve threaded increments" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const limits: Limits = .{ .max_retry_attempts = 64 };
+    var failures = std.atomic.Value(usize).init(0);
+    const worker: MemoryIncrementWorker = .{
+        .backend = memory.backend(),
+        .limits = limits,
+        .iterations = 100,
+        .failures = &failures,
+    };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, MemoryIncrementWorker.run, .{worker});
+    for (&threads) |*thread| thread.join();
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+    var result = try memory.backend().load(std.testing.allocator, .global, "global", 0, limits);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("400", result.values.items[0].value);
 }
