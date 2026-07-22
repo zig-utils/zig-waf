@@ -226,6 +226,7 @@ pub const Executor = struct {
             .base64_encode => self.base64Encode(input),
             .css_decode => self.cssDecode(input),
             .escape_seq_decode => self.escapeSeqDecode(input),
+            .js_decode => self.jsDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
             .trim => trimResult(input, true, true),
@@ -372,6 +373,54 @@ pub const Executor = struct {
                 index += 2;
             }
             changed = true;
+        }
+        return finish(generated, input, changed);
+    }
+
+    fn jsDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOfScalar(u8, input, '\\') orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var changed = false;
+        var index = first;
+        while (index < input.len) {
+            if (input[index] != '\\') {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            } else if (index + 5 < input.len and input[index + 1] == 'u' and
+                isHex(input[index + 2]) and isHex(input[index + 3]) and
+                isHex(input[index + 4]) and isHex(input[index + 5]))
+            {
+                const code_point = decodeHexU16(input[index + 2 .. index + 6]);
+                var decoded: u8 = @truncate(code_point);
+                if (decoded > 0 and decoded < 0x5f and (code_point & 0xff00) == 0xff00) decoded += 0x20;
+                generated.buffer.appendAssumeCapacity(decoded);
+                index += 6;
+                changed = true;
+            } else if (index + 3 < input.len and input[index + 1] == 'x' and
+                isHex(input[index + 2]) and isHex(input[index + 3]))
+            {
+                generated.buffer.appendAssumeCapacity(hexNibble(input[index + 2]).? * 16 + hexNibble(input[index + 3]).?);
+                index += 4;
+                changed = true;
+            } else if (index + 1 < input.len and isOctal(input[index + 1])) {
+                var digits: usize = 1;
+                while (digits < 3 and index + 1 + digits < input.len and isOctal(input[index + 1 + digits])) : (digits += 1) {}
+                if (digits == 3 and input[index + 1] > '3') digits = 2;
+                var decoded: u8 = 0;
+                for (input[index + 1 .. index + 1 + digits]) |digit| decoded = decoded * 8 + digit - '0';
+                generated.buffer.appendAssumeCapacity(decoded);
+                index += 1 + digits;
+                changed = true;
+            } else if (index + 1 < input.len) {
+                generated.buffer.appendAssumeCapacity(cEscapeByte(input[index + 1]) orelse input[index + 1]);
+                index += 2;
+                changed = true;
+            } else {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            }
         }
         return finish(generated, input, changed);
     }
@@ -1005,6 +1054,24 @@ test "C escape decoding handles simple hex octal and malformed sequences" {
     try std.testing.expectEqualStrings("value\\", trailing.bytes);
     try std.testing.expect(!trailing.changed);
     try std.testing.expectEqualStrings("q", (try executor.apply(.escape_seq_decode, "\\q")).bytes);
+}
+
+test "JavaScript decoding handles Unicode hex octal and escaped literals" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ '\\', 'a', '\\', 'b', '\\', 'f', '\\', 'n', '\\', 'r', '\\', 't', '\\', 'v', '?', '\'', '"', 0, 10, 'S', 0, 0xff },
+        (try executor.apply(.js_decode, "\\\\a\\\\b\\\\f\\\\n\\\\r\\\\t\\\\v\\?\\'\\\"\\0\\12\\123\\x00\\xff")).bytes,
+    );
+    try std.testing.expectEqualStrings("A!~", (try executor.apply(.js_decode, "\\u0041\\uff01\\uFF5e")).bytes);
+    try std.testing.expectEqualStrings("?7", (try executor.apply(.js_decode, "\\777")).bytes);
+    try std.testing.expectEqualStrings("uUxxg", (try executor.apply(.js_decode, "\\u\\U\\x\\xg")).bytes);
+
+    const trailing = try executor.apply(.js_decode, "\\");
+    try std.testing.expectEqualStrings("\\", trailing.bytes);
+    try std.testing.expect(!trailing.changed);
 }
 
 test "executor validates deterministic input and output limits" {
