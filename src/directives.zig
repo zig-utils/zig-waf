@@ -1,6 +1,8 @@
 //! Canonical stable directive inventory and schema metadata.
 
 const std = @import("std");
+const plan_mod = @import("plan.zig");
+const seclang = @import("seclang/root.zig");
 
 pub const Id = enum(u8) {
     sec_rule,
@@ -110,6 +112,8 @@ pub const Schema = enum {
     audit_log_format,
     audit_parts,
     octal_mode,
+    upload_keep_files,
+    remote_fail_action,
     path,
     regex,
     id_ranges,
@@ -182,6 +186,46 @@ pub const Entry = struct {
     owner_issue: u16,
 };
 
+pub const DiagnosticCode = enum {
+    unknown_directive,
+    unavailable_capability,
+    invalid_argument_count,
+    invalid_value,
+
+    pub fn id(self: DiagnosticCode) []const u8 {
+        return switch (self) {
+            .unknown_directive => "WAF-DIRECTIVE-0101",
+            .unavailable_capability => "WAF-DIRECTIVE-0102",
+            .invalid_argument_count => "WAF-DIRECTIVE-0103",
+            .invalid_value => "WAF-DIRECTIVE-0104",
+        };
+    }
+
+    pub fn message(self: DiagnosticCode) []const u8 {
+        return switch (self) {
+            .unknown_directive => "directive is not in the stable compatibility union",
+            .unavailable_capability => "directive requires a capability unavailable in this build",
+            .invalid_argument_count => "directive argument count does not match its canonical schema",
+            .invalid_value => "directive value does not match its canonical schema",
+        };
+    }
+};
+
+pub const Diagnostic = struct {
+    code: DiagnosticCode,
+    primary: seclang.source.Span,
+    directive: ?Id = null,
+    sensitive: bool = false,
+    message: []const u8,
+};
+
+pub const ValidationOutcome = union(enum) {
+    valid,
+    diagnostic: Diagnostic,
+};
+
+const Arity = struct { minimum: u8, maximum: u8 };
+
 const M = Presence{ .modsecurity = true, .coraza = false };
 const C = Presence{ .modsecurity = false, .coraza = true };
 const MC = Presence{ .modsecurity = true, .coraza = true };
@@ -241,7 +285,7 @@ pub const registry = [_]Entry{
     row(.sec_upload_dir, "SecUploadDir", .path, .singular_replace, .upload, MC, 26),
     row(.sec_upload_file_mode, "SecUploadFileMode", .octal_mode, .singular_replace, .upload, MC, 26),
     row(.sec_upload_file_limit, "SecUploadFileLimit", .unsigned, .singular_replace, .upload, MC, 26),
-    row(.sec_upload_keep_files, "SecUploadKeepFiles", .limit_action, .singular_replace, .upload, MC, 26),
+    row(.sec_upload_keep_files, "SecUploadKeepFiles", .upload_keep_files, .singular_replace, .upload, MC, 26),
     row(.sec_tmp_save_uploaded_files, "SecTmpSaveUploadedFiles", .toggle, .singular_replace, .upload, M, 26),
     row(.sec_chroot_dir, "SecChrootDir", .path, .singular_replace, .core, M, 72),
 
@@ -262,7 +306,7 @@ pub const registry = [_]Entry{
     row(.sec_rx_pre_filter, "SecRxPreFilter", .toggle, .singular_replace, .regex_limits, C, 18),
 
     secretRow(.sec_remote_rules, "SecRemoteRules", .remote_rules, .append, .remote_rules, MC, 14),
-    row(.sec_remote_rules_fail_action, "SecRemoteRulesFailAction", .limit_action, .singular_replace, .remote_rules, MC, 14),
+    row(.sec_remote_rules_fail_action, "SecRemoteRulesFailAction", .remote_fail_action, .singular_replace, .remote_rules, MC, 14),
     row(.sec_collection_timeout, "SecCollectionTimeout", .unsigned, .singular_replace, .core, MC, 10),
     row(.sec_geo_lookup_db, "SecGeoLookupDb", .path, .singular_replace, .geo_lookup, M, 21),
     row(.sec_gsb_lookup_db, "SecGsbLookupDb", .path, .singular_replace, .gsb_lookup, MC, 21),
@@ -323,6 +367,171 @@ pub fn get(id: Id) *const Entry {
     return &registry[@backingInt(id)];
 }
 
+/// Validate the complete immutable plan before it can be published by a WAF.
+/// Values remain borrowed from the plan; diagnostics never interpolate input.
+pub fn validatePlan(compiled: *const plan_mod.Plan, capabilities: CapabilitySet) ValidationOutcome {
+    for (compiled.directives) |directive| {
+        switch (directive.kind) {
+            .include, .include_optional => continue,
+            else => {},
+        }
+        const name = compiled.string(directive.name) orelse
+            return diagnostic(.unknown_directive, directive.source, null, false);
+        const entry = lookup(name) orelse
+            return diagnostic(.unknown_directive, directive.source, null, false);
+        if (!capabilities.has(entry.capability))
+            return diagnostic(.unavailable_capability, directive.source, entry.id, entry.sensitive);
+
+        const start: usize = directive.arguments_start;
+        const count: usize = directive.arguments_count;
+        if (start > compiled.arguments.len or count > compiled.arguments.len - start)
+            return diagnostic(.invalid_argument_count, directive.source, entry.id, entry.sensitive);
+        const arguments = compiled.arguments[start..][0..count];
+        const expected = arity(entry.id);
+        if (arguments.len < expected.minimum or arguments.len > expected.maximum)
+            return diagnostic(.invalid_argument_count, directive.source, entry.id, entry.sensitive);
+        if (!validValues(compiled, entry, arguments)) {
+            const primary = if (arguments.len == 0) directive.source else arguments[0].source;
+            return diagnostic(.invalid_value, primary, entry.id, entry.sensitive);
+        }
+    }
+    return .valid;
+}
+
+fn diagnostic(
+    code: DiagnosticCode,
+    primary: seclang.source.Span,
+    directive: ?Id,
+    sensitive: bool,
+) ValidationOutcome {
+    return .{ .diagnostic = .{
+        .code = code,
+        .primary = primary,
+        .directive = directive,
+        .sensitive = sensitive,
+        .message = code.message(),
+    } };
+}
+
+fn arity(id: Id) Arity {
+    return switch (id) {
+        .sec_rule => .{ .minimum = 2, .maximum = 3 },
+        .sec_response_body_mime_types_clear => .{ .minimum = 0, .maximum = 0 },
+        .sec_remote_rules,
+        .sec_rule_update_target_by_id,
+        .sec_rule_update_target_by_msg,
+        .sec_rule_update_target_by_tag,
+        .sec_rule_update_action_by_id,
+        .sec_dataset,
+        => .{ .minimum = 2, .maximum = 2 },
+        .sec_hash_param,
+        .sec_hash_method_rx,
+        .sec_hash_method_pm,
+        .sec_unicode_map,
+        .sec_unicode_map_file,
+        => .{ .minimum = 1, .maximum = 2 },
+        else => .{ .minimum = 1, .maximum = 1 },
+    };
+}
+
+fn validValues(compiled: *const plan_mod.Plan, entry: *const Entry, arguments: []const plan_mod.Argument) bool {
+    if (entry.schema == .clear) return arguments.len == 0;
+    for (arguments) |argument| {
+        const raw = compiled.string(argument.raw) orelse return false;
+        if (argumentContent(raw, argument.quote).len == 0) return false;
+    }
+    if (arguments.len == 0) return true;
+    const raw = compiled.string(arguments[0].raw) orelse return false;
+    const value = argumentContent(raw, arguments[0].quote);
+    return switch (entry.schema) {
+        .toggle => enumValue(value, &.{ "On", "Off" }),
+        .rule_engine => enumValue(value, &.{ "On", "Off", "DetectionOnly" }),
+        .connection_engine => enumValue(value, &.{ "On", "Off" }),
+        .unsigned => validateUnsigned(entry.id, value),
+        .limit_action => enumValue(value, &.{ "Reject", "ProcessPartial" }),
+        .byte_separator => value.len == 1,
+        .cookie_format => enumValue(value, &.{ "0", "1" }),
+        .audit_engine => enumValue(value, &.{ "On", "Off", "RelevantOnly" }),
+        .audit_log_type => enumValue(value, &.{ "Serial", "Concurrent", "HTTPS" }),
+        .audit_log_format => enumValue(value, &.{ "Native", "JSON" }),
+        .audit_parts => validAuditParts(value),
+        .octal_mode => parseOctalMode(value) != null,
+        .upload_keep_files => enumValue(value, &.{ "On", "Off", "RelevantOnly" }),
+        .remote_fail_action => enumValue(value, &.{ "Abort", "Warn" }),
+        .rule,
+        .action,
+        .default_action,
+        .marker,
+        .text,
+        .mime_type,
+        .clear,
+        .path,
+        .regex,
+        .id_ranges,
+        .rule_update,
+        .remote_rules,
+        .dataset,
+        .hash_parameter,
+        .unicode_map,
+        => true,
+    };
+}
+
+fn argumentContent(raw: []const u8, quote: seclang.lexer.Quote) []const u8 {
+    if (raw.len < 2) return raw;
+    return switch (quote) {
+        .single => if (raw[0] == '\'' and raw[raw.len - 1] == '\'') raw[1 .. raw.len - 1] else raw,
+        .double => if (raw[0] == '"' and raw[raw.len - 1] == '"') raw[1 .. raw.len - 1] else raw,
+        else => raw,
+    };
+}
+
+fn enumValue(value: []const u8, allowed: []const []const u8) bool {
+    for (allowed) |candidate| if (std.ascii.eqlIgnoreCase(value, candidate)) return true;
+    return false;
+}
+
+fn validateUnsigned(id: Id, value: []const u8) bool {
+    const parsed = parseUnsigned(value) orelse return false;
+    return switch (id) {
+        .sec_debug_log_level => parsed <= 9,
+        else => true,
+    };
+}
+
+fn parseUnsigned(value: []const u8) ?u64 {
+    if (value.len == 0) return null;
+    var parsed: u64 = 0;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+        parsed = std.math.mul(u64, parsed, 10) catch return null;
+        parsed = std.math.add(u64, parsed, byte - '0') catch return null;
+    }
+    return parsed;
+}
+
+fn parseOctalMode(value: []const u8) ?u16 {
+    if (value.len == 0 or value.len > 4) return null;
+    var parsed: u16 = 0;
+    for (value) |byte| {
+        if (byte < '0' or byte > '7') return null;
+        parsed = std.math.mul(u16, parsed, 8) catch return null;
+        parsed = std.math.add(u16, parsed, byte - '0') catch return null;
+    }
+    if (parsed > 0o7777) return null;
+    return parsed;
+}
+
+fn validAuditParts(value: []const u8) bool {
+    var saw_part = false;
+    for (value) |byte| {
+        if (byte == '+' or byte == '-') continue;
+        if (!std.ascii.isAlphabetic(byte)) return false;
+        saw_part = true;
+    }
+    return saw_part;
+}
+
 test "stable union has one canonical case insensitive entry per id" {
     try std.testing.expectEqual(std.meta.fieldNames(Id).len, registry.len);
     try std.testing.expectEqual(@as(usize, 85), registry.len);
@@ -349,4 +558,74 @@ test "capability and secrecy metadata are explicit" {
     try std.testing.expect(lookup("SecHashKey").?.sensitive);
     try std.testing.expect(lookup("SecHttpBlKey").?.sensitive);
     try std.testing.expect(!lookup("SecRuleEngine").?.sensitive);
+}
+
+test "plan validation recognizes the union and decodes strict scalar schemas" {
+    const input =
+        \\SecRuleEngine DetectionOnly
+        \\SecRequestBodyAccess On
+        \\SecRequestBodyLimit 1048576
+        \\SecResponseBodyMimeTypesClear
+        \\SecResponseBodyMimeType application/json
+        \\SecAuditEngine RelevantOnly
+        \\SecAuditLogType Concurrent
+        \\SecAuditLogFormat JSON
+        \\SecAuditLogParts ABIJDEFHZ
+        \\SecAuditLogFileMode 0640
+        \\SecRemoteRulesFailAction Warn
+        \\SecRule ARGS "@contains attack" "id:1,deny"
+    ;
+    const compiled = try compileTestPlan(input);
+    defer compiled.deinit();
+    try std.testing.expectEqual(ValidationOutcome.valid, validatePlan(compiled, .full()));
+}
+
+test "reduced builds reject unavailable directives before publication" {
+    const compiled = try compileTestPlan("SecAuditEngine On");
+    defer compiled.deinit();
+    const outcome = validatePlan(compiled, .coreOnly());
+    try std.testing.expectEqual(DiagnosticCode.unavailable_capability, outcome.diagnostic.code);
+    try std.testing.expectEqual(Id.sec_audit_engine, outcome.diagnostic.directive.?);
+    try std.testing.expectEqualStrings("WAF-DIRECTIVE-0102", outcome.diagnostic.code.id());
+}
+
+test "unknown directives and malformed values have stable non-echoing diagnostics" {
+    const unknown = try compileTestPlan("SecMystery enabled");
+    defer unknown.deinit();
+    try std.testing.expectEqual(DiagnosticCode.unknown_directive, validatePlan(unknown, .full()).diagnostic.code);
+
+    const malformed = try compileTestPlan("SecRequestBodyLimit 1MiB");
+    defer malformed.deinit();
+    try std.testing.expectEqual(DiagnosticCode.invalid_value, validatePlan(malformed, .full()).diagnostic.code);
+
+    const secret = try compileTestPlan("SecHashKey \"\"");
+    defer secret.deinit();
+    const secret_failure = validatePlan(secret, .full()).diagnostic;
+    try std.testing.expect(secret_failure.sensitive);
+    try std.testing.expect(std.mem.indexOf(u8, secret_failure.message, "HashKey") == null);
+}
+
+test "strict enum arity debug and file mode validation rejects malformed input" {
+    const cases = [_][]const u8{
+        "SecRuleEngine Enabled",
+        "SecResponseBodyMimeTypesClear unexpected",
+        "SecDebugLogLevel 10",
+        "SecAuditLogFileMode 0680",
+        "SecRemoteRules only-one-argument",
+    };
+    for (cases) |input| {
+        const compiled = try compileTestPlan(input);
+        defer compiled.deinit();
+        switch (validatePlan(compiled, .full())) {
+            .valid => return error.TestExpectedEqual,
+            .diagnostic => {},
+        }
+    }
+}
+
+fn compileTestPlan(input: []const u8) !*plan_mod.Plan {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "directives.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    return plan_mod.compile(std.testing.allocator, &parsed.registry, &documents, .{});
 }

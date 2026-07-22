@@ -3,6 +3,7 @@
 const std = @import("std");
 const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
+const directives = @import("directives.zig");
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
 const seclang = @import("seclang/root.zig");
@@ -103,7 +104,7 @@ pub const ClockSource = struct {
     }
 };
 
-pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature };
+pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration };
 pub const DeinitError = error{TransactionsActive};
 
 pub const Intervention = struct {
@@ -131,6 +132,7 @@ pub const Builder = struct {
     io: std.Io,
     clock_source: ?ClockSource = null,
     retained_plan: ?*const compiled_plan.Plan = null,
+    directive_capabilities: directives.CapabilitySet = .full(),
 
     pub fn init(allocator: std.mem.Allocator) Builder {
         return .{
@@ -177,14 +179,26 @@ pub const Builder = struct {
         self.config.persistent_required_features = required;
     }
 
+    /// Select the directive capabilities compiled into this WAF build. A plan
+    /// using an omitted capability is rejected before publication.
+    pub fn setDirectiveCapabilities(self: *Builder, capabilities: directives.CapabilitySet) void {
+        self.directive_capabilities = capabilities;
+    }
+
     /// Retain the plan when `build` succeeds. The caller keeps ownership of its
     /// handle and only needs to keep it alive until `build` returns.
     pub fn setRetainedPlan(self: *Builder, value: *const compiled_plan.Plan) void {
         self.retained_plan = value;
     }
 
+    /// Return the stable source-anchored diagnostic used by `build` without
+    /// publishing or taking ownership of the plan.
+    pub fn validateCompiledPlan(self: *const Builder, value: *const compiled_plan.Plan) directives.ValidationOutcome {
+        return directives.validatePlan(value, self.directive_capabilities);
+    }
+
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
-        try self.validate();
+        try self.validate(self.retained_plan);
         const retained = if (self.retained_plan) |value| try value.retain(self.allocator) else null;
         errdefer if (retained) |value| value.deinit();
         return self.allocate(retained);
@@ -193,16 +207,20 @@ pub const Builder = struct {
     /// Transfer `value` to the new WAF only on success. On error, ownership
     /// remains with the caller.
     pub fn buildTransferringPlan(self: *const Builder, value: *compiled_plan.Plan) (ConfigError || std.mem.Allocator.Error)!*Waf {
-        try self.validate();
+        try self.validate(value);
         return self.allocate(value);
     }
 
-    fn validate(self: *const Builder) ConfigError!void {
+    fn validate(self: *const Builder, candidate: ?*const compiled_plan.Plan) ConfigError!void {
         try self.config.limits.validate();
         self.config.persistent_limits.validate() catch return error.InvalidLimit;
         if (self.config.persistent_backend) |backend| {
             if (!backend.features.containsAll(self.config.persistent_required_features)) return error.MissingPersistentBackendFeature;
         }
+        if (candidate) |value| switch (self.validateCompiledPlan(value)) {
+            .valid => {},
+            .diagnostic => return error.InvalidDirectiveConfiguration,
+        };
     }
 
     fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
@@ -1839,6 +1857,29 @@ test "builder retains or transfers compiled plans explicitly" {
     const transferred_waf = try transfer_builder.buildTransferringPlan(transferred_plan);
     try std.testing.expectEqual(transferred_plan, transferred_waf.compiledPlan().?);
     try transferred_waf.deinit();
+}
+
+test "builder validates directive schemas and reduced build capabilities before publication" {
+    var unknown_parsed = try seclang.parser.parseBytes(std.testing.allocator, "unknown.conf", "SecMystery enabled", .{}, .{});
+    defer unknown_parsed.deinit();
+    var unknown_documents = [_]seclang.parser.Document{unknown_parsed.document};
+    const unknown_plan = try compiled_plan.compile(std.testing.allocator, &unknown_parsed.registry, &unknown_documents, .{});
+    defer unknown_plan.deinit();
+    var unknown_builder = Builder.init(std.testing.allocator);
+    unknown_builder.setRetainedPlan(unknown_plan);
+    try std.testing.expectEqual(directives.DiagnosticCode.unknown_directive, unknown_builder.validateCompiledPlan(unknown_plan).diagnostic.code);
+    try std.testing.expectError(error.InvalidDirectiveConfiguration, unknown_builder.build());
+    try std.testing.expectEqual(@as(usize, 1), unknown_plan.sharedReferenceCount());
+
+    var audit_parsed = try seclang.parser.parseBytes(std.testing.allocator, "reduced.conf", "SecAuditEngine On", .{}, .{});
+    defer audit_parsed.deinit();
+    var audit_documents = [_]seclang.parser.Document{audit_parsed.document};
+    const audit_plan = try compiled_plan.compile(std.testing.allocator, &audit_parsed.registry, &audit_documents, .{});
+    defer audit_plan.deinit();
+    var reduced_builder = Builder.init(std.testing.allocator);
+    reduced_builder.setDirectiveCapabilities(.coreOnly());
+    try std.testing.expectError(error.InvalidDirectiveConfiguration, reduced_builder.buildTransferringPlan(audit_plan));
+    try std.testing.expectEqual(@as(usize, 1), audit_plan.sharedReferenceCount());
 }
 
 test "failed builds preserve caller plan ownership" {
