@@ -1,6 +1,7 @@
 //! Lossless directive-shape parser for bounded SecLang tokens.
 
 const std = @import("std");
+const diagnostic = @import("diagnostic.zig");
 const lexer = @import("lexer.zig");
 const source = @import("source.zig");
 const syntax = @import("syntax.zig");
@@ -76,6 +77,7 @@ pub const Document = struct {
     arena: std.heap.ArenaAllocator,
     source_id: source.SourceId,
     directives: std.ArrayList(Directive) = .empty,
+    diagnostics: []const diagnostic.Diagnostic = &.{},
     argument_count: usize = 0,
 
     pub fn deinit(self: *Document) void {
@@ -83,6 +85,25 @@ pub const Document = struct {
         self.arena.deinit();
         self.* = undefined;
     }
+};
+
+pub const Outcome = union(enum) {
+    document: Document,
+    diagnostic: diagnostic.Diagnostic,
+
+    pub fn deinit(self: *Outcome) void {
+        switch (self.*) {
+            .document => |*document| document.deinit(),
+            .diagnostic => {},
+        }
+        self.* = undefined;
+    }
+};
+
+const Failure = struct {
+    cause: anyerror,
+    primary: source.Span,
+    secondary: ?source.Span = null,
 };
 
 pub const ParseError = lexer.LexerError || syntax.SyntaxError || std.mem.Allocator.Error || error{
@@ -108,24 +129,75 @@ pub fn parseSource(
     source_id: source.SourceId,
     limits: Limits,
 ) ParseError!Document {
-    try limits.validate();
+    return parseSourceDetailed(allocator, registry, source_id, limits, null);
+}
+
+pub fn parseSourceOutcome(
+    allocator: std.mem.Allocator,
+    registry: *const source.Registry,
+    source_id: source.SourceId,
+    limits: Limits,
+) (std.mem.Allocator.Error || error{InvalidSourceId})!Outcome {
+    const input = registry.get(source_id) orelse return error.InvalidSourceId;
+    var failure: ?Failure = null;
+    const document = parseSourceDetailed(allocator, registry, source_id, limits, &failure) catch |cause| {
+        if (cause == error.OutOfMemory) return error.OutOfMemory;
+        if (cause == error.InvalidSourceId) return error.InvalidSourceId;
+        const detail = failure orelse Failure{ .cause = cause, .primary = input.fullSpan() };
+        var value = diagnostic.Diagnostic.fromError(detail.cause, detail.primary);
+        value.secondary = detail.secondary;
+        return .{ .diagnostic = value };
+    };
+    return .{ .document = document };
+}
+
+fn parseSourceDetailed(
+    allocator: std.mem.Allocator,
+    registry: *const source.Registry,
+    source_id: source.SourceId,
+    limits: Limits,
+    failure: ?*?Failure,
+) ParseError!Document {
+    limits.validate() catch |cause| {
+        if (registry.get(source_id)) |input| recordFailure(failure, cause, input.fullSpan());
+        return cause;
+    };
     const input = registry.get(source_id) orelse return error.InvalidSourceId;
     var document: Document = .{ .arena = .init(allocator), .source_id = source_id };
     errdefer document.deinit();
     var lines = try lexer.LogicalLineIterator.init(input, limits.lexer);
-    while (try lines.next(allocator)) |line_value| {
+    while (true) {
+        const line_value = lines.next(allocator) catch |cause| {
+            recordFailure(failure, cause, pointSpan(input, lines.offset));
+            return cause;
+        } orelse break;
         var line = line_value;
         defer line.deinit();
-        var tokens = try lexer.tokenize(&line, allocator, limits.lexer);
+        var tokens = lexer.tokenize(&line, allocator, limits.lexer) catch |cause| {
+            recordFailure(failure, cause, line.physical);
+            return cause;
+        };
         defer tokens.deinit();
         if (tokens.tokens.len == 0) continue;
-        if (document.directives.items.len == limits.max_directives) return error.TooManyDirectives;
+        if (document.directives.items.len == limits.max_directives) {
+            recordFailure(failure, error.TooManyDirectives, line.physical);
+            return error.TooManyDirectives;
+        }
         const name_token = tokens.tokens[0];
-        if (name_token.quote != .unquoted or !validDirectiveName(name_token.raw)) return error.InvalidDirectiveName;
+        if (name_token.quote != .unquoted or !validDirectiveName(name_token.raw)) {
+            recordFailure(failure, error.InvalidDirectiveName, name_token.physical);
+            return error.InvalidDirectiveName;
+        }
         const argument_count = tokens.tokens.len - 1;
-        if (argument_count > limits.max_arguments -| document.argument_count) return error.TooManyArguments;
+        if (argument_count > limits.max_arguments -| document.argument_count) {
+            recordFailure(failure, error.TooManyArguments, line.physical);
+            return error.TooManyArguments;
+        }
         const kind = classify(name_token.raw);
-        try validateShape(kind, argument_count);
+        validateShape(kind, argument_count) catch |cause| {
+            recordFailure(failure, cause, shapeFailureSpan(line.physical, tokens.tokens, cause));
+            return cause;
+        };
 
         const arena = document.arena.allocator();
         const arguments = try arena.alloc(Argument, argument_count);
@@ -141,14 +213,26 @@ pub fn parseSource(
         var parsed_actions: []const syntax.Action = &.{};
         switch (kind) {
             .sec_rule => {
-                parsed_targets = try syntax.parseTargets(arena, arguments[0].content(), limits.syntax);
-                parsed_operator = try syntax.parseOperator(arguments[1].content());
+                parsed_targets = syntax.parseTargets(arena, arguments[0].content(), limits.syntax) catch |cause| {
+                    recordFailure(failure, cause, arguments[0].physical);
+                    return cause;
+                };
+                parsed_operator = syntax.parseOperator(arguments[1].content()) catch |cause| {
+                    recordFailure(failure, cause, arguments[1].physical);
+                    return cause;
+                };
                 if (arguments.len == 3) {
-                    parsed_actions = try syntax.parseActions(arena, arguments[2].content(), limits.syntax);
+                    parsed_actions = syntax.parseActions(arena, arguments[2].content(), limits.syntax) catch |cause| {
+                        recordFailure(failure, cause, arguments[2].physical);
+                        return cause;
+                    };
                 }
             },
             .sec_action, .sec_default_action => {
-                parsed_actions = try syntax.parseActions(arena, arguments[0].content(), limits.syntax);
+                parsed_actions = syntax.parseActions(arena, arguments[0].content(), limits.syntax) catch |cause| {
+                    recordFailure(failure, cause, arguments[0].physical);
+                    return cause;
+                };
             },
             else => {},
         }
@@ -165,6 +249,30 @@ pub fn parseSource(
         document.argument_count += argument_count;
     }
     return document;
+}
+
+fn recordFailure(output: ?*?Failure, cause: anyerror, primary: source.Span) void {
+    if (output) |target| target.* = .{ .cause = cause, .primary = primary };
+}
+
+fn pointSpan(input: *const source.Source, offset: usize) source.Span {
+    const point: u32 = @intCast(@min(offset, input.bytes.len));
+    return .{ .source = input.id, .start = point, .end = point };
+}
+
+fn shapeFailureSpan(line: source.Span, tokens: []const lexer.Token, cause: anyerror) source.Span {
+    if (cause == error.TooManyRuleArguments or
+        cause == error.TooManyActionArguments or
+        cause == error.TooManyMarkerArguments or
+        cause == error.TooManyIncludeArguments)
+    {
+        return tokens[tokens.len - 1].physical;
+    }
+    if (tokens.len > 1) {
+        const last = tokens[tokens.len - 1].physical;
+        return .{ .source = last.source, .start = last.end, .end = last.end };
+    }
+    return .{ .source = line.source, .start = tokens[0].physical.end, .end = tokens[0].physical.end };
 }
 
 fn classify(name: []const u8) Kind {
@@ -285,4 +393,30 @@ test "parser propagates structured syntax failures and limits" {
     try std.testing.expectError(error.EmptyTarget, parseSource(std.testing.allocator, &registry, malformed, .{}));
     const bounded = try registry.add("bounded.conf", "SecAction \"log,pass\"", null);
     try std.testing.expectError(error.TooManyActions, parseSource(std.testing.allocator, &registry, bounded, .{ .syntax = .{ .max_actions = 1 } }));
+}
+
+test "diagnosed parsing reports first middle and final source locations" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+
+    const first = try registry.add("first.conf", "\"SecAction\" pass", null);
+    var first_outcome = try parseSourceOutcome(std.testing.allocator, &registry, first, .{});
+    defer first_outcome.deinit();
+    try std.testing.expectEqual(diagnostic.Code.invalid_directive_name, first_outcome.diagnostic.code);
+    try std.testing.expectEqual(@as(u32, 0), first_outcome.diagnostic.primary.start);
+
+    const middle = try registry.add("middle.conf", "SecAction pass\n\"SecRule\" ARGS @rx\nSecAction deny", null);
+    var middle_outcome = try parseSourceOutcome(std.testing.allocator, &registry, middle, .{});
+    defer middle_outcome.deinit();
+    const middle_location = try registry.location(middle, middle_outcome.diagnostic.primary.start);
+    try std.testing.expectEqual(@as(u32, 2), middle_location.line);
+    try std.testing.expectEqual(@as(u32, 1), middle_location.column);
+
+    const final = try registry.add("final.conf", "SecAction pass\nSecRule ARGS", null);
+    var final_outcome = try parseSourceOutcome(std.testing.allocator, &registry, final, .{});
+    defer final_outcome.deinit();
+    try std.testing.expectEqual(diagnostic.Code.missing_rule_operator, final_outcome.diagnostic.code);
+    const final_location = try registry.location(final, final_outcome.diagnostic.primary.start);
+    try std.testing.expectEqual(@as(u32, 2), final_location.line);
+    try std.testing.expectEqual(@as(u32, 13), final_location.column);
 }
