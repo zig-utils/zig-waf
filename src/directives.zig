@@ -224,7 +224,7 @@ pub const ValidationOutcome = union(enum) {
     diagnostic: Diagnostic,
 };
 
-const Arity = struct { minimum: u8, maximum: u8 };
+const Arity = struct { minimum: usize, maximum: usize };
 
 const M = Presence{ .modsecurity = true, .coraza = false };
 const C = Presence{ .modsecurity = false, .coraza = true };
@@ -417,6 +417,7 @@ fn arity(id: Id) Arity {
     return switch (id) {
         .sec_rule => .{ .minimum = 2, .maximum = 3 },
         .sec_response_body_mime_types_clear => .{ .minimum = 0, .maximum = 0 },
+        .sec_response_body_mime_type => .{ .minimum = 1, .maximum = std.math.maxInt(usize) },
         .sec_remote_rules,
         .sec_rule_update_target_by_id,
         .sec_rule_update_target_by_msg,
@@ -566,7 +567,7 @@ test "plan validation recognizes the union and decodes strict scalar schemas" {
         \\SecRequestBodyAccess On
         \\SecRequestBodyLimit 1048576
         \\SecResponseBodyMimeTypesClear
-        \\SecResponseBodyMimeType application/json
+        \\SecResponseBodyMimeType application/json text/plain text/html
         \\SecAuditEngine RelevantOnly
         \\SecAuditLogType Concurrent
         \\SecAuditLogFormat JSON
