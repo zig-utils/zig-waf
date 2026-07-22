@@ -30,6 +30,32 @@ pub const AuditEngine = enum {
     relevant_only,
 };
 
+pub const ControlKind = enum {
+    audit_engine,
+    audit_log_parts,
+    force_request_body_variable,
+    request_body_access,
+    request_body_limit,
+    request_body_processor,
+    response_body_access,
+    rule_engine,
+    rule_remove_by_id,
+    rule_remove_by_tag,
+    rule_remove_target_by_id,
+    rule_remove_target_by_tag,
+};
+
+pub const BodyProcessor = enum {
+    json,
+    xml,
+    urlencoded,
+};
+
+pub const Control = struct {
+    kind: ControlKind,
+    value: []const u8,
+};
+
 pub const Severity = enum(u3) {
     emergency = 0,
     alert = 1,
@@ -233,6 +259,41 @@ pub fn parseBoolean(value: []const u8) ParseError!bool {
     return error.InvalidOperation;
 }
 
+pub fn parseControl(value: []const u8) ParseError!Control {
+    const assignment = try parseAssignment(value);
+    if (assignment.value.len == 0) return error.MissingValue;
+    const kinds = [_]struct { name: []const u8, kind: ControlKind }{
+        .{ .name = "auditEngine", .kind = .audit_engine },
+        .{ .name = "auditLogParts", .kind = .audit_log_parts },
+        .{ .name = "forceRequestBodyVariable", .kind = .force_request_body_variable },
+        .{ .name = "requestBodyAccess", .kind = .request_body_access },
+        .{ .name = "requestBodyLimit", .kind = .request_body_limit },
+        .{ .name = "requestBodyProcessor", .kind = .request_body_processor },
+        .{ .name = "responseBodyAccess", .kind = .response_body_access },
+        .{ .name = "ruleEngine", .kind = .rule_engine },
+        .{ .name = "ruleRemoveById", .kind = .rule_remove_by_id },
+        .{ .name = "ruleRemoveByTag", .kind = .rule_remove_by_tag },
+        .{ .name = "ruleRemoveTargetById", .kind = .rule_remove_target_by_id },
+        .{ .name = "ruleRemoveTargetByTag", .kind = .rule_remove_target_by_tag },
+    };
+    for (kinds) |entry| if (std.ascii.eqlIgnoreCase(assignment.name, entry.name))
+        return .{ .kind = entry.kind, .value = assignment.value };
+    return error.InvalidName;
+}
+
+pub fn parseBodyProcessor(value: []const u8) ParseError!BodyProcessor {
+    if (std.ascii.eqlIgnoreCase(value, "json")) return .json;
+    if (std.ascii.eqlIgnoreCase(value, "xml")) return .xml;
+    if (std.ascii.eqlIgnoreCase(value, "urlencoded")) return .urlencoded;
+    return error.InvalidOperation;
+}
+
+pub fn parsePositiveUsize(value: []const u8) ParseError!usize {
+    const number = parseUnsigned(value) catch return error.InvalidNumber;
+    if (number == 0 or number > std.math.maxInt(usize)) return error.NumberOutOfRange;
+    return @intCast(number);
+}
+
 fn parseVariable(value: []const u8) ParseError!struct { collection: Collection, key: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return error.InvalidVariable;
     if (dot == 0 or dot + 1 == value.len) return error.InvalidVariable;
@@ -311,4 +372,17 @@ test "allow status skip and runtime modes validate without allocation" {
     try std.testing.expectError(error.InvalidOperation, parseEngineMode("enabled"));
     try std.testing.expectError(error.InvalidOperation, parseAuditEngine("sometimes"));
     try std.testing.expectError(error.InvalidOperation, parseBoolean("yes"));
+}
+
+test "runtime control names and body values parse without allocation" {
+    try std.testing.expectEqualDeep(Control{ .kind = .rule_engine, .value = "DetectionOnly" }, try parseControl("ruleEngine=DetectionOnly"));
+    try std.testing.expectEqualDeep(Control{ .kind = .rule_remove_target_by_id, .value = "942100;ARGS:password" }, try parseControl("ruleRemoveTargetById=942100;ARGS:password"));
+    try std.testing.expectEqual(BodyProcessor.json, try parseBodyProcessor("JSON"));
+    try std.testing.expectEqual(BodyProcessor.urlencoded, try parseBodyProcessor("urlencoded"));
+    try std.testing.expectEqual(@as(usize, 1048576), try parsePositiveUsize("1048576"));
+    try std.testing.expectError(error.InvalidName, parseControl("unknown=On"));
+    try std.testing.expectError(error.InvalidOperation, parseControl("ruleEngine"));
+    try std.testing.expectError(error.MissingValue, parseControl("ruleEngine="));
+    try std.testing.expectError(error.InvalidOperation, parseBodyProcessor("multipart"));
+    try std.testing.expectError(error.NumberOutOfRange, parsePositiveUsize("0"));
 }
