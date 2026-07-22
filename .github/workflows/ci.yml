@@ -35,6 +35,11 @@ jobs:
           repository: stacksjs/stx
           ref: 38b8e9bfd8079dd3987427894b74608bf4d47876
           path: stx
+      - uses: actions/checkout@v4
+        with:
+          repository: coreruleset/coreruleset
+          ref: 55b09f5acfd16413e7b31041100711ceb7adc89c
+          path: owasp-crs
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0-dev.1441+d5181a9c9
@@ -55,15 +60,23 @@ jobs:
           test "$(git -C ../zig-regex rev-parse HEAD)" = "$(jq -r '.repositories["zig-regex"].commit' dependencies.lock.json)"
           test "$(git -C ../zig-tls rev-parse HEAD)" = "$(jq -r '.repositories["zig-tls"].commit' dependencies.lock.json)"
           test "$(git -C ../stx rev-parse HEAD)" = "$(jq -r '.repositories.stx.commit' dependencies.lock.json)"
+          test "$(git -C ../owasp-crs rev-parse HEAD)" = "$(jq -r '.repositories["owasp-crs"].commit' dependencies.lock.json)"
       - name: Format
         working-directory: zig-waf
-        run: zig fmt --check build.zig src benchmarks
+        run: zig fmt --check build.zig src benchmarks tools
       - name: Test
         working-directory: zig-waf
         run: zig build test
       - name: Compile
         working-directory: zig-waf
         run: zig build check
+      - name: CRS 4.28 parser corpus
+        working-directory: zig-waf
+        run: >-
+          zig build test-parser-corpus
+          -Dparser-corpus=../owasp-crs/crs-setup.conf.example
+          -Dparser-corpus=../owasp-crs/plugins
+          -Dparser-corpus=../owasp-crs/rules
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
