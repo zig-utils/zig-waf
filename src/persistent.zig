@@ -3,7 +3,7 @@
 const std = @import("std");
 const collections = @import("collections.zig");
 
-pub const backend_abi_version: u32 = 2;
+pub const backend_abi_version: u32 = 3;
 
 pub const BackendFeature = enum(u8) {
     optimistic_revisions,
@@ -111,6 +111,7 @@ pub const Value = struct {
     value: []const u8,
     has_value: bool = true,
     expires_at_ns: ?i64 = null,
+    updated_at_ns: ?i64 = null,
 
     pub fn expired(self: Value, now_ns: i64) bool {
         return if (self.expires_at_ns) |deadline| deadline <= now_ns else false;
@@ -134,6 +135,7 @@ pub const Snapshot = struct {
             .value = try allocator.dupe(u8, value.value),
             .has_value = value.has_value,
             .expires_at_ns = value.expires_at_ns,
+            .updated_at_ns = value.updated_at_ns,
         });
     }
 
@@ -149,6 +151,8 @@ pub const SetMutation = struct {
     value: []const u8,
     expires_at_ns: ?i64 = null,
     preserve_existing_expiry: bool = true,
+    updated_at_ns: ?i64 = null,
+    preserve_existing_update_time: bool = true,
 };
 
 pub const Mutation = union(enum) {
@@ -161,6 +165,12 @@ pub const Mutation = union(enum) {
     subtract: struct {
         name: []const u8,
         delta: i64,
+    },
+    deprecate: struct {
+        name: []const u8,
+        amount: u32,
+        period_ns: i64,
+        now_ns: i64,
     },
     expire: struct {
         name: []const u8,
@@ -233,16 +243,29 @@ pub const SessionError = BackendError || error{
     RetryLimitExceeded,
 };
 
+pub const DeprecationResult = struct {
+    value: i64,
+    updated_at_ns: i64,
+};
+
 const Binding = struct {
     namespace: Namespace,
     collection_key: []const u8,
     revision: u64,
     mutations: std.ArrayList(Mutation) = .empty,
+    initial_update_times: std.ArrayList(UpdateTime) = .empty,
+    staged_update_times: std.ArrayList(UpdateTime) = .empty,
+};
+
+const UpdateTime = struct {
+    name: []const u8,
+    updated_at_ns: ?i64,
 };
 
 pub const Checkpoint = struct {
     binding_count: usize,
     mutation_counts: [std.meta.fieldNames(Namespace).len]usize,
+    update_time_counts: [std.meta.fieldNames(Namespace).len]usize,
 };
 
 /// Per-request persistence state. Creating a session performs no backend I/O;
@@ -272,11 +295,18 @@ pub const Session = struct {
         var snapshot = try self.backend.load(self.arena.child_allocator, namespace, collection_key, now_ns, self.limits);
         errdefer snapshot.deinit();
         const allocator = self.arena.allocator();
-        try self.bindings.append(allocator, .{
+        var binding: Binding = .{
             .namespace = namespace,
             .collection_key = try allocator.dupe(u8, collection_key),
             .revision = snapshot.revision,
-        });
+        };
+        for (snapshot.values.items) |value| if (value.updated_at_ns) |updated_at_ns| {
+            try binding.initial_update_times.append(allocator, .{
+                .name = try allocator.dupe(u8, value.name),
+                .updated_at_ns = updated_at_ns,
+            });
+        };
+        try self.bindings.append(allocator, binding);
         return snapshot;
     }
 
@@ -293,7 +323,15 @@ pub const Session = struct {
 
     pub fn remove(self: *Session, namespace: Namespace, name: []const u8) SessionError!void {
         if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
-        try self.appendMutation(namespace, .{ .remove = try self.arena.allocator().dupe(u8, name) });
+        const binding = self.findBinding(namespace) orelse return error.CollectionNotInitialized;
+        if (binding.mutations.items.len == self.limits.max_mutations_per_commit) return error.TooManyMutations;
+        const allocator = self.arena.allocator();
+        try binding.mutations.ensureUnusedCapacity(allocator, 1);
+        try binding.staged_update_times.ensureUnusedCapacity(allocator, 1);
+        const mutation_name = try allocator.dupe(u8, name);
+        const clock_name = try allocator.dupe(u8, name);
+        binding.mutations.appendAssumeCapacity(.{ .remove = mutation_name });
+        binding.staged_update_times.appendAssumeCapacity(.{ .name = clock_name, .updated_at_ns = null });
     }
 
     pub fn add(self: *Session, namespace: Namespace, name: []const u8, delta: i64) SessionError!void {
@@ -310,6 +348,54 @@ pub const Session = struct {
             .name = try self.arena.allocator().dupe(u8, name),
             .delta = delta,
         } });
+    }
+
+    /// Stage elapsed-time decay while retaining an append-only clock history
+    /// that can be truncated by `rollback`. The backend recomputes the same
+    /// operation against its authoritative revision during commit/retry.
+    pub fn deprecate(
+        self: *Session,
+        namespace: Namespace,
+        name: []const u8,
+        current_value: ?i64,
+        amount: u32,
+        period_ns: i64,
+        now_ns: i64,
+    ) SessionError!?DeprecationResult {
+        if (name.len == 0 or name.len > self.limits.max_variable_name_bytes or amount == 0 or period_ns <= 0 or now_ns < 0)
+            return error.InvalidMutation;
+        const binding = self.findBinding(namespace) orelse return error.CollectionNotInitialized;
+        const current = current_value orelse return null;
+        if (binding.mutations.items.len == self.limits.max_mutations_per_commit) return error.TooManyMutations;
+
+        const prior_update = switch (findLatestUpdateTime(binding, name)) {
+            .value => |value| value,
+            .absent, .reset => now_ns,
+        };
+        const elapsed = @max(@as(i64, 0), now_ns -| prior_update);
+        const periods = @divFloor(elapsed, period_ns);
+        const decrement = @as(i128, amount) * @as(i128, periods);
+        const next_wide = @max(@as(i128, 0), @as(i128, @max(@as(i64, 0), current)) - decrement);
+        const next: i64 = @intCast(next_wide);
+        const advanced = std.math.mul(i64, periods, period_ns) catch return error.CapacityExceeded;
+        const updated_at_ns = std.math.add(i64, prior_update, advanced) catch return error.CapacityExceeded;
+
+        const allocator = self.arena.allocator();
+        try binding.mutations.ensureUnusedCapacity(allocator, 1);
+        try binding.staged_update_times.ensureUnusedCapacity(allocator, 1);
+        const mutation_name = try allocator.dupe(u8, name);
+        const clock_name = try allocator.dupe(u8, name);
+        binding.mutations.appendAssumeCapacity(.{ .deprecate = .{
+            .name = mutation_name,
+            .amount = amount,
+            .period_ns = period_ns,
+            .now_ns = now_ns,
+        } });
+        binding.staged_update_times.appendAssumeCapacity(.{
+            .name = clock_name,
+            .updated_at_ns = updated_at_ns,
+        });
+        return .{ .value = next, .updated_at_ns = updated_at_ns };
     }
 
     pub fn expire(self: *Session, namespace: Namespace, name: []const u8, expires_at_ns: i64) SessionError!void {
@@ -374,9 +460,11 @@ pub const Session = struct {
         var result: Checkpoint = .{
             .binding_count = self.bindings.items.len,
             .mutation_counts = @splat(0),
+            .update_time_counts = @splat(0),
         };
         for (self.bindings.items) |binding| {
             result.mutation_counts[@backingInt(binding.namespace)] = binding.mutations.items.len;
+            result.update_time_counts[@backingInt(binding.namespace)] = binding.staged_update_times.items.len;
         }
         return result;
     }
@@ -387,6 +475,9 @@ pub const Session = struct {
             const count = checkpoint_value.mutation_counts[@backingInt(binding.namespace)];
             std.debug.assert(count <= binding.mutations.items.len);
             binding.mutations.shrinkRetainingCapacity(count);
+            const update_count = checkpoint_value.update_time_counts[@backingInt(binding.namespace)];
+            std.debug.assert(update_count <= binding.staged_update_times.items.len);
+            binding.staged_update_times.shrinkRetainingCapacity(update_count);
         }
         self.bindings.shrinkRetainingCapacity(checkpoint_value.binding_count);
     }
@@ -426,6 +517,23 @@ pub const Session = struct {
     }
 };
 
+const UpdateTimeLookup = union(enum) { absent, reset, value: i64 };
+
+fn findLatestUpdateTime(binding: *const Binding, name: []const u8) UpdateTimeLookup {
+    var index = binding.staged_update_times.items.len;
+    while (index != 0) {
+        index -= 1;
+        const candidate = binding.staged_update_times.items[index];
+        if (binding.namespace.collectionName().keysEqual(candidate.name, name)) {
+            return if (candidate.updated_at_ns) |value| .{ .value = value } else .reset;
+        }
+    }
+    for (binding.initial_update_times.items) |candidate| {
+        if (binding.namespace.collectionName().keysEqual(candidate.name, name)) return .{ .value = candidate.updated_at_ns.? };
+    }
+    return .absent;
+}
+
 /// Owned mutable record used by persistence backend implementations.
 pub const Record = struct {
     arena: std.heap.ArenaAllocator,
@@ -460,6 +568,7 @@ pub const Record = struct {
             .value = try allocator.dupe(u8, value.value),
             .has_value = value.has_value,
             .expires_at_ns = value.expires_at_ns,
+            .updated_at_ns = value.updated_at_ns,
         });
     }
 
@@ -602,15 +711,25 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
                     record.values.items[index].expires_at_ns
                 else
                     set.expires_at_ns;
+                const updated_at_ns = if (set.preserve_existing_update_time)
+                    record.values.items[index].updated_at_ns
+                else
+                    set.updated_at_ns;
                 record.values.items[index] = .{
                     .name = try allocator.dupe(u8, set.name),
                     .value = try allocator.dupe(u8, set.value),
                     .has_value = true,
                     .expires_at_ns = expires_at_ns,
+                    .updated_at_ns = updated_at_ns,
                 };
             } else {
                 if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
-                try record.append(.{ .name = set.name, .value = set.value, .expires_at_ns = set.expires_at_ns });
+                try record.append(.{
+                    .name = set.name,
+                    .value = set.value,
+                    .expires_at_ns = set.expires_at_ns,
+                    .updated_at_ns = set.updated_at_ns,
+                });
             }
         },
         .remove => |name| {
@@ -635,6 +754,7 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
                     .value = try allocator.dupe(u8, value),
                     .has_value = true,
                     .expires_at_ns = record.values.items[value_index].expires_at_ns,
+                    .updated_at_ns = record.values.items[value_index].updated_at_ns,
                 };
             } else {
                 if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
@@ -659,11 +779,40 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
                     .value = try allocator.dupe(u8, value),
                     .has_value = true,
                     .expires_at_ns = record.values.items[value_index].expires_at_ns,
+                    .updated_at_ns = record.values.items[value_index].updated_at_ns,
                 };
             } else {
                 if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
                 try record.append(.{ .name = subtract.name, .value = value });
             }
+        },
+        .deprecate => |deprecate| {
+            if (deprecate.name.len == 0 or deprecate.name.len > limits.max_variable_name_bytes or
+                deprecate.amount == 0 or deprecate.period_ns <= 0 or deprecate.now_ns < 0)
+            {
+                return error.InvalidMutation;
+            }
+            const index = findValue(record.values.items, deprecate.name) orelse continue;
+            if (!record.values.items[index].has_value) continue;
+            const prior_update = record.values.items[index].updated_at_ns orelse deprecate.now_ns;
+            const elapsed = @max(@as(i64, 0), deprecate.now_ns -| prior_update);
+            const periods = @divFloor(elapsed, deprecate.period_ns);
+            const decrement = @as(i128, deprecate.amount) * @as(i128, periods);
+            const current = parseNumericOrZero(record.values.items[index].value);
+            const next_wide = @max(@as(i128, 0), @as(i128, @max(@as(i64, 0), current)) - decrement);
+            const next: i64 = @intCast(next_wide);
+            const advanced = std.math.mul(i64, periods, deprecate.period_ns) catch return error.CapacityExceeded;
+            const updated_at_ns = std.math.add(i64, prior_update, advanced) catch return error.CapacityExceeded;
+            var text: [24]u8 = undefined;
+            const value = std.fmt.bufPrint(&text, "{d}", .{next}) catch unreachable;
+            const allocator = record.arena.allocator();
+            record.values.items[index] = .{
+                .name = try allocator.dupe(u8, deprecate.name),
+                .value = try allocator.dupe(u8, value),
+                .has_value = true,
+                .expires_at_ns = record.values.items[index].expires_at_ns,
+                .updated_at_ns = updated_at_ns,
+            };
         },
         .expire => |expire| {
             if (expire.name.len == 0 or expire.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
@@ -906,6 +1055,63 @@ test "subtraction preserves the full signed operand domain" {
     var result = try backend.load(std.testing.allocator, .global, "global", 0, limits);
     defer result.deinit();
     try std.testing.expectEqualStrings("0", result.values.items[0].value);
+}
+
+test "deprecation uses elapsed whole periods and rollback restores its clock" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const backend = memory.backend();
+    const limits: Limits = .{};
+    try std.testing.expectEqual(@as(u64, 1), try backend.commit(.{
+        .namespace = .global,
+        .collection_key = "global",
+        .expected_revision = 0,
+        .mutations = &.{.{ .set = .{
+            .name = "score",
+            .value = "100",
+            .updated_at_ns = 0,
+            .preserve_existing_update_time = false,
+        } }},
+        .limits = limits,
+    }));
+
+    var session = try Session.init(std.testing.allocator, backend, limits);
+    defer session.deinit();
+    var snapshot = (try session.initialize(.global, "global", 25 * std.time.ns_per_s)).?;
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(i64, 0), snapshot.values.items[0].updated_at_ns.?);
+    const before_rule = session.checkpoint();
+    const discarded = (try session.deprecate(.global, "score", 100, 10, 10 * std.time.ns_per_s, 25 * std.time.ns_per_s)).?;
+    try std.testing.expectEqual(@as(i64, 80), discarded.value);
+    try std.testing.expectEqual(@as(i64, 20 * std.time.ns_per_s), discarded.updated_at_ns);
+    session.rollback(before_rule);
+
+    const applied = (try session.deprecate(.global, "score", 100, 10, 10 * std.time.ns_per_s, 35 * std.time.ns_per_s)).?;
+    try std.testing.expectEqual(@as(i64, 70), applied.value);
+    try std.testing.expectEqual(@as(i64, 30 * std.time.ns_per_s), applied.updated_at_ns);
+    const same_period = (try session.deprecate(.global, "score", applied.value, 10, 10 * std.time.ns_per_s, 35 * std.time.ns_per_s)).?;
+    try std.testing.expectEqual(@as(i64, 70), same_period.value);
+    try std.testing.expectEqual(@as(usize, 1), try session.flush(35 * std.time.ns_per_s));
+
+    var result = try backend.load(std.testing.allocator, .global, "global", 35 * std.time.ns_per_s, limits);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("70", result.values.items[0].value);
+    try std.testing.expectEqual(@as(i64, 30 * std.time.ns_per_s), result.values.items[0].updated_at_ns.?);
+
+    var reset_session = try Session.init(std.testing.allocator, backend, limits);
+    defer reset_session.deinit();
+    var reset_snapshot = (try reset_session.initialize(.global, "global", 55 * std.time.ns_per_s)).?;
+    reset_snapshot.deinit();
+    try reset_session.remove(.global, "score");
+    try reset_session.set(.global, "score", "100", null);
+    const reset = (try reset_session.deprecate(.global, "score", 100, 10, 10 * std.time.ns_per_s, 55 * std.time.ns_per_s)).?;
+    try std.testing.expectEqual(@as(i64, 100), reset.value);
+    try std.testing.expectEqual(@as(i64, 55 * std.time.ns_per_s), reset.updated_at_ns);
+    try std.testing.expectEqual(@as(usize, 1), try reset_session.flush(55 * std.time.ns_per_s));
+    var reset_result = try backend.load(std.testing.allocator, .global, "global", 55 * std.time.ns_per_s, limits);
+    defer reset_result.deinit();
+    try std.testing.expectEqualStrings("100", reset_result.values.items[0].value);
+    try std.testing.expectEqual(@as(i64, 55 * std.time.ns_per_s), reset_result.values.items[0].updated_at_ns.?);
 }
 
 test "session creation and unused state perform no backend work" {

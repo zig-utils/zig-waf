@@ -920,7 +920,52 @@ pub const Transaction = struct {
                     try self.stagePersistentExpiry(namespace, name, seconds);
                     result.effects_applied += 1;
                 },
-                .deprecatevar => result.pending_persistent_effects += 1,
+                .deprecatevar => {
+                    if (!include_persistent) {
+                        result.pending_persistent_effects += 1;
+                        continue;
+                    }
+                    const configured_collection = effect.collection orelse return error.InvalidRuleReference;
+                    const namespace = persistentNamespace(configured_collection) orelse return error.InvalidRuleReference;
+                    if (self.persistentNamespaceFailedOpen(namespace)) {
+                        result.effects_applied += 1;
+                        continue;
+                    }
+                    const collection_name = effectCollectionName(configured_collection);
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    errdefer self.waf.allocator.free(name);
+                    if (name.len == 0) return error.InvalidActionValue;
+                    const amount_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    defer self.waf.allocator.free(amount_text);
+                    const period_text = try self.expandEffectTextStaged(effect.auxiliary orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    defer self.waf.allocator.free(period_text);
+                    const amount = action_config.parsePositiveU32(amount_text) catch return error.InvalidActionValue;
+                    const period_seconds = action_config.parsePositiveU32(period_text) catch return error.InvalidActionValue;
+                    const current_text: ?[]const u8 = switch (batch.lookup(collection_name, name)) {
+                        .value => |value| value,
+                        .removed => null,
+                        .missing => if (self.collection_variables.first(collection_name, name)) |value| value.value else null,
+                    };
+                    const period_ns = std.math.mul(i64, @as(i64, period_seconds), std.time.ns_per_s) catch
+                        return error.PersistentTimestampOverflow;
+                    const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+                    const deprecation = try session.deprecate(
+                        namespace,
+                        name,
+                        if (current_text) |value| persistent.parseNumericOrZero(value) else null,
+                        amount,
+                        period_ns,
+                        try self.persistentNow(),
+                    );
+                    if (deprecation) |applied| {
+                        const next = try std.fmt.allocPrint(self.waf.allocator, "{d}", .{applied.value});
+                        errdefer self.waf.allocator.free(next);
+                        try batch.putOwned(collection_name, name, next, source);
+                    } else {
+                        self.waf.allocator.free(name);
+                    }
+                    result.effects_applied += 1;
+                },
             }
         }
 
@@ -2828,7 +2873,7 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
 
 test "matched-rule effects bind mutate expire and flush persistent namespaces" {
     const input =
-        \\SecRule ARGS @rx "id:8,initcol:'ip=%{REMOTE_ADDR}',setvar:'ip.score=1',setvar:'ip.score=+2',expirevar:'ip.score=60',setsid:'%{TX.sid}',setvar:'session.flag=1',setuid:'alice',setvar:'user.copy=%{SESSION.flag}',setrsc:'/account',setvar:'resource.hit'"
+        \\SecRule ARGS @rx "id:8,initcol:'ip=%{REMOTE_ADDR}',setvar:'ip.score=1',setvar:'ip.score=+2',deprecatevar:'ip.score=1/10',expirevar:'ip.score=60',setsid:'%{TX.sid}',setvar:'session.flag=1',setuid:'alice',setvar:'user.copy=%{SESSION.flag}',setrsc:'/account',setvar:'resource.hit'"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "persistent-effects.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -2856,7 +2901,7 @@ test "matched-rule effects bind mutate expire and flush persistent namespaces" {
         .value = "value",
         .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
     });
-    try std.testing.expectEqual(@as(usize, 10), outcome.effects_applied);
+    try std.testing.expectEqual(@as(usize, 11), outcome.effects_applied);
     try std.testing.expectEqual(@as(usize, 0), outcome.pending_persistent_effects);
     try std.testing.expectEqualStrings("3", (try tx.collectionFirst(.ip, "score")).?.value);
     try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.session, "flag")).?.value);
@@ -2870,6 +2915,7 @@ test "matched-rule effects bind mutate expire and flush persistent namespaces" {
     var ip_before_expiry = try memory.backend().load(std.testing.allocator, .ip, "192.0.2.20", 65 * std.time.ns_per_s - 1, .{});
     defer ip_before_expiry.deinit();
     try std.testing.expectEqualStrings("3", ip_before_expiry.values.items[0].value);
+    try std.testing.expectEqual(@as(i64, 5 * std.time.ns_per_s), ip_before_expiry.values.items[0].updated_at_ns.?);
     var ip_at_expiry = try memory.backend().load(std.testing.allocator, .ip, "192.0.2.20", 65 * std.time.ns_per_s, .{});
     defer ip_at_expiry.deinit();
     try std.testing.expectEqual(@as(usize, 0), ip_at_expiry.values.items.len);
