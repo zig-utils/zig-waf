@@ -104,6 +104,13 @@ pub fn build(b: *std.Build) void {
     const parser_corpus_step = b.step("test-parser-corpus", "Parse SecLang files beneath corpus roots");
     parser_corpus_step.dependOn(&run_parser_corpus.step);
 
+    const run_plan_corpus = b.addRunArtifact(parser_corpus);
+    run_plan_corpus.addArg("--compile-plan");
+    if (b.option([]const []const u8, "plan-corpus", "SecLang structural plan corpus file or directory (repeatable)")) |corpus_roots|
+        run_plan_corpus.addArgs(corpus_roots);
+    const plan_corpus_step = b.step("test-plan-corpus", "Compile structural plans beneath corpus roots");
+    plan_corpus_step.dependOn(&run_plan_corpus.step);
+
     const parser_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_fuzz.zig"),
         .target = target,
