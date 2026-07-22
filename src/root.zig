@@ -2,6 +2,7 @@
 
 pub const version = "0.0.0-dev";
 pub const compatibility = @import("compatibility.zig");
+pub const collections = @import("collections.zig");
 pub const engine = @import("engine.zig");
 pub const operators = @import("operators.zig");
 pub const variables = @import("variables.zig");
@@ -20,6 +21,7 @@ pub const ClockSource = engine.ClockSource;
 test {
     _ = version;
     _ = compatibility;
+    _ = collections;
     _ = engine;
     _ = operators;
     _ = variables;
