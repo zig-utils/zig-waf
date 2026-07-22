@@ -1,0 +1,112 @@
+{
+  "schemaVersion": 1,
+  "issue": "WAF-13",
+  "zig": "0.17.0-dev.1441+d5181a9c9",
+  "compilerAbi": 3,
+  "baselines": {
+    "modsecurity": {
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d"
+    },
+    "coraza": {
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360"
+    },
+    "crs": {
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c"
+    }
+  },
+  "contracts": {
+    "phaseScopedDefaults": true,
+    "immutableRemovalEvidence": true,
+    "idTagAndMessageSelectors": true,
+    "orderedTargetUpdates": true,
+    "orderedActionUpdates": true,
+    "nextMarkerResolution": true,
+    "strictAndCompatibilityMissingRulePolicies": true,
+    "authenticatedBoundedRemoteLoading": true,
+    "orderedLocalAndRemoteSourceAssembly": true,
+    "secretRedactedFingerprinting": true,
+    "noStaleRemoteFallback": true
+  },
+  "fixtures": [
+    {
+      "name": "default-actions",
+      "file": "src/compatibility/fixtures/rule-configuration/default-actions.conf",
+      "upstream": [
+        "ModSecurity/test/test-cases/regression/config-secdefaultaction.json",
+        "Coraza/internal/seclang/rule_parser_test.go"
+      ],
+      "test": "pinned default-action differential fixture"
+    },
+    {
+      "name": "removal-target-action-overlays",
+      "file": "src/compatibility/fixtures/rule-configuration/overlays.conf",
+      "upstream": [
+        "ModSecurity/test/test-cases/regression/config-remove_by_id.json",
+        "ModSecurity/test/test-cases/regression/config-update-target-by-id.json",
+        "ModSecurity/test/test-cases/regression/config-update-action-by-id.json",
+        "Coraza/internal/seclang/rule_parser_test.go"
+      ],
+      "test": "pinned removal target and action differential fixture"
+    },
+    {
+      "name": "next-marker-resolution",
+      "file": "src/compatibility/fixtures/rule-configuration/markers.conf",
+      "upstream": [
+        "ModSecurity/test/test-cases/regression/secmarker.json",
+        "Coraza/internal/seclang/rules_test.go",
+        "OWASP_CRS/rules/RESPONSE-950-DATA-LEAKAGES.conf",
+        "OWASP_CRS/rules/RESPONSE-959-BLOCKING-EVALUATION.conf"
+      ],
+      "test": "pinned skip-after marker differential fixture"
+    },
+    {
+      "name": "missing-rule-references",
+      "file": "src/compatibility/fixtures/rule-configuration/missing-references.conf",
+      "upstream": [
+        "Coraza/internal/seclang/rule_parser_test.go"
+      ],
+      "test": "pinned missing-reference differential fixture retains exact intervals"
+    }
+  ],
+  "qualification": {
+    "fixtureCount": 4,
+    "unitTests": 165,
+    "allocationFailureCoverage": true,
+    "deterministicFuzzIterations": 10000,
+    "deterministicFuzzSeed": 11936128518282651045,
+    "fiveRootCorpusFiles": 58,
+    "fiveRootCorpusDirectives": 925,
+    "fiveRootCorpusRules": 761,
+    "orderedCrsFiles": 30,
+    "orderedCrsDirectives": 794,
+    "orderedCrsRules": 695,
+    "unexplainedMismatches": 0
+  },
+  "releaseFastLocalBenchmark": {
+    "fixture": "OWASP CRS REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+    "inputBytes": 98977,
+    "rules": 73,
+    "baselineDirectives": 74,
+    "overlayDirectives": 77,
+    "baselineOwnedBytes": 287569,
+    "overlayOwnedBytes": 289232,
+    "overlayOwnedBytesDelta": 1663,
+    "appliedRemovals": 1,
+    "missingReferences": 0,
+    "baselineCompileNanoseconds": 190187333,
+    "overlayCompileNanoseconds": 159022917,
+    "iterations": 339,
+    "baselinePublicationNanoseconds": 11,
+    "overlayPublicationNanoseconds": 10
+  },
+  "commands": {
+    "unit": "zig build test --summary all",
+    "corpus": "zig build test-plan-corpus -Dplan-corpus=<repeatable-path>",
+    "orderedCrs": "zig build test-crs-configuration -Dcrs-configuration=<repeatable-path>",
+    "fuzz": "zig build fuzz-plan -Dplan-fuzz-iterations=10000",
+    "benchmark": "zig build bench-plan -Doptimize=ReleaseFast -Dplan-benchmark=<file>"
+  }
+}
