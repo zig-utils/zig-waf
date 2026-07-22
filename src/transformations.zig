@@ -206,6 +206,7 @@ pub const Executor = struct {
             .replace_nulls => self.replaceNulls(input),
             .hex_decode => self.hexDecode(input),
             .hex_encode => self.hexEncode(input),
+            .sql_hex_decode => self.sqlHexDecode(input),
             .url_decode => self.urlDecode(input),
             .url_encode => self.urlEncode(input),
             .parity_even_7bit => self.parity(input, true),
@@ -432,6 +433,44 @@ pub const Executor = struct {
         return finish(generated, input, true);
     }
 
+    fn sqlHexDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        var first: ?usize = null;
+        var index: usize = 0;
+        while (index + 3 < input.len) : (index += 1) {
+            if (input[index] == '0' and
+                (input[index + 1] == 'x' or input[index + 1] == 'X') and
+                isHex(input[index + 2]) and
+                isHex(input[index + 3]))
+            {
+                first = index;
+                break;
+            }
+        }
+        if (first == null) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+
+        const generated = try self.writable(input.len - 2);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first.?]);
+        index = first.?;
+        while (index < input.len) {
+            if (index + 3 < input.len and
+                input[index] == '0' and
+                (input[index + 1] == 'x' or input[index + 1] == 'X') and
+                isHex(input[index + 2]) and
+                isHex(input[index + 3]))
+            {
+                index += 2;
+                while (index + 1 < input.len and isHex(input[index]) and isHex(input[index + 1])) {
+                    generated.buffer.appendAssumeCapacity(hexNibble(input[index]).? * 16 + hexNibble(input[index + 1]).?);
+                    index += 2;
+                }
+            } else {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            }
+        }
+        return finish(generated, input, true);
+    }
+
     fn urlDecode(self: *Executor, input: []const u8) ApplyError!Result {
         var changed = false;
         var index: usize = 0;
@@ -654,6 +693,22 @@ test "hex profiles preserve pinned malformed and empty-input behavior" {
     try std.testing.expect((try coraza.apply(.hex_encode, "")).changed);
     try std.testing.expectError(error.InvalidInput, coraza.apply(.hex_decode, "414"));
     try std.testing.expectError(error.InvalidInput, coraza.apply(.hex_decode, "0z"));
+}
+
+test "SQL hex decoding preserves malformed prefixes and decodes complete runs" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualStrings("ABC", (try executor.apply(.sql_hex_decode, "0x414243")).bytes);
+    try std.testing.expectEqualStrings("aABCz  !", (try executor.apply(.sql_hex_decode, "a0x414243z 0X20!")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0xff, 'z' }, (try executor.apply(.sql_hex_decode, "0x00ffz")).bytes);
+
+    for ([_][]const u8{ "", "0x", "0x4", "0xGG", "prefix 0x4" }) |malformed| {
+        const result = try executor.apply(.sql_hex_decode, malformed);
+        try std.testing.expectEqual(Storage.borrowed, result.storage);
+        try std.testing.expect(!result.changed);
+        try std.testing.expectEqualStrings(malformed, result.bytes);
+    }
 }
 
 test "Base64 profiles separate strict partial and forgiving decoding" {
