@@ -78,15 +78,25 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = waf });
     const run_tests = b.addRunArtifact(tests);
+    const transformation_evidence_module = b.createModule(.{
+        .root_source_file = b.path("tests/transformation_evidence.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformation_evidence_module.addImport("waf", waf);
+    const transformation_evidence_tests = b.addTest(.{ .root_module = transformation_evidence_module });
+    const run_transformation_evidence_tests = b.addRunArtifact(transformation_evidence_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_c_smoke.step);
+    test_step.dependOn(&run_transformation_evidence_tests.step);
 
     const check_step = b.step("check", "Compile libraries and executables");
     check_step.dependOn(&cli.step);
     check_step.dependOn(&daemon.step);
     check_step.dependOn(&c_api.step);
     check_step.dependOn(&tests.step);
+    check_step.dependOn(&transformation_evidence_tests.step);
 
     const parser_corpus_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_corpus.zig"),
