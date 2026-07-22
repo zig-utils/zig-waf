@@ -1152,6 +1152,47 @@ pub const Transaction = struct {
         };
     }
 
+    /// Expand a compiler-owned action subexpression without reparsing macro
+    /// names on the request path. The caller owns the returned bytes.
+    pub fn expandEffectText(
+        self: *Transaction,
+        text: compiled_plan.EffectText,
+        allocator: std.mem.Allocator,
+    ) TransactionError![]u8 {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
+        const source = plan.string(text.value) orelse return error.InvalidRuleReference;
+        const program_id = text.macro orelse return allocator.dupe(u8, source);
+        const program_index: usize = @backingInt(program_id);
+        if (program_index >= plan.macro_programs.len) return error.InvalidRuleReference;
+        const program = plan.macro_programs[program_index];
+        if (program.tokens_start + program.tokens_count > plan.macro_tokens.len)
+            return error.InvalidRuleReference;
+        try self.updateDuration();
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(allocator);
+        for (plan.macro_tokens[program.tokens_start..][0..program.tokens_count]) |token| {
+            if (token.source_start + token.source_length > source.len) return error.InvalidRuleReference;
+            const raw = source[token.source_start..][0..token.source_length];
+            const value = switch (token.kind) {
+                .literal => raw,
+                .scalar => if (token.scalar) |name|
+                    resolveMacroScalar(self, name) orelse missingPlanMacro(raw, self.waf.config.macro_missing_policy)
+                else
+                    missingPlanMacro(raw, self.waf.config.macro_missing_policy),
+                .collection => if (token.collection) |name|
+                    resolveMacroCollection(self, name, if (token.key) |key| plan.string(key) else null) orelse
+                        missingPlanMacro(raw, self.waf.config.macro_missing_policy)
+                else
+                    missingPlanMacro(raw, self.waf.config.macro_missing_policy),
+            };
+            if (value.len > self.waf.config.limits.max_scalar_value_bytes -| output.items.len)
+                return error.MacroOutputTooLarge;
+            try output.appendSlice(allocator, value);
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
     pub fn setIdentity(self: *Transaction, remote_user: []const u8, user_id: []const u8) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.setScalar(.remote_user, remote_user, .connector, .request_headers);
@@ -1436,6 +1477,16 @@ fn resolveMacroCollection(context: *anyopaque, name: collections.Name, key: ?[]c
     else
         transaction.collection_variables.firstAny(name);
     return (found orelse return null).value;
+}
+
+fn missingPlanMacro(raw: []const u8, policy: macros.MissingPolicy) []const u8 {
+    return switch (policy) {
+        .empty => "",
+        .expression => if (raw.len >= 3 and std.mem.startsWith(u8, raw, "%{") and raw[raw.len - 1] == '}')
+            raw[2 .. raw.len - 1]
+        else
+            raw,
+    };
 }
 
 const ReloadWorker = struct {
@@ -2047,6 +2098,50 @@ test "rule projection uses chain-head metadata and capture replacement is bounde
         .source = source,
         .captures = &too_many,
     }));
+}
+
+test "compiled effect text expands typed scalar keyed and unkeyed macros" {
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "effect-expansion.conf",
+        "SecRule ARGS @rx \"id:1,setenv:'RESULT=%{REQUEST_URI}-%{TX.user}-%{ARGS}-%{TX.missing}'\"",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/macro", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try tx.setCollectionValue(.tx, "user", "alice", source);
+    try tx.setCollectionValue(.args, "first", "value", source);
+    const effect = plan.nondisruptive_effects[plan.rules[0].effects_start];
+    const expanded = try tx.expandEffectText(effect.value.?, std.testing.allocator);
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqualStrings("/macro-alice-value-", expanded);
+
+    var expression_builder = Builder.init(std.testing.allocator);
+    expression_builder.setRetainedPlan(plan);
+    expression_builder.setMacroMissingPolicy(.expression);
+    const expression_waf = try expression_builder.build();
+    defer expression_waf.deinit() catch unreachable;
+    var expression_tx = expression_waf.newTransaction();
+    defer expression_tx.deinit();
+    try expression_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try expression_tx.processUri("/macro", "GET", "HTTP/1.1");
+    try expression_tx.processRequestHeaders();
+    const preserved = try expression_tx.expandEffectText(effect.value.?, std.testing.allocator);
+    defer std.testing.allocator.free(preserved);
+    try std.testing.expectEqualStrings("/macro-TX.user-ARGS-TX.missing", preserved);
 }
 
 test "compiled feature discovery is explicit" {
