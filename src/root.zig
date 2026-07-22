@@ -9,6 +9,7 @@ pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
 pub const plan = @import("plan.zig");
 pub const plan_fuzz = @import("plan_fuzz.zig");
+pub const rule_config = @import("rule_config.zig");
 pub const persistent = @import("persistent.zig");
 pub const persistent_lmdb = @import("persistent_lmdb.zig");
 pub const selectors = @import("selectors.zig");
@@ -36,6 +37,7 @@ test {
     _ = operators;
     _ = plan;
     _ = plan_fuzz;
+    _ = rule_config;
     _ = persistent;
     _ = persistent_lmdb;
     _ = selectors;
