@@ -89,7 +89,6 @@ pub const Id = enum(u8) {
     sec_hash_method_pm,
     sec_unicode_map,
     sec_unicode_map_file,
-    sec_unicode_code_page,
     sec_xml_external_entity,
     sec_parse_xml_into_args,
 };
@@ -450,7 +449,6 @@ pub const registry = [_]Entry{
     row(.sec_hash_method_pm, "SecHashMethodPm", .hash_parameter, .append, .hashing, MC, 21),
     row(.sec_unicode_map, "SecUnicodeMap", .unicode_map, .singular_replace, .unicode_map, C, 17),
     row(.sec_unicode_map_file, "SecUnicodeMapFile", .unicode_map, .singular_replace, .unicode_map, MC, 17),
-    row(.sec_unicode_code_page, "SecUnicodeCodePage", .unsigned, .singular_replace, .unicode_map, M, 17),
     row(.sec_xml_external_entity, "SecXmlExternalEntity", .toggle, .singular_replace, .xml, M, 28),
     row(.sec_parse_xml_into_args, "SecParseXmlIntoArgs", .toggle, .singular_replace, .xml, M, 28),
 };
@@ -805,7 +803,7 @@ fn hashU64(hasher: *std.crypto.hash.Blake3, value: u64) void {
 
 test "stable union has one canonical case insensitive entry per id" {
     try std.testing.expectEqual(std.meta.fieldNames(Id).len, registry.len);
-    try std.testing.expectEqual(@as(usize, 87), registry.len);
+    try std.testing.expectEqual(@as(usize, 86), registry.len);
     for (registry, 0..) |entry, index| {
         try std.testing.expectEqual(index, @backingInt(entry.id));
         try std.testing.expectEqual(entry.id, lookup(entry.name).?.id);
