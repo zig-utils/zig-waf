@@ -6,6 +6,7 @@ const compiled_plan = @import("plan.zig");
 const directives = @import("directives.zig");
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
+const rule_config = @import("rule_config.zig");
 const seclang = @import("seclang/root.zig");
 const variables = @import("variables.zig");
 
@@ -104,7 +105,7 @@ pub const ClockSource = struct {
     }
 };
 
-pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration, InvalidExecutionPlan };
+pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration, InvalidExecutionPlan, MissingRuleReference };
 pub const DeinitError = error{TransactionsActive};
 
 pub const Intervention = struct {
@@ -133,6 +134,7 @@ pub const Builder = struct {
     clock_source: ?ClockSource = null,
     retained_plan: ?*const compiled_plan.Plan = null,
     directive_capabilities: directives.CapabilitySet = .full(),
+    missing_rule_policy: rule_config.MissingRulePolicy = .strict,
 
     pub fn init(allocator: std.mem.Allocator) Builder {
         return .{
@@ -185,6 +187,10 @@ pub const Builder = struct {
         self.directive_capabilities = capabilities;
     }
 
+    pub fn setMissingRulePolicy(self: *Builder, policy: rule_config.MissingRulePolicy) void {
+        self.missing_rule_policy = policy;
+    }
+
     /// Retain the plan when `build` succeeds. The caller keeps ownership of its
     /// handle and only needs to keep it alive until `build` returns.
     pub fn setRetainedPlan(self: *Builder, value: *const compiled_plan.Plan) void {
@@ -230,6 +236,8 @@ pub const Builder = struct {
             .valid => {},
             .diagnostic => return error.InvalidExecutionPlan,
         };
+        if (candidate) |value| if (self.missing_rule_policy == .strict and value.missing_rule_references.len != 0)
+            return error.MissingRuleReference;
     }
 
     fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
@@ -1967,6 +1975,32 @@ test "builder rejects unresolved static skipAfter after final source assembly" {
     try std.testing.expectEqual(@as(usize, 1), candidate.sharedReferenceCount());
     const target = candidate.firstUnresolvedStaticMarker().?;
     try std.testing.expectEqualStrings("skipAfter", candidate.string(candidate.actions[target.action_index].name).?);
+}
+
+test "missing rule references are strict by default and explicit in compatibility mode" {
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "missing-rule.conf",
+        "SecRuleRemoveById 99",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+
+    const strict_candidate = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer strict_candidate.deinit();
+    var strict_builder = Builder.init(std.testing.allocator);
+    try std.testing.expectError(error.MissingRuleReference, strict_builder.buildTransferringPlan(strict_candidate));
+    try std.testing.expectEqual(@as(usize, 1), strict_candidate.sharedReferenceCount());
+
+    const compatible_candidate = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    var compatible_builder = Builder.init(std.testing.allocator);
+    compatible_builder.setMissingRulePolicy(.compatibility);
+    const compatible = try compatible_builder.buildTransferringPlan(compatible_candidate);
+    defer compatible.deinit() catch unreachable;
+    try std.testing.expectEqual(@as(usize, 1), compatible.compiledPlan().?.missing_rule_references.len);
+    try std.testing.expectEqual(compiled_plan.MissingRuleReferenceKind.remove_by_id, compatible.compiledPlan().?.missing_rule_references[0].kind);
 }
 
 test "transactions remain pinned to their compiled plan across reload" {

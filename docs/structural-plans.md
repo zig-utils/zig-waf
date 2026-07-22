@@ -141,6 +141,15 @@ graph invariants. Transformation pipelines and action macros are rebuilt after
 each overlay, including `t:none` reset semantics. `max_action_expansion`
 independently bounds materialization amplification.
 
+Every requested ID/range is retained separately from the merged search index.
+Requests that match no external rule ID become immutable
+`MissingRuleReference` records naming the directive, operation kind, and exact
+interval. Final `Waf.Builder` publication is strict by default and returns
+`error.MissingRuleReference`; callers must explicitly select
+`MissingRulePolicy.compatibility` to publish while retaining those structured
+warnings. Compatibility mode does not suppress malformed syntax, partial-chain
+selection, duplicate IDs, resource failures, or unresolved static markers.
+
 Allocation and configured capacity failures remain distinct typed errors.
 
 ## Resource limits and verification

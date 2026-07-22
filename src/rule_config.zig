@@ -2,6 +2,8 @@
 
 const std = @import("std");
 
+pub const MissingRulePolicy = enum { strict, compatibility };
+
 pub const IdInterval = struct {
     first: u64,
     last: u64,
@@ -41,6 +43,7 @@ pub const IdSelectorFailure = struct {
 
 pub const IdSelector = struct {
     allocator: std.mem.Allocator,
+    requested: []const IdInterval,
     intervals: []const IdInterval,
 
     pub fn parse(
@@ -74,6 +77,8 @@ pub const IdSelector = struct {
             }
         }
         if (parsed.items.len == 0) return error.EmptyIdSelector;
+        const requested = try allocator.dupe(IdInterval, parsed.items);
+        errdefer allocator.free(requested);
         std.mem.sort(IdInterval, parsed.items, {}, lessThanInterval);
         var write: usize = 0;
         for (parsed.items) |interval| {
@@ -93,11 +98,12 @@ pub const IdSelector = struct {
             }
         }
         const owned = try allocator.dupe(IdInterval, parsed.items[0..write]);
-        return .{ .allocator = allocator, .intervals = owned };
+        return .{ .allocator = allocator, .requested = requested, .intervals = owned };
     }
 
     pub fn deinit(self: *IdSelector) void {
         self.allocator.free(self.intervals);
+        self.allocator.free(self.requested);
         self.* = undefined;
     }
 
@@ -173,6 +179,7 @@ test "id selectors canonicalize lists ranges duplicates and adjacency" {
     );
     defer selector.deinit();
     try std.testing.expectEqual(@as(?IdSelectorFailure, null), failure);
+    try std.testing.expectEqual(@as(usize, 5), selector.requested.len);
     try std.testing.expectEqualSlices(IdInterval, &.{
         .{ .first = 10, .last = 21 },
         .{ .first = 30, .last = 30 },

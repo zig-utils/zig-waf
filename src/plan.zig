@@ -39,6 +39,7 @@ pub const Limits = struct {
     max_flow_targets: usize = 500_000,
     max_target_expansion: usize = 4_000_000,
     max_action_expansion: usize = 8_000_000,
+    max_configuration_warnings: usize = 1_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
     max_string_bytes: usize = 1024 * 1024,
@@ -69,6 +70,7 @@ pub const Limits = struct {
             self.max_flow_targets == 0 or
             self.max_target_expansion == 0 or
             self.max_action_expansion == 0 or
+            self.max_configuration_warnings == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
             self.max_string_bytes == 0 or
@@ -99,6 +101,7 @@ pub const Limits = struct {
             self.max_flow_targets > std.math.maxInt(u32) or
             self.max_target_expansion > std.math.maxInt(u32) or
             self.max_action_expansion > std.math.maxInt(u32) or
+            self.max_configuration_warnings > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
         {
@@ -132,6 +135,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyFlowTargets,
     TargetExpansionLimitExceeded,
     ActionExpansionLimitExceeded,
+    TooManyConfigurationWarnings,
     TooManyArguments,
     TooManyStrings,
     StringTooLarge,
@@ -376,6 +380,14 @@ pub const RuleRemoval = struct {
     chain_head: RuleId,
 };
 
+pub const MissingRuleReferenceKind = enum { remove_by_id, update_target_by_id, update_action_by_id };
+
+pub const MissingRuleReference = struct {
+    directive: DirectiveId,
+    kind: MissingRuleReferenceKind,
+    interval: rule_config.IdInterval,
+};
+
 const Component = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -399,6 +411,7 @@ const Component = struct {
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     rule_removals: []const RuleRemoval,
+    missing_rule_references: []const MissingRuleReference,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -441,6 +454,7 @@ pub const Plan = struct {
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     rule_removals: []const RuleRemoval,
+    missing_rule_references: []const MissingRuleReference,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -639,6 +653,8 @@ const RuleRemovalOperation = struct {
     selector: RuleRemovalSelector,
     intervals_start: u32,
     intervals_count: u32,
+    requests_start: u32,
+    requests_count: u32,
     pattern: ?StringId,
 };
 
@@ -648,6 +664,8 @@ const RuleTargetUpdate = struct {
     selector: RuleRemovalSelector,
     intervals_start: u32,
     intervals_count: u32,
+    requests_start: u32,
+    requests_count: u32,
     pattern: ?StringId,
     targets_start: u32,
     targets_count: u32,
@@ -658,6 +676,8 @@ const RuleActionUpdate = struct {
     source: seclang.source.Span,
     intervals_start: u32,
     intervals_count: u32,
+    requests_start: u32,
+    requests_count: u32,
     actions_start: u32,
     actions_count: u32,
 };
@@ -683,10 +703,12 @@ const Compiler = struct {
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
+    id_requests: std.ArrayList(rule_config.IdInterval) = .empty,
     rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
     rule_target_updates: std.ArrayList(RuleTargetUpdate) = .empty,
     rule_action_updates: std.ArrayList(RuleActionUpdate) = .empty,
     rule_removals: std.ArrayList(RuleRemoval) = .empty,
+    missing_rule_references: std.ArrayList(MissingRuleReference) = .empty,
     target_expansion: usize = 0,
     action_expansion: usize = 0,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
@@ -718,10 +740,12 @@ const Compiler = struct {
         self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.id_intervals.deinit(self.allocator);
+        self.id_requests.deinit(self.allocator);
         self.rule_removal_operations.deinit(self.allocator);
         self.rule_target_updates.deinit(self.allocator);
         self.rule_action_updates.deinit(self.allocator);
         self.rule_removals.deinit(self.allocator);
+        self.missing_rule_references.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
     }
@@ -840,14 +864,20 @@ const Compiler = struct {
         defer selector.deinit();
         if (selector.intervals.len > self.limits.max_id_intervals -| self.id_intervals.items.len)
             return error.TooManyIdIntervals;
+        if (selector.requested.len > self.limits.max_id_intervals -| self.id_requests.items.len)
+            return error.TooManyIdIntervals;
         const start = try typedIndex(self.id_intervals.items.len);
+        const requests_start = try typedIndex(self.id_requests.items.len);
         try self.id_intervals.appendSlice(self.allocator, selector.intervals);
+        try self.id_requests.appendSlice(self.allocator, selector.requested);
         try self.rule_removal_operations.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
             .selector = .id,
             .intervals_start = start,
             .intervals_count = try typedIndex(selector.intervals.len),
+            .requests_start = requests_start,
+            .requests_count = try typedIndex(selector.requested.len),
             .pattern = null,
         });
     }
@@ -870,6 +900,8 @@ const Compiler = struct {
             .selector = selector,
             .intervals_start = 0,
             .intervals_count = 0,
+            .requests_start = 0,
+            .requests_count = 0,
             .pattern = try self.interner.intern(pattern),
         });
     }
@@ -886,6 +918,8 @@ const Compiler = struct {
         const target_value = directive.arguments[1].content();
         var intervals_start: u32 = 0;
         var intervals_count: u32 = 0;
+        var requests_start: u32 = 0;
+        var requests_count: u32 = 0;
         var pattern: ?StringId = null;
         if (selector == .id) {
             if (self.id_intervals.items.len == self.limits.max_id_intervals) return error.TooManyIdIntervals;
@@ -901,7 +935,12 @@ const Compiler = struct {
             defer id_selector.deinit();
             intervals_start = try typedIndex(self.id_intervals.items.len);
             intervals_count = try typedIndex(id_selector.intervals.len);
+            if (id_selector.requested.len > self.limits.max_id_intervals -| self.id_requests.items.len)
+                return error.TooManyIdIntervals;
+            requests_start = try typedIndex(self.id_requests.items.len);
+            requests_count = try typedIndex(id_selector.requested.len);
             try self.id_intervals.appendSlice(self.allocator, id_selector.intervals);
+            try self.id_requests.appendSlice(self.allocator, id_selector.requested);
         } else {
             if (selector_value.len == 0) return;
             pattern = try self.interner.intern(selector_value);
@@ -930,6 +969,8 @@ const Compiler = struct {
             .selector = selector,
             .intervals_start = intervals_start,
             .intervals_count = intervals_count,
+            .requests_start = requests_start,
+            .requests_count = requests_count,
             .pattern = pattern,
             .targets_start = targets_start,
             .targets_count = try typedIndex(parsed_targets.len),
@@ -964,7 +1005,11 @@ const Compiler = struct {
                 return self.fail(error.InvalidRuleActionUpdate, directive.arguments[1].physical, null);
         }
         const intervals_start = try typedIndex(self.id_intervals.items.len);
+        if (id_selector.requested.len > self.limits.max_id_intervals -| self.id_requests.items.len)
+            return error.TooManyIdIntervals;
+        const requests_start = try typedIndex(self.id_requests.items.len);
         try self.id_intervals.appendSlice(self.allocator, id_selector.intervals);
+        try self.id_requests.appendSlice(self.allocator, id_selector.requested);
         const action_range = self.addActions(parsed_actions) catch |cause|
             return self.fail(cause, directive.arguments[1].physical, null);
         try self.rule_action_updates.append(self.allocator, .{
@@ -972,6 +1017,8 @@ const Compiler = struct {
             .source = directive.physical,
             .intervals_start = intervals_start,
             .intervals_count = try typedIndex(id_selector.intervals.len),
+            .requests_start = requests_start,
+            .requests_count = try typedIndex(id_selector.requested.len),
             .actions_start = action_range.start,
             .actions_count = action_range.count,
         });
@@ -1282,6 +1329,11 @@ const Compiler = struct {
                     member = selected_rule.chain_next;
                 }
             }
+            if (removal.selector == .id) try self.recordMissingRuleReferences(
+                self.id_requests.items[removal.requests_start..][0..removal.requests_count],
+                removal.directive,
+                .remove_by_id,
+            );
         }
         for (&self.phase_rules) |*phase| {
             var write: usize = 0;
@@ -1331,6 +1383,11 @@ const Compiler = struct {
                 self.rules.items[rule_index].targets_count = try typedIndex(expansion);
                 self.target_expansion += expansion;
             }
+            if (update.selector == .id) try self.recordMissingRuleReferences(
+                self.id_requests.items[update.requests_start..][0..update.requests_count],
+                update.directive,
+                .update_target_by_id,
+            );
         }
     }
 
@@ -1375,6 +1432,36 @@ const Compiler = struct {
                 self.rules.items[rule_index].transformations_count = transformations.count;
                 self.action_expansion += effective.items.len;
             }
+            try self.recordMissingRuleReferences(
+                self.id_requests.items[update.requests_start..][0..update.requests_count],
+                update.directive,
+                .update_action_by_id,
+            );
+        }
+    }
+
+    fn recordMissingRuleReferences(
+        self: *Compiler,
+        requested: []const rule_config.IdInterval,
+        directive: DirectiveId,
+        kind: MissingRuleReferenceKind,
+    ) CompileError!void {
+        for (requested) |interval| {
+            var found = false;
+            for (self.rules.items) |rule| {
+                if (rule.external_id) |external_id| if (interval.contains(external_id)) {
+                    found = true;
+                    break;
+                };
+            }
+            if (found) continue;
+            if (self.missing_rule_references.items.len == self.limits.max_configuration_warnings)
+                return error.TooManyConfigurationWarnings;
+            try self.missing_rule_references.append(self.allocator, .{
+                .directive = directive,
+                .kind = kind,
+                .interval = interval,
+            });
         }
     }
 
@@ -1465,6 +1552,7 @@ const Compiler = struct {
         const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
+        const missing_rule_references = try duplicateCounted(MissingRuleReference, arena_allocator, self.missing_rule_references.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
             destination.* = try duplicateCounted(RuleId, arena_allocator, items.items, &owned_bytes, self.limits);
@@ -1492,6 +1580,7 @@ const Compiler = struct {
             .macro_tokens = macro_tokens,
             .defaults = defaults,
             .rule_removals = rule_removals,
+            .missing_rule_references = missing_rule_references,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
         };
@@ -1524,6 +1613,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.macro_tokens = component.macro_tokens;
     plan.defaults = component.defaults;
     plan.rule_removals = component.rule_removals;
+    plan.missing_rule_references = component.missing_rule_references;
     plan.phase_rules = component.phase_rules;
     plan.owned_bytes = component.owned_bytes;
 }
@@ -1550,7 +1640,8 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(MacroProgram, first.macro_programs, second.macro_programs) or
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
-        !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals))
+        !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals) or
+        !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references))
     {
         return false;
     }
@@ -1645,6 +1736,13 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     for (plan.rule_removals) |removal| {
         hashU32(&hasher, @backingInt(removal.directive));
         hashU32(&hasher, @backingInt(removal.chain_head));
+    }
+    hashU32(&hasher, @intCast(plan.missing_rule_references.len));
+    for (plan.missing_rule_references) |reference| {
+        hashU32(&hasher, @backingInt(reference.directive));
+        hashU8(&hasher, @intCast(@backingInt(reference.kind)));
+        hashU64(&hasher, reference.interval.first);
+        hashU64(&hasher, reference.interval.last);
     }
     hashU32(&hasher, @intCast(plan.markers.len));
     for (plan.markers) |marker| {
@@ -2336,6 +2434,27 @@ test "action updates reject id phase chain and malformed lists" {
             },
         }
     }
+}
+
+test "unmatched id requests remain structured final-builder evidence" {
+    const input =
+        \\SecRule ARGS @rx id:1
+        \\SecRuleRemoveById "1 2 10-20"
+        \\SecRuleUpdateTargetById 3 TX
+        \\SecRuleUpdateActionById 4 pass
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "missing-rules.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), compiled.missing_rule_references.len);
+    try std.testing.expectEqual(MissingRuleReferenceKind.remove_by_id, compiled.missing_rule_references[0].kind);
+    try std.testing.expectEqual(rule_config.IdInterval{ .first = 2, .last = 2 }, compiled.missing_rule_references[0].interval);
+    try std.testing.expectEqual(rule_config.IdInterval{ .first = 10, .last = 20 }, compiled.missing_rule_references[1].interval);
+    try std.testing.expectEqual(MissingRuleReferenceKind.update_target_by_id, compiled.missing_rule_references[2].kind);
+    try std.testing.expectEqual(MissingRuleReferenceKind.update_action_by_id, compiled.missing_rule_references[3].kind);
 }
 
 test "static skipAfter targets resolve to the next marker and phase rule" {
