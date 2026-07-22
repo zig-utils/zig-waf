@@ -29,6 +29,18 @@ const scenarios = [_]Scenario{
         .input = "SecRule ARGS @rx \"id:4,initcol:'ip=%{REMOTE_ADDR}',setvar:'ip.score=1',setvar:'ip.score=+5',deprecatevar:'ip.score=1/60',expirevar:'ip.score=300'\"\n",
         .persistent = true,
     },
+    .{
+        .name = "deny_decision",
+        .input = "SecRule ARGS @rx \"id:5,msg:'denied',deny,status:403\"\n",
+    },
+    .{
+        .name = "redirect_decision",
+        .input = "SecRule ARGS @rx \"id:6,setvar:'tx.path=blocked',redirect:'https://example.test/%{TX.path}',status:307\"\n",
+    },
+    .{
+        .name = "runtime_controls",
+        .input = "SecRule ARGS @rx \"id:7,ctl:auditEngine=On,ctl:auditLogParts=ABCFHZ,ctl:ruleRemoveById=100-200,ctl:ruleRemoveByTag=benchmark,ctl:ruleRemoveTargetById=300;ARGS:secret\"\n",
+    },
 };
 
 pub fn main(init: std.process.Init) !void {
