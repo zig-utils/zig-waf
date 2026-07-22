@@ -3,12 +3,17 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const injection_dependency = b.dependency("injection", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const waf = b.addModule("waf", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+    waf.addImport("injection", injection_dependency.module("injection"));
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
@@ -28,13 +33,7 @@ pub fn build(b: *std.Build) void {
     const daemon = b.addExecutable(.{ .name = "zig-wafd", .root_module = daemon_module });
     b.installArtifact(daemon);
 
-    const tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/root.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+    const tests = b.addTest(.{ .root_module = waf });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
