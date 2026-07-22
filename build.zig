@@ -104,6 +104,23 @@ pub fn build(b: *std.Build) void {
     const parser_corpus_step = b.step("test-parser-corpus", "Parse SecLang files beneath corpus roots");
     parser_corpus_step.dependOn(&run_parser_corpus.step);
 
+    const parser_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/parser_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_fuzz_module.addImport("waf", waf);
+    const parser_fuzz = b.addExecutable(.{
+        .name = "parser-fuzz",
+        .root_module = parser_fuzz_module,
+    });
+    const run_parser_fuzz = b.addRunArtifact(parser_fuzz);
+    const parser_fuzz_iterations = b.option(usize, "parser-fuzz-iterations", "Deterministic parser fuzz case count") orelse 10_000;
+    const parser_fuzz_seed = b.option(u64, "parser-fuzz-seed", "Deterministic parser fuzz seed") orelse 6_840_335_614_489_015_467;
+    run_parser_fuzz.addArgs(&.{ b.fmt("{d}", .{parser_fuzz_iterations}), b.fmt("{d}", .{parser_fuzz_seed}) });
+    const parser_fuzz_step = b.step("fuzz-parser", "Run deterministic SecLang parser fuzz cases");
+    parser_fuzz_step.dependOn(&run_parser_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,
