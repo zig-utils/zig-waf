@@ -4,6 +4,7 @@ pub const version = "0.0.0-dev";
 pub const compatibility = @import("compatibility.zig");
 pub const collections = @import("collections.zig");
 pub const engine = @import("engine.zig");
+pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
 pub const variables = @import("variables.zig");
 
@@ -23,6 +24,7 @@ test {
     _ = compatibility;
     _ = collections;
     _ = engine;
+    _ = macros;
     _ = operators;
     _ = variables;
 }
