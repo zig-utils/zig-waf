@@ -1,0 +1,56 @@
+{
+  "schemaVersion": 1,
+  "issue": "WAF-10",
+  "zig": "0.17.0-dev.1441+d5181a9c9",
+  "syntaxOnly": true,
+  "baselines": [
+    {
+      "name": "ModSecurity",
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d",
+      "configurationFiles": 12
+    },
+    {
+      "name": "Coraza",
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360",
+      "configurationFiles": 13
+    },
+    {
+      "name": "OWASP CRS",
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c",
+      "configurationFiles": 33,
+      "excludedValidatorFixtures": 13,
+      "exclusionReason": "util/crs-rules-check/examples are deliberately malformed inputs for the upstream validator"
+    }
+  ],
+  "corpus": {
+    "roots": 5,
+    "files": 58,
+    "bytes": 803184,
+    "directives": 925,
+    "unexplainedExclusions": 0
+  },
+  "contracts": {
+    "ownedSources": true,
+    "lfAndCrlf": true,
+    "physicalSpans": true,
+    "continuations": true,
+    "quotedArguments": true,
+    "commentsOutsideTokens": true,
+    "structuredRuleSyntax": true,
+    "boundedDiagnostics": true,
+    "rootConfinedIncludes": true,
+    "deterministicGlobs": true,
+    "allocationFailureCoverage": true,
+    "deterministicFuzzing": true,
+    "releaseFastBenchmark": true
+  },
+  "commands": {
+    "unit": "zig build test",
+    "corpus": "zig build test-parser-corpus -Dparser-corpus=<repeatable-path>",
+    "fuzz": "zig build fuzz-parser -Dparser-fuzz-iterations=10000",
+    "benchmark": "zig build bench-parser -Doptimize=ReleaseFast -Dparser-benchmark=<file>"
+  }
+}

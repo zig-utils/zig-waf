@@ -17,6 +17,7 @@ pantry install
 zig build test
 zig build check
 zig build bench-scalars -Doptimize=ReleaseFast
+zig build fuzz-parser -Dparser-fuzz-iterations=10000
 ```
 
 Production fleet mode requires PostgreSQL. SQLite will only support isolated
@@ -37,6 +38,8 @@ Local development uses sibling checkouts of `zig-injection`, `zig-regex`, and
 
 The complete implementation graph is tracked by the
 [WAF roadmap](https://github.com/zig-utils/zig-waf/issues/1).
+The bounded syntax and include contracts are documented in
+[`docs/seclang-parser.md`](docs/seclang-parser.md).
 
 ## License
 
