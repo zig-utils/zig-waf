@@ -31,3 +31,11 @@ Executable evidence is recorded in
 `src/compatibility/evidence/disruptive-flow-controls.json`. CI runs unit and
 integration tests, the pinned five-root plan corpus, 10,000 deterministic action
 fuzz cases, and ReleaseFast action benchmarks.
+
+The closing ReleaseFast run on the development host (5,000 iterations per
+scenario) measured the no-op cursor at p99 250 ns with zero operation
+allocations, dynamic `skipAfter` at p99 42 ns with zero operation allocations,
+and exclusion-heavy traversal plus a regex target probe at p99 292 ns. The last
+scenario records four bounded first-use matcher-cache allocations (142 bytes)
+per transaction; cursor traversal itself only advances immutable plan slices
+and transaction-local counters.

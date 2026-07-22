@@ -41,6 +41,22 @@
     "fuzz": "zig build fuzz-actions -Daction-fuzz-iterations=10000",
     "benchmark": "zig build bench-actions -Doptimize=ReleaseFast",
     "corpus": "zig build test-plan-corpus with pinned CRS, ModSecurity, and Coraza roots",
-    "unexplainedMismatches": 0
+    "unexplainedMismatches": 0,
+    "releaseFastFlowResults": {
+      "iterationsPerScenario": 5000,
+      "cursorNoop": {
+        "p99Nanoseconds": 250,
+        "operationAllocationsPerIteration": 0
+      },
+      "cursorDynamicSkipAfter": {
+        "p99Nanoseconds": 42,
+        "operationAllocationsPerIteration": 0
+      },
+      "cursorExclusionHeavyWithRegexProbe": {
+        "p99Nanoseconds": 292,
+        "operationAllocationsPerIteration": 4,
+        "operationBytesPerIteration": 142
+      }
+    }
   }
 }
