@@ -73,7 +73,7 @@ expressions are source-anchored configuration diagnostics.
 ## Identity and diagnostics
 
 The public 32-byte fingerprint is BLAKE3 over typed semantic values and
-resolved string bytes. It is domain-separated by compiler ABI version 2 and
+resolved string bytes. It is domain-separated by compiler ABI version 3 and
 does not include allocator addresses, native struct padding, filesystem paths,
 or source offsets. Identical ordered configuration at unrelated paths therefore
 has the same public identity. The compiler ABI must change whenever the
@@ -172,14 +172,26 @@ chain count.
 Unit tests inject failure at every observed allocation point, repeat 250
 compile/deinit cycles, exercise real-thread sharing and retirement, and verify
 failed builder validation preserves caller ownership. The deterministic fuzz
-oracle checks source spans, typed ranges, phase ordering, chains, prefilters,
-macros, fingerprints, and diagnostics over a pinned 10,000-case mutation run.
+oracle checks source spans, typed ranges, phase ordering, chains, removals,
+markers, missing references, prefilters, macros, fingerprints, and diagnostics
+over a pinned 10,000-case mutation run. Its seed corpus includes target/action
+overlays and remote-rule directives.
 
 Hosted CI structurally compiles the same 58 pinned ModSecurity 3.0.16, Coraza
 3.7.0, and deployable CRS 4.28.0 configuration files used by WAF-10, with no
 unexplained exclusions. The boundary contains 925 directives, 761 rules, and
 2,419,595 bytes of reported plan-owned storage. The complete evidence is embedded from
 `src/compatibility/evidence/structural-plan.json` as `plan.evidence_json`.
+
+WAF-13 adds executable differential fixtures for phase defaults, rule
+removals, target/action overlays, marker resolution, and missing-rule evidence.
+They pin the exact ModSecurity 3.0.16, Coraza 3.7.0, and CRS 4.28.0 source cases
+from which the expected semantics were derived. The fixture manifest,
+qualification counts, commands, and overlay benchmark observation are embedded
+from `src/compatibility/evidence/rule-configuration.json` as
+`rule_config_evidence.json`. The artifact records zero unexplained semantic
+mismatches; upstream engines remain conformance oracles, not runtime
+dependencies.
 
 On the hosted pinned CRS SQLi fixture (98,977 input bytes, 74 directives, 73
 rules), ReleaseFast measured 88,518 compiled rules/s, 286,761 owned bytes,
@@ -207,5 +219,7 @@ zig build bench-plan -Doptimize=ReleaseFast \
 The ReleaseFast benchmark reports compilation throughput, rules and directives
 per second, owned bytes, bytes per rule, string deduplication, phase-index
 traversal throughput, equivalent-generation reuse time, and isolated runtime
-publication pause. These are compiler baselines; WAF request-path release gates
-remain owned by WAF-39.
+publication pause. It also compiles the same rule body with concrete
+remove/target/action overlays and reports overlay plan bytes, applied removals,
+missing references, and publication pause separately. These are compiler
+baselines; WAF request-path release gates remain owned by WAF-39.

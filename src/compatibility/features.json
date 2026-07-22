@@ -176,6 +176,28 @@
       "notes": "Owned typed IR, phase indexes, defaults, chains, action families, conservative prefilters, immutable macro programs, stable diagnostics, deterministic fingerprints, atomic component sharing, WAF generation pinning, corpus compilation, fuzzing, and ReleaseFast metrics are verified. WAF-12 owns complete directive-specific semantic validation."
     },
     {
+      "id": "engine.rule-configuration-overlays",
+      "area": "engine",
+      "name": "Rule defaults, removals, updates, markers, and authenticated remote rules",
+      "status": "verified",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/14",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/rule_config.zig",
+        "src/remote_rules.zig",
+        "src/seclang/assembly.zig",
+        "src/rule_config_evidence.zig",
+        "src/compatibility/fixtures/rule-configuration",
+        "src/compatibility/evidence/rule-configuration.json",
+        "benchmarks/plan.zig",
+        "docs/remote-rules.md",
+        "docs/structural-plans.md"
+      ],
+      "notes": "Phase-scoped defaults, ID/tag/message removal, ordered target and action overlays, source-ordered marker linking, explicit missing-rule policy, and authenticated bounded remote assembly are immutable compile-time behavior. Pinned upstream-derived fixtures, allocation-failure tests, deterministic fuzzing, corpus gates, and baseline/overlay ReleaseFast measurements are executable."
+    },
+    {
       "id": "fleet.postgresql-18",
       "area": "fleet",
       "name": "Pantry-managed PostgreSQL 18 and native libpq 18",
