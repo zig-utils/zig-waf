@@ -1,6 +1,7 @@
 //! Stable SecLang transformation inventory and canonical name resolution.
 
 const std = @import("std");
+const html_entities = @import("html_entities.zig");
 
 pub const Kind = enum(u8) {
     base64_decode,
@@ -226,6 +227,7 @@ pub const Executor = struct {
             .base64_encode => self.base64Encode(input),
             .css_decode => self.cssDecode(input),
             .escape_seq_decode => self.escapeSeqDecode(input),
+            .html_entity_decode => self.htmlEntityDecode(input),
             .js_decode => self.jsDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
@@ -423,6 +425,104 @@ pub const Executor = struct {
             }
         }
         return finish(generated, input, changed);
+    }
+
+    fn htmlEntityDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        return switch (self.profile) {
+            .modsecurity => self.htmlEntityDecodeModSecurity(input),
+            .coraza => self.htmlEntityDecodeCoraza(input),
+        };
+    }
+
+    fn htmlEntityDecodeModSecurity(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOfScalar(u8, input, '&') orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var index = first;
+        while (index < input.len) {
+            if (input[index] != '&' or index + 1 == input.len) {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+                continue;
+            }
+
+            var cursor = index + 1;
+            if (input[cursor] == '#') {
+                cursor += 1;
+                if (cursor == input.len) {
+                    generated.buffer.appendSliceAssumeCapacity(input[index..cursor]);
+                    index = cursor;
+                    continue;
+                }
+                var base: u8 = 10;
+                if (input[cursor] == 'x' or input[cursor] == 'X') {
+                    base = 16;
+                    cursor += 1;
+                }
+                const digits_start = cursor;
+                while (cursor < input.len and if (base == 16) isHex(input[cursor]) else std.ascii.isDigit(input[cursor])) : (cursor += 1) {}
+                if (cursor != digits_start) {
+                    generated.buffer.appendAssumeCapacity(parseSaturatingByte(input[digits_start..cursor], base));
+                    if (cursor < input.len and input[cursor] == ';') cursor += 1;
+                    index = cursor;
+                    continue;
+                }
+            } else {
+                const name_start = cursor;
+                while (cursor < input.len and std.ascii.isAlphanumeric(input[cursor])) : (cursor += 1) {}
+                if (cursor != name_start) {
+                    const name = input[name_start..cursor];
+                    const decoded: ?u8 = if (startsWithIgnoreCase(name, "quot"))
+                        '"'
+                    else if (startsWithIgnoreCase(name, "amp"))
+                        '&'
+                    else if (startsWithIgnoreCase(name, "lt"))
+                        '<'
+                    else if (startsWithIgnoreCase(name, "gt"))
+                        '>'
+                    else if (startsWithIgnoreCase(name, "nbsp"))
+                        0xa0
+                    else
+                        null;
+                    if (decoded) |byte| {
+                        generated.buffer.appendAssumeCapacity(byte);
+                        if (cursor < input.len and input[cursor] == ';') cursor += 1;
+                        index = cursor;
+                        continue;
+                    }
+                }
+            }
+
+            generated.buffer.appendAssumeCapacity(input[index]);
+            index += 1;
+        }
+        return finish(generated, input, generated.buffer.items.len != input.len);
+    }
+
+    fn htmlEntityDecodeCoraza(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOfScalar(u8, input, '&') orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var index = first;
+        while (index < input.len) {
+            if (input[index] != '&') {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+                continue;
+            }
+            const decoded = decodeCorazaHtmlEntity(input[index..]);
+            if (decoded) |entity| {
+                try appendCodePoint(generated.buffer, entity.value.first);
+                if (entity.value.second) |second| try appendCodePoint(generated.buffer, second);
+                index += entity.consumed;
+            } else {
+                generated.buffer.appendAssumeCapacity('&');
+                index += 1;
+            }
+        }
+        return finish(generated, input, generated.buffer.items.len != input.len);
     }
 
     fn compressWhitespace(self: *Executor, input: []const u8) ApplyError!Result {
@@ -785,6 +885,93 @@ fn isNull(byte: u8) bool {
     return byte == 0;
 }
 
+fn startsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
+    return input.len >= prefix.len and std.ascii.eqlIgnoreCase(input[0..prefix.len], prefix);
+}
+
+fn parseSaturatingByte(digits: []const u8, base: u8) u8 {
+    const maximum: u64 = std.math.maxInt(i64);
+    var value: u64 = 0;
+    for (digits) |digit| {
+        const decoded: u64 = if (base == 16) hexNibble(digit).? else digit - '0';
+        if (value > (maximum - decoded) / base) {
+            value = maximum;
+            break;
+        }
+        value = value * base + decoded;
+    }
+    return @truncate(value);
+}
+
+const DecodedHtmlEntity = struct {
+    value: html_entities.Value,
+    consumed: usize,
+};
+
+fn decodeCorazaHtmlEntity(input: []const u8) ?DecodedHtmlEntity {
+    if (input.len <= 1 or input[0] != '&') return null;
+    if (input[1] == '#') return decodeCorazaNumericEntity(input);
+
+    var end: usize = 1;
+    while (end < input.len and std.ascii.isAlphanumeric(input[end])) : (end += 1) {}
+    if (end < input.len and input[end] == ';') end += 1;
+    const name = input[1..end];
+    if (name.len == 0) return null;
+    if (html_entities.lookup(name)) |value| return .{ .value = value, .consumed = end };
+
+    var prefix_len = @min(name.len - 1, 6);
+    while (prefix_len > 1) : (prefix_len -= 1) {
+        if (html_entities.lookup(name[0..prefix_len])) |value| {
+            return .{ .value = value, .consumed = prefix_len + 1 };
+        }
+    }
+    return null;
+}
+
+fn decodeCorazaNumericEntity(input: []const u8) ?DecodedHtmlEntity {
+    if (input.len <= 3) return null;
+    var cursor: usize = 2;
+    var base: u8 = 10;
+    if (input[cursor] == 'x' or input[cursor] == 'X') {
+        base = 16;
+        cursor += 1;
+    }
+    const digits_start = cursor;
+    var value: u32 = 0;
+    while (cursor < input.len) : (cursor += 1) {
+        const digit: u32 = if (base == 16)
+            hexNibble(input[cursor]) orelse break
+        else if (std.ascii.isDigit(input[cursor]))
+            input[cursor] - '0'
+        else
+            break;
+        value = if (value > (0x110000 - digit) / base) 0x110000 else value * base + digit;
+    }
+    if (cursor == digits_start) return null;
+    if (cursor < input.len and input[cursor] == ';') cursor += 1;
+
+    const code_point: u21 = if (value >= 0x80 and value <= 0x9f)
+        html_numeric_replacements[value - 0x80]
+    else if (value == 0 or (value >= 0xd800 and value <= 0xdfff) or value > 0x10ffff)
+        0xfffd
+    else
+        @intCast(value);
+    return .{ .value = .{ .first = code_point }, .consumed = cursor };
+}
+
+fn appendCodePoint(buffer: *std.ArrayList(u8), code_point: u21) ApplyError!void {
+    var encoded: [4]u8 = undefined;
+    const length = std.unicode.utf8Encode(code_point, &encoded) catch unreachable;
+    buffer.appendSliceAssumeCapacity(encoded[0..length]);
+}
+
+const html_numeric_replacements = [_]u21{
+    0x20ac, 0x0081, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021,
+    0x02c6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008d, 0x017d, 0x008f,
+    0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
+    0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
+};
+
 fn cEscapeByte(byte: u8) ?u8 {
     return switch (byte) {
         'a' => 0x07,
@@ -1072,6 +1259,34 @@ test "JavaScript decoding handles Unicode hex octal and escaped literals" {
     const trailing = try executor.apply(.js_decode, "\\");
     try std.testing.expectEqualStrings("\\", trailing.bytes);
     try std.testing.expect(!trailing.changed);
+}
+
+test "HTML entity decoding preserves ModSecurity byte semantics" {
+    var executor = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer executor.deinit();
+
+    try std.testing.expectEqualSlices(u8, &.{ '"', '&', '<', '>', 0xa0 }, (try executor.apply(.html_entity_decode, "&quot;&AMP;&lt;&gt;&nbsp;")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 'A', 'A', 0xff, 1 }, (try executor.apply(.html_entity_decode, "&#65;&#x41;&#x1ff;&#1")).bytes);
+    try std.testing.expectEqualStrings("&", (try executor.apply(.html_entity_decode, "&ampfoo;")).bytes);
+    const unknown = try executor.apply(.html_entity_decode, "&unknown;");
+    try std.testing.expectEqual(Storage.borrowed, unknown.storage);
+    try std.testing.expect(!unknown.changed);
+}
+
+test "HTML entity decoding preserves Coraza HTML5 and Unicode semantics" {
+    var executor = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer executor.deinit();
+
+    try std.testing.expectEqualStrings("á€", (try executor.apply(.html_entity_decode, "&aacute;&#128;")).bytes);
+    try std.testing.expectEqualStrings("≂̸", (try executor.apply(.html_entity_decode, "&NotEqualTilde;")).bytes);
+    try std.testing.expectEqualStrings("&foo", (try executor.apply(.html_entity_decode, "&ampfoo")).bytes);
+    try std.testing.expectEqualStrings("���", (try executor.apply(.html_entity_decode, "&#0;&#xD800;&#999999999999999999999;")).bytes);
+
+    const short_numeric = try executor.apply(.html_entity_decode, "&#1");
+    try std.testing.expectEqualStrings("&#1", short_numeric.bytes);
+    try std.testing.expect(!short_numeric.changed);
+    const unknown = try executor.apply(.html_entity_decode, "&zzzzzz;");
+    try std.testing.expectEqual(Storage.borrowed, unknown.storage);
 }
 
 test "executor validates deterministic input and output limits" {
