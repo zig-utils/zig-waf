@@ -28,7 +28,24 @@
     "directives": 925,
     "plans": 58,
     "rules": 761,
+    "planOwnedBytes": 2419595,
     "unexplainedExclusions": 0
+  },
+  "hostedBenchmark": {
+    "fixture": "OWASP CRS REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+    "inputBytes": 98977,
+    "directives": 74,
+    "rules": 73,
+    "plansPerSecond": 1212,
+    "directivesPerSecond": 89730,
+    "rulesPerSecond": 88518,
+    "ownedBytes": 286761,
+    "bytesPerRule": 3928,
+    "dedupSavedBytes": 68092,
+    "phaseTraversalRulesPerSecond": 2784665810,
+    "reuseCompileNanoseconds": 873188,
+    "publicationNanoseconds": 4,
+    "githubActionsRun": 29945716010
   },
   "contracts": {
     "ownedSources": true,

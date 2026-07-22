@@ -102,8 +102,16 @@ macros, fingerprints, and diagnostics over a pinned 10,000-case mutation run.
 
 Hosted CI structurally compiles the same 58 pinned ModSecurity 3.0.16, Coraza
 3.7.0, and deployable CRS 4.28.0 configuration files used by WAF-10, with no
-unexplained exclusions. The complete evidence is embedded from
+unexplained exclusions. The boundary contains 925 directives, 761 rules, and
+2,419,595 bytes of reported plan-owned storage. The complete evidence is embedded from
 `src/compatibility/evidence/structural-plan.json` as `plan.evidence_json`.
+
+On the hosted pinned CRS SQLi fixture (98,977 input bytes, 74 directives, 73
+rules), ReleaseFast measured 88,518 compiled rules/s, 286,761 owned bytes,
+68,092 deduplicated string bytes, 2.784 billion indexed rules/s traversal,
+873,188 ns equivalent-generation reuse compilation, and a 4 ns average
+publication swap. These values are observations from Actions run 29945716010,
+not hard-coded performance gates.
 
 ## Reproduction
 
