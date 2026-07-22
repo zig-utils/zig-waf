@@ -1,4 +1,4 @@
-//! Reusable deterministic and coverage-guided non-disruptive action oracle.
+//! Reusable deterministic and coverage-guided SecLang action runtime oracle.
 
 const std = @import("std");
 const engine = @import("engine.zig");
@@ -25,6 +25,7 @@ pub fn fuzzOne(allocator: std.mem.Allocator, input: []const u8) !void {
 
     var builder = engine.Builder.init(allocator);
     builder.setRetainedPlan(compiled);
+    builder.setInterventionCapabilities(.{ .proxy = true });
     const waf = builder.build() catch return;
     defer waf.deinit() catch unreachable;
     var tx = waf.newTransaction();
@@ -61,7 +62,10 @@ pub fn fuzzOne(allocator: std.mem.Allocator, input: []const u8) !void {
             const intent = tx.matchIntent(outcome.intent) orelse return error.MissingActionFuzzIntent;
             if (intent.rule != head_id or intent.chain_head != head_id or
                 !std.mem.eql(u8, intent.matched_name, "ARGS:fuzz") or
-                !std.mem.eql(u8, intent.matched_value, matched_value))
+                !std.mem.eql(u8, intent.matched_value, matched_value) or
+                intent.disruptive_status < 100 or intent.disruptive_status > 599 or
+                ((intent.disruptive == .redirect or intent.disruptive == .proxy) and
+                    intent.disruptive_destination == null))
             {
                 return error.InvalidActionFuzzIntent;
             }

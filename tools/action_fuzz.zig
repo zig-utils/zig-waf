@@ -5,7 +5,10 @@ const structured_seed =
     "SecDefaultAction \"phase:2,pass,log,auditlog\"\n" ++
     "SecRule ARGS @rx \"id:42,msg:'%{TX.score}',tag:'fuzz',capture,setvar:'tx.score=+1',setenv:'FLAG=%{TX.score}'\"\n" ++
     "SecRule TX @rx \"id:43,chain,setvar:'tx.chain=head'\"\n" ++
-    "SecRule REQUEST_URI @rx \"setvar:'tx.chain=%{TX.chain}-tail',nolog\"\n";
+    "SecRule REQUEST_URI @rx \"setvar:'tx.chain=%{TX.chain}-tail',nolog\"\n" ++
+    "SecRule ARGS @rx \"id:44,deny,status:403,skip:1,ctl:auditEngine=On,ctl:auditLogParts=ABCFHZ\"\n" ++
+    "SecRule ARGS @rx \"id:45,redirect:'https://example.test/%{REQUEST_URI}',ctl:ruleRemoveById=100-200\"\n" ++
+    "SecRule ARGS @rx \"id:46,proxy:'https://upstream.test',ctl:ruleRemoveTargetByTag=fuzz;ARGS:secret\"\n";
 const ascii_alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 \n\r\t\"'\\,#@!&|:%{}[]()*?+-_./";
 
 pub fn main(init: std.process.Init) !void {

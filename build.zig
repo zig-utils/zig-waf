@@ -209,7 +209,7 @@ pub fn build(b: *std.Build) void {
     const action_fuzz_iterations = b.option(usize, "action-fuzz-iterations", "Deterministic action runtime fuzz case count") orelse 10_000;
     const action_fuzz_seed = b.option(u64, "action-fuzz-seed", "Deterministic action runtime fuzz seed") orelse 13_907_095_936_298_285_211;
     run_action_fuzz.addArgs(&.{ b.fmt("{d}", .{action_fuzz_iterations}), b.fmt("{d}", .{action_fuzz_seed}) });
-    const action_fuzz_step = b.step("fuzz-actions", "Run deterministic non-disruptive action fuzz cases");
+    const action_fuzz_step = b.step("fuzz-actions", "Run deterministic SecLang action runtime fuzz cases");
     action_fuzz_step.dependOn(&run_action_fuzz.step);
 
     const ownership_benchmark_module = b.createModule(.{
