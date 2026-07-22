@@ -8,7 +8,7 @@
     },
     "zig-regex": {
       "repository": "zig-utils/zig-regex",
-      "commit": "b8ca89df644976801e0b6444419444b708eeaa25",
+      "commit": "1b2293e749de60620cb6024c551fedb3d02d54c0",
       "localPath": "../zig-regex"
     },
     "zig-tls": {

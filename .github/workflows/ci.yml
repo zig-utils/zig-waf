@@ -23,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zig-utils/zig-regex
-          ref: b8ca89df644976801e0b6444419444b708eeaa25
+          ref: 1b2293e749de60620cb6024c551fedb3d02d54c0
           path: zig-regex
       - uses: actions/checkout@v4
         with:
