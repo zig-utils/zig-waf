@@ -1582,3 +1582,37 @@ test "component reuse requires exact equality after fingerprint screening" {
     try std.testing.expectEqual(@as(usize, 1), changed.sharedReferenceCount());
     try std.testing.expect(first.actions.ptr != changed.actions.ptr);
 }
+
+test "plan compilation cleans every injected allocation failure" {
+    const input =
+        \\SecDefaultAction "phase:2,pass,t:lowercase"
+        \\SecRule ARGS|REQUEST_HEADERS:host "@contains attack" "id:1,msg:'%{REQUEST_URI}',deny,chain"
+        \\SecRule TX:score "@pm one two" "capture,setvar:tx.hit=1"
+        \\SecMarker END
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "allocation-plan.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+
+    var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const baseline = try compile(baseline_allocator.allocator(), &parsed.registry, &documents, .{});
+    baseline.deinit();
+    const allocation_count = baseline_allocator.alloc_index;
+    try std.testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..allocation_count) |failure_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
+        try std.testing.expectError(error.OutOfMemory, compile(failing.allocator(), &parsed.registry, &documents, .{}));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "plans compile and deinitialize repeatedly without retained allocations" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "repeat.conf", "SecRule ARGS \"@contains stable\" \"id:1,phase:2,deny\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    for (0..250) |_| {
+        const value = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+        value.deinit();
+    }
+}
