@@ -2,6 +2,7 @@
 
 pub const version = "0.0.0-dev";
 pub const compatibility = @import("compatibility.zig");
+pub const action_config = @import("action_config.zig");
 pub const collections = @import("collections.zig");
 pub const directives = @import("directives.zig");
 pub const engine = @import("engine.zig");
@@ -32,6 +33,7 @@ pub const ClockSource = engine.ClockSource;
 test {
     _ = version;
     _ = compatibility;
+    _ = action_config;
     _ = collections;
     _ = directives;
     _ = engine;
