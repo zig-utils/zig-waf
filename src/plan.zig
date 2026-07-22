@@ -1989,10 +1989,16 @@ const Compiler = struct {
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .rule_remove_by_id => _ = action_config.parseIdRange(control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .rule_remove_target_by_id => {
+                        const target = action_config.parseTargetControl(control.value) catch
+                            return self.fail(error.InvalidRuntimeControl, rule.source, null);
+                        _ = action_config.parseIdRange(target.selector) catch
+                            return self.fail(error.InvalidRuntimeControl, rule.source, null);
+                    },
+                    .rule_remove_target_by_tag => _ = action_config.parseTargetControl(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .audit_log_parts,
                     .rule_remove_by_tag,
-                    .rule_remove_target_by_id,
-                    .rule_remove_target_by_tag,
                     => {},
                 }
             }
@@ -4039,6 +4045,8 @@ test "invalid static runtime controls have a stable diagnostic" {
         "SecRule ARGS @rx \"id:1,ctl:requestBodyLimit=0\"",
         "SecRule ARGS @rx \"id:1,ctl:requestBodyProcessor=YAML\"",
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveById=20-10\"",
+        "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetById=20-10;ARGS:x\"",
+        "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetByTag=tag-only\"",
     };
     for (cases) |input| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-control.conf", input, .{}, .{});

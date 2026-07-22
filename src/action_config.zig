@@ -65,6 +65,11 @@ pub const IdRange = struct {
     }
 };
 
+pub const TargetControl = struct {
+    selector: []const u8,
+    target: []const u8,
+};
+
 pub const Severity = enum(u3) {
     emergency = 0,
     alert = 1,
@@ -318,6 +323,16 @@ pub fn parseIdRange(value: []const u8) ParseError!IdRange {
     return .{ .first = first, .last = last };
 }
 
+pub fn parseTargetControl(value: []const u8) ParseError!TargetControl {
+    const separator = std.mem.indexOfScalar(u8, value, ';') orelse return error.InvalidOperation;
+    if (separator == 0 or separator + 1 == value.len or
+        std.mem.indexOfScalarPos(u8, value, separator + 1, ';') != null)
+    {
+        return error.InvalidOperation;
+    }
+    return .{ .selector = value[0..separator], .target = value[separator + 1 ..] };
+}
+
 fn parseVariable(value: []const u8) ParseError!struct { collection: Collection, key: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return error.InvalidVariable;
     if (dot == 0 or dot + 1 == value.len) return error.InvalidVariable;
@@ -413,4 +428,7 @@ test "runtime control names and body values parse without allocation" {
     try std.testing.expectEqualDeep(IdRange{ .first = 10, .last = 20 }, try parseIdRange("10-20"));
     try std.testing.expectError(error.NumberOutOfRange, parseIdRange("20-10"));
     try std.testing.expectError(error.InvalidOperation, parseIdRange("1-2-3"));
+    try std.testing.expectEqualDeep(TargetControl{ .selector = "942100", .target = "ARGS:password" }, try parseTargetControl("942100;ARGS:password"));
+    try std.testing.expectError(error.InvalidOperation, parseTargetControl("942100"));
+    try std.testing.expectError(error.InvalidOperation, parseTargetControl(";ARGS"));
 }

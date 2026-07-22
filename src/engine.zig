@@ -595,11 +595,27 @@ pub const RuleExclusion = union(enum) {
     tag: []const u8,
 };
 
+pub const TargetExclusion = struct {
+    selector: RuleExclusion,
+    target: []const u8,
+};
+
 fn deinitRuleExclusions(allocator: std.mem.Allocator, exclusions: *std.ArrayList(RuleExclusion)) void {
     for (exclusions.items) |exclusion| switch (exclusion) {
         .id => {},
         .tag => |value| allocator.free(value),
     };
+    exclusions.deinit(allocator);
+}
+
+fn deinitTargetExclusions(allocator: std.mem.Allocator, exclusions: *std.ArrayList(TargetExclusion)) void {
+    for (exclusions.items) |exclusion| {
+        switch (exclusion.selector) {
+            .id => {},
+            .tag => |value| allocator.free(value),
+        }
+        allocator.free(exclusion.target);
+    }
     exclusions.deinit(allocator);
 }
 
@@ -792,6 +808,7 @@ pub const Transaction = struct {
     flow_state: FlowState = .{},
     control_state: ControlState,
     rule_exclusions: std.ArrayList(RuleExclusion) = .empty,
+    target_exclusions: std.ArrayList(TargetExclusion) = .empty,
     rule_exclusion_bytes: usize = 0,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
@@ -1153,11 +1170,14 @@ pub const Transaction = struct {
         var staged_controls = self.control_state;
         var staged_exclusions: std.ArrayList(RuleExclusion) = .empty;
         defer deinitRuleExclusions(self.waf.allocator, &staged_exclusions);
+        var staged_target_exclusions: std.ArrayList(TargetExclusion) = .empty;
+        defer deinitTargetExclusions(self.waf.allocator, &staged_target_exclusions);
         var staged_exclusion_bytes: usize = 0;
         result.controls_applied = try self.stageRuntimeControls(
             matches,
             &staged_controls,
             &staged_exclusions,
+            &staged_target_exclusions,
             &staged_exclusion_bytes,
             &batch,
             &scalar_batch,
@@ -1180,6 +1200,7 @@ pub const Transaction = struct {
             return error.MatchIntentStorageLimitExceeded;
         try self.match_intents.ensureUnusedCapacity(self.waf.allocator, 1);
         try self.rule_exclusions.ensureUnusedCapacity(self.waf.allocator, staged_exclusions.items.len);
+        try self.target_exclusions.ensureUnusedCapacity(self.waf.allocator, staged_target_exclusions.items.len);
 
         const keys = try self.waf.allocator.alloc(collections.Key, batch.items.items.len);
         defer self.waf.allocator.free(keys);
@@ -1216,8 +1237,10 @@ pub const Transaction = struct {
         intent_committed = true;
         self.control_state = staged_controls;
         self.rule_exclusions.appendSliceAssumeCapacity(staged_exclusions.items);
+        self.target_exclusions.appendSliceAssumeCapacity(staged_target_exclusions.items);
         self.rule_exclusion_bytes += staged_exclusion_bytes;
         staged_exclusions.clearRetainingCapacity();
+        staged_target_exclusions.clearRetainingCapacity();
         const committed_intent = &self.match_intents.items[self.match_intents.items.len - 1];
         self.commitDecision(head, committed_intent);
         return result;
@@ -1233,6 +1256,7 @@ pub const Transaction = struct {
         matches: []const MatchedRule,
         staged: *ControlState,
         staged_exclusions: *std.ArrayList(RuleExclusion),
+        staged_target_exclusions: *std.ArrayList(TargetExclusion),
         staged_exclusion_bytes: *usize,
         batch: *const ShadowBatch,
         scalar_batch: *const ScalarShadowBatch,
@@ -1278,7 +1302,8 @@ pub const Transaction = struct {
                             return error.InvalidActionValue;
                     },
                     .rule_remove_by_id => {
-                        if (self.rule_exclusions.items.len + staged_exclusions.items.len ==
+                        if (self.rule_exclusions.items.len + self.target_exclusions.items.len +
+                            staged_exclusions.items.len + staged_target_exclusions.items.len ==
                             self.waf.config.limits.max_runtime_exclusions)
                         {
                             return error.CapacityExceeded;
@@ -1288,21 +1313,62 @@ pub const Transaction = struct {
                         });
                     },
                     .rule_remove_by_tag => {
-                        if (self.rule_exclusions.items.len + staged_exclusions.items.len ==
+                        if (expanded.len == 0) return error.InvalidActionValue;
+                        if (self.rule_exclusions.items.len + self.target_exclusions.items.len +
+                            staged_exclusions.items.len + staged_target_exclusions.items.len ==
                             self.waf.config.limits.max_runtime_exclusions or
                             expanded.len > self.waf.config.limits.max_runtime_exclusion_bytes -| self.rule_exclusion_bytes -| staged_exclusion_bytes.*)
                         {
                             return error.CapacityExceeded;
                         }
                         const owned = try self.waf.allocator.dupe(u8, expanded);
-                        errdefer self.waf.allocator.free(owned);
-                        try staged_exclusions.append(self.waf.allocator, .{ .tag = owned });
+                        staged_exclusions.append(self.waf.allocator, .{ .tag = owned }) catch |err| {
+                            self.waf.allocator.free(owned);
+                            return err;
+                        };
                         staged_exclusion_bytes.* += owned.len;
                     },
-                    .audit_log_parts,
-                    .rule_remove_target_by_id,
-                    .rule_remove_target_by_tag,
-                    => return error.UnsupportedRuntimeControl,
+                    .rule_remove_target_by_id, .rule_remove_target_by_tag => {
+                        const parsed = action_config.parseTargetControl(expanded) catch return error.InvalidActionValue;
+                        if (std.mem.indexOf(u8, parsed.target, ":/") != null and std.mem.endsWith(u8, parsed.target, "/"))
+                            return error.UnsupportedRuntimeControl;
+                        const selector_bytes = if (control.kind == .rule_remove_target_by_tag) parsed.selector.len else 0;
+                        const added_bytes = std.math.add(usize, selector_bytes, parsed.target.len) catch return error.CapacityExceeded;
+                        if (self.rule_exclusions.items.len + self.target_exclusions.items.len +
+                            staged_exclusions.items.len + staged_target_exclusions.items.len ==
+                            self.waf.config.limits.max_runtime_exclusions or
+                            added_bytes > self.waf.config.limits.max_runtime_exclusion_bytes -| self.rule_exclusion_bytes -| staged_exclusion_bytes.*)
+                        {
+                            return error.CapacityExceeded;
+                        }
+                        const id_range = if (control.kind == .rule_remove_target_by_id)
+                            action_config.parseIdRange(parsed.selector) catch return error.InvalidActionValue
+                        else
+                            null;
+                        const owned_target = try self.waf.allocator.dupe(u8, parsed.target);
+                        const selector: RuleExclusion = if (control.kind == .rule_remove_target_by_id)
+                            .{ .id = id_range.? }
+                        else blk: {
+                            const owned_tag = self.waf.allocator.dupe(u8, parsed.selector) catch |err| {
+                                self.waf.allocator.free(owned_target);
+                                return err;
+                            };
+                            break :blk .{ .tag = owned_tag };
+                        };
+                        staged_target_exclusions.append(self.waf.allocator, .{
+                            .selector = selector,
+                            .target = owned_target,
+                        }) catch |err| {
+                            switch (selector) {
+                                .id => {},
+                                .tag => |value| self.waf.allocator.free(value),
+                            }
+                            self.waf.allocator.free(owned_target);
+                            return err;
+                        };
+                        staged_exclusion_bytes.* += added_bytes;
+                    },
+                    .audit_log_parts => return error.UnsupportedRuntimeControl,
                 }
                 count += 1;
             }
@@ -1898,18 +1964,35 @@ pub const Transaction = struct {
     }
 
     fn ruleExcludedCompiled(self: *const Transaction, plan: *const compiled_plan.Plan, rule: compiled_plan.Rule) bool {
-        for (self.rule_exclusions.items) |exclusion| switch (exclusion) {
+        for (self.rule_exclusions.items) |exclusion| if (exclusionMatchesRule(plan, rule, exclusion)) return true;
+        return false;
+    }
+
+    pub fn targetExcluded(self: *const Transaction, rule_id: compiled_plan.RuleId, target: []const u8) bool {
+        const plan = self.compiledPlan() orelse return false;
+        const index: usize = @backingInt(rule_id);
+        if (index >= plan.rules.len) return false;
+        const rule = plan.rules[index];
+        for (self.target_exclusions.items) |exclusion| {
+            if (!std.ascii.eqlIgnoreCase(exclusion.target, target)) continue;
+            if (exclusionMatchesRule(plan, rule, exclusion.selector)) return true;
+        }
+        return false;
+    }
+
+    fn exclusionMatchesRule(plan: *const compiled_plan.Plan, rule: compiled_plan.Rule, exclusion: RuleExclusion) bool {
+        return switch (exclusion) {
             .id => |range| if (rule.external_id) |external_id| {
-                if (range.contains(external_id)) return true;
-            },
+                return range.contains(external_id);
+            } else false,
             .tag => |excluded_tag| {
-                if (rule.metadata.tags_start + rule.metadata.tags_count > plan.metadata_tags.len) continue;
+                if (rule.metadata.tags_start + rule.metadata.tags_count > plan.metadata_tags.len) return false;
                 for (plan.metadata_tags[rule.metadata.tags_start..][0..rule.metadata.tags_count]) |tag| {
                     if (std.mem.eql(u8, plan.string(tag.value) orelse continue, excluded_tag)) return true;
                 }
+                return false;
             },
         };
-        return false;
     }
 
     pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
@@ -2407,6 +2490,7 @@ pub const Transaction = struct {
         self.match_intents.deinit(self.waf.allocator);
         self.match_intent_bytes = 0;
         deinitRuleExclusions(self.waf.allocator, &self.rule_exclusions);
+        deinitTargetExclusions(self.waf.allocator, &self.target_exclusions);
         self.rule_exclusion_bytes = 0;
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
@@ -3512,7 +3596,7 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
 
 test "matched-rule application preserves visible state across every allocation failure" {
     const input =
-        \\SecRule ARGS @rx "id:77,msg:'score=%{TX.score}',tag:'allocation-%{TX.score}',capture,setvar:'tx.score=+1',setenv:'SCORE=%{TX.score}'"
+        \\SecRule ARGS @rx "id:77,msg:'score=%{TX.score}',tag:'allocation-%{TX.score}',tag:'allocation-target',capture,setvar:'tx.score=+1',setenv:'SCORE=%{TX.score}',ctl:ruleRemoveById=77,ctl:ruleRemoveTargetByTag=allocation-target;ARGS:secret"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "action-allocation.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -3544,11 +3628,15 @@ test "matched-rule application preserves visible state across every allocation f
                     try std.testing.expect((try tx.collectionFirst(.env, "SCORE")) == null);
                     try std.testing.expect((try tx.collectionFirst(.tx, "0")) == null);
                     try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+                    try std.testing.expect(!tx.ruleExcluded(@fromBackingInt(0)));
+                    try std.testing.expect(!tx.targetExcluded(@fromBackingInt(0), "ARGS:secret"));
                 }
                 return err;
             };
             try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "score")).?.value);
             try std.testing.expectEqualStrings("value", tx.matchIntent(outcome.intent).?.matched_value);
+            try std.testing.expect(tx.ruleExcluded(@fromBackingInt(0)));
+            try std.testing.expect(tx.targetExcluded(@fromBackingInt(0), "ARGS:secret"));
         }
     }.run, .{plan});
 }
@@ -3839,10 +3927,10 @@ test "invalid or late runtime controls roll back the entire match" {
 
 test "runtime rule id and tag exclusions affect only subsequent cursor entries" {
     const input =
-        \\SecRule ARGS @rx "id:1,phase:1,ctl:ruleRemoveById=2,ctl:ruleRemoveByTag=skip-me"
+        \\SecRule ARGS @rx "id:1,phase:1,ctl:ruleRemoveById=2,ctl:ruleRemoveByTag=skip-me,ctl:ruleRemoveTargetById=4;ARGS:secret,ctl:ruleRemoveTargetByTag=group;REQUEST_HEADERS:authorization"
         \\SecRule ARGS @rx "id:2,phase:1"
         \\SecRule ARGS @rx "id:3,phase:1,tag:'skip-me'"
-        \\SecRule ARGS @rx "id:4,phase:1"
+        \\SecRule ARGS @rx "id:4,phase:1,tag:'group'"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "rule-exclusions.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -3865,10 +3953,13 @@ test "runtime rule id and tag exclusions affect only subsequent cursor entries" 
         .value = "value",
         .source = .{ .origin = .request_header, .offset = 0, .length = 5 },
     });
-    try std.testing.expectEqual(@as(usize, 2), outcome.controls_applied);
+    try std.testing.expectEqual(@as(usize, 4), outcome.controls_applied);
     try std.testing.expect(tx.ruleExcluded(@fromBackingInt(1)));
     try std.testing.expect(tx.ruleExcluded(@fromBackingInt(2)));
     try std.testing.expect(!tx.ruleExcluded(@fromBackingInt(3)));
+    try std.testing.expect(tx.targetExcluded(@fromBackingInt(3), "ARGS:secret"));
+    try std.testing.expect(tx.targetExcluded(@fromBackingInt(3), "request_headers:Authorization"));
+    try std.testing.expect(!tx.targetExcluded(@fromBackingInt(3), "ARGS:public"));
     try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(3)), (try cursor.next()).?);
     try std.testing.expect((try cursor.next()) == null);
 }
