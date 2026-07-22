@@ -230,4 +230,20 @@ pub fn build(b: *std.Build) void {
         run_parser_benchmark.addArg(benchmark_path);
     const parser_benchmark_step = b.step("bench-parser", "Benchmark SecLang parsing throughput and ownership");
     parser_benchmark_step.dependOn(&run_parser_benchmark.step);
+
+    const plan_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/plan.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    plan_benchmark_module.addImport("waf", waf);
+    const plan_benchmark = b.addExecutable(.{
+        .name = "plan-benchmark",
+        .root_module = plan_benchmark_module,
+    });
+    const run_plan_benchmark = b.addRunArtifact(plan_benchmark);
+    if (b.option([]const u8, "plan-benchmark", "Optional SecLang file for the plan benchmark")) |benchmark_path|
+        run_plan_benchmark.addArg(benchmark_path);
+    const plan_benchmark_step = b.step("bench-plan", "Benchmark structural plan compilation, traversal, reuse, and publication");
+    plan_benchmark_step.dependOn(&run_plan_benchmark.step);
 }
