@@ -391,7 +391,7 @@ pub const registry = [_]Entry{
     row(.sec_response_body_limit, "SecResponseBodyLimit", .unsigned, .singular_replace, .response_body, MC, 29),
     row(.sec_response_body_limit_action, "SecResponseBodyLimitAction", .limit_action, .singular_replace, .response_body, MC, 29),
     row(.sec_response_body_mime_type, "SecResponseBodyMimeType", .mime_type, .append, .response_body, MC, 29),
-    row(.sec_response_body_mime_types_clear, "SecResponseBodyMimeTypesClear", .clear, .singular_replace, .response_body, MC, 29),
+    row(.sec_response_body_mime_types_clear, "SecResponseBodyMimeTypesClear", .clear, .append, .response_body, MC, 29),
     row(.sec_arguments_limit, "SecArgumentsLimit", .unsigned, .singular_replace, .request_body, MC, 24),
     row(.sec_argument_separator, "SecArgumentSeparator", .byte_separator, .singular_replace, .request_body, MC, 24),
     row(.sec_cookie_format, "SecCookieFormat", .cookie_format, .singular_replace, .request_body, MC, 24),
@@ -783,20 +783,27 @@ fn computeConfigurationFingerprint(configuration: *const Configuration) Fingerpr
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update("zig-waf typed directive configuration\x00");
     for (registry) |entry| {
+        if (entry.repeatability == .append) continue;
         hashByte(&hasher, @backingInt(entry.id));
-        if (entry.repeatability == .append) {
-            var count: u32 = 0;
-            var counter = configuration.occurrences(entry.id);
-            while (counter.next() != null) count += 1;
-            hashU32(&hasher, count);
-            var occurrences = configuration.occurrences(entry.id);
-            while (occurrences.next()) |directive| hashDecodedDirective(&hasher, directive);
-        } else if (configuration.latest(entry.id)) |directive| {
+        if (configuration.latest(entry.id)) |directive| {
             hashByte(&hasher, 1);
             hashDecodedDirective(&hasher, directive);
         } else {
             hashByte(&hasher, 0);
         }
+    }
+    var append_count: u32 = 0;
+    for (configuration.plan.directives) |directive| {
+        const name = configuration.plan.string(directive.name) orelse continue;
+        const entry = lookup(name) orelse continue;
+        append_count += @intFromBool(entry.repeatability == .append);
+    }
+    hashU32(&hasher, append_count);
+    for (configuration.plan.directives) |*directive| {
+        const name = configuration.plan.string(directive.name) orelse continue;
+        const entry = lookup(name) orelse continue;
+        if (entry.repeatability != .append) continue;
+        hashDecodedDirective(&hasher, .{ .plan = configuration.plan, .entry = entry, .directive = directive });
     }
     var result: Fingerprint = undefined;
     hasher.final(&result);
@@ -1005,6 +1012,22 @@ test "configuration fingerprints normalize enums and replacement while excluding
     defer changed_plan.deinit();
     const changed = Configuration.init(changed_plan, .full()).configuration;
     try std.testing.expect(!std.mem.eql(u8, &first.fingerprint, &changed.fingerprint));
+}
+
+test "configuration fingerprints preserve global append and clear ordering" {
+    const cleared_plan = try compileTestPlan(
+        \\SecResponseBodyMimeType text/plain
+        \\SecResponseBodyMimeTypesClear
+    );
+    defer cleared_plan.deinit();
+    const populated_plan = try compileTestPlan(
+        \\SecResponseBodyMimeTypesClear
+        \\SecResponseBodyMimeType text/plain
+    );
+    defer populated_plan.deinit();
+    const cleared = Configuration.init(cleared_plan, .full()).configuration;
+    const populated = Configuration.init(populated_plan, .full()).configuration;
+    try std.testing.expect(!std.mem.eql(u8, &cleared.fingerprint, &populated.fingerprint));
 }
 
 fn compileTestPlan(input: []const u8) !*plan_mod.Plan {
