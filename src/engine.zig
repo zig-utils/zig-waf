@@ -449,6 +449,7 @@ pub const TransactionError = error{
     InvalidMatchContext,
     TooManyCaptures,
     InvalidEnvironmentName,
+    InvalidActionValue,
     CollectionSizeOverflow,
     PersistentBackendNotConfigured,
     PersistentTimestampOverflow,
@@ -591,6 +592,49 @@ const ShadowBatch = struct {
     }
 };
 
+const ScalarShadowMutation = struct {
+    name: variables.Name,
+    value: []u8,
+    origin: variables.Origin,
+    available_from: variables.Availability,
+};
+
+const ScalarShadowBatch = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(ScalarShadowMutation) = .empty,
+
+    fn deinit(self: *ScalarShadowBatch) void {
+        for (self.items.items) |item| self.allocator.free(item.value);
+        self.items.deinit(self.allocator);
+    }
+
+    fn putOwned(
+        self: *ScalarShadowBatch,
+        name: variables.Name,
+        value: []u8,
+        origin: variables.Origin,
+        available_from: variables.Availability,
+    ) !void {
+        for (self.items.items) |*item| {
+            if (item.name != name) continue;
+            self.allocator.free(item.value);
+            item.* = .{ .name = name, .value = value, .origin = origin, .available_from = available_from };
+            return;
+        }
+        try self.items.append(self.allocator, .{
+            .name = name,
+            .value = value,
+            .origin = origin,
+            .available_from = available_from,
+        });
+    }
+
+    fn get(self: *const ScalarShadowBatch, name: variables.Name) ?[]const u8 {
+        for (self.items.items) |item| if (item.name == name) return item.value;
+        return null;
+    }
+};
+
 /// Isolated per-request mutable state.
 ///
 /// The initial implementation records only bounded metadata and body byte
@@ -610,6 +654,7 @@ pub const Transaction = struct {
     collection_variables: collections.Store,
     persistent_session: ?persistent.Session,
     last_persistent_failure: ?PersistentFailure = null,
+    persistent_failed_open: u8 = 0,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -713,6 +758,26 @@ pub const Transaction = struct {
         rule_id: compiled_plan.RuleId,
         context: MatchContext,
     ) TransactionError!LocalEffectOutcome {
+        return self.applyMatchedRuleMode(rule_id, context, false);
+    }
+
+    /// Apply local and configured persistent non-disruptive effects. Backend
+    /// mutations remain staged in the request session until the lifecycle
+    /// flush boundary; all transaction-local projections commit together.
+    pub fn applyMatchedRule(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        context: MatchContext,
+    ) TransactionError!LocalEffectOutcome {
+        return self.applyMatchedRuleMode(rule_id, context, true);
+    }
+
+    fn applyMatchedRuleMode(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        context: MatchContext,
+        include_persistent: bool,
+    ) TransactionError!LocalEffectOutcome {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.validateMatchContext(context);
         const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
@@ -727,6 +792,15 @@ pub const Transaction = struct {
 
         var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
         defer batch.deinit();
+        var scalar_batch: ScalarShadowBatch = .{ .allocator = self.waf.allocator };
+        defer scalar_batch.deinit();
+        const persistence_checkpoint = if (include_persistent)
+            if (self.persistent_session) |*session| session.checkpoint() else null
+        else
+            null;
+        errdefer if (persistence_checkpoint) |checkpoint_value| {
+            self.persistent_session.?.rollback(checkpoint_value);
+        };
         const projection = try self.stageRuleProjection(&batch, rule_id, selected, head, plan);
         var result: LocalEffectOutcome = .{
             .projection = projection,
@@ -760,35 +834,93 @@ pub const Transaction = struct {
                     result.effects_applied += 1;
                 },
                 .setenv => {
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, plan);
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
                     errdefer self.waf.allocator.free(name);
                     if (!validEnvironmentName(name)) return error.InvalidEnvironmentName;
-                    const value = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, plan);
+                    const value = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
                     errdefer self.waf.allocator.free(value);
                     try batch.putOwned(.env, name, value, source);
                     result.effects_applied += 1;
                 },
                 .setvar => {
                     const configured_collection = effect.collection orelse return error.InvalidRuleReference;
-                    if (configured_collection != .tx) {
+                    if (configured_collection.persistent() and !include_persistent) {
                         result.pending_persistent_effects += 1;
                         continue;
                     }
-                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, plan);
+                    const collection_name = effectCollectionName(configured_collection);
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
                     errdefer self.waf.allocator.free(name);
-                    if (name.len == 0) return error.InvalidMatchContext;
+                    if (name.len == 0) return error.InvalidActionValue;
                     const operation = effect.operation orelse return error.InvalidRuleReference;
                     const expanded_operand = if (effect.value) |value|
-                        try self.expandEffectTextStaged(value, &batch, plan)
+                        try self.expandEffectTextStaged(value, &batch, &scalar_batch, plan)
                     else
                         null;
                     defer if (expanded_operand) |value| self.waf.allocator.free(value);
-                    const next = try self.evaluateSetVar(&batch, name, operation, expanded_operand);
+                    const next = try self.evaluateSetVar(&batch, collection_name, name, operation, expanded_operand);
                     errdefer if (next) |value| self.waf.allocator.free(value);
-                    try batch.putOwned(.tx, name, next, source);
+                    if (configured_collection.persistent()) {
+                        const namespace = persistentNamespace(configured_collection).?;
+                        if (!self.persistentNamespaceFailedOpen(namespace)) {
+                            try self.stagePersistentSetVar(namespace, name, operation, expanded_operand);
+                            try batch.putOwned(collection_name, name, next, source);
+                        } else {
+                            self.waf.allocator.free(name);
+                            if (next) |value| self.waf.allocator.free(value);
+                        }
+                    } else {
+                        try batch.putOwned(.tx, name, next, source);
+                    }
                     result.effects_applied += 1;
                 },
-                .initcol, .expirevar, .deprecatevar, .setuid, .setsid, .setrsc => result.pending_persistent_effects += 1,
+                .initcol => {
+                    if (!include_persistent) {
+                        result.pending_persistent_effects += 1;
+                        continue;
+                    }
+                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                        return error.InvalidRuleReference;
+                    const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    defer self.waf.allocator.free(key);
+                    if (key.len == 0) return error.InvalidActionValue;
+                    _ = try self.initializePersistentStaged(&batch, namespace, key);
+                    result.effects_applied += 1;
+                },
+                .setuid, .setsid, .setrsc => {
+                    if (!include_persistent) {
+                        result.pending_persistent_effects += 1;
+                        continue;
+                    }
+                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                        return error.InvalidRuleReference;
+                    const key = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    errdefer self.waf.allocator.free(key);
+                    if (key.len == 0) return error.InvalidActionValue;
+                    _ = try self.initializePersistentStaged(&batch, namespace, key);
+                    try scalar_batch.putOwned(bindingScalar(namespace), key, .rule, .request_headers);
+                    result.effects_applied += 1;
+                },
+                .expirevar => {
+                    if (!include_persistent) {
+                        result.pending_persistent_effects += 1;
+                        continue;
+                    }
+                    const namespace = persistentNamespace(effect.collection orelse return error.InvalidRuleReference) orelse
+                        return error.InvalidRuleReference;
+                    if (self.persistentNamespaceFailedOpen(namespace)) {
+                        result.effects_applied += 1;
+                        continue;
+                    }
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    defer self.waf.allocator.free(name);
+                    const seconds_text = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                    defer self.waf.allocator.free(seconds_text);
+                    const seconds = action_config.parsePositiveU32(seconds_text) catch return error.InvalidActionValue;
+                    try self.stagePersistentExpiry(namespace, name, seconds);
+                    result.effects_applied += 1;
+                },
+                .deprecatevar => result.pending_persistent_effects += 1,
             }
         }
 
@@ -806,7 +938,22 @@ pub const Transaction = struct {
             values[value_index] = .{ .collection = item.collection, .key = item.key, .value = value, .source = item.source };
             value_index += 1;
         };
+        const scalar_values = try self.waf.allocator.alloc(variables.SetValue, scalar_batch.items.items.len);
+        defer self.waf.allocator.free(scalar_values);
+        for (scalar_batch.items.items, scalar_values) |item, *value| value.* = .{
+            .name = item.name,
+            .value = item.value,
+            .origin = item.origin,
+            .available_from = item.available_from,
+        };
+        var prepared_scalars = try self.scalar_variables.prepareBatch(
+            scalar_values,
+            self.waf.config.limits.max_scalar_value_bytes,
+            self.waf.config.limits.max_scalar_storage_bytes,
+        );
+        defer prepared_scalars.deinit();
         try self.collection_variables.replaceKeyGroups(keys, values);
+        self.scalar_variables.commitPreparedBatch(&prepared_scalars);
         return result;
     }
 
@@ -1198,7 +1345,10 @@ pub const Transaction = struct {
         if (@backingInt(availability) < @backingInt(variables.Availability.request_headers)) return error.InvalidLifecycle;
         const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
         var snapshot = (session.initialize(namespace, collection_key, try self.persistentNow()) catch |err| {
-            if (try self.handlePersistentFailure(err)) return .failed_open;
+            if (try self.handlePersistentFailure(err)) {
+                self.markPersistentNamespaceFailedOpen(namespace);
+                return .failed_open;
+            }
             return err;
         }) orelse return .already_initialized;
         defer snapshot.deinit();
@@ -1522,6 +1672,7 @@ pub const Transaction = struct {
         self: *Transaction,
         text: compiled_plan.EffectText,
         batch: *const ShadowBatch,
+        scalar_batch: *const ScalarShadowBatch,
         plan: *const compiled_plan.Plan,
     ) TransactionError![]u8 {
         const source = plan.string(text.value) orelse return error.InvalidRuleReference;
@@ -1539,7 +1690,8 @@ pub const Transaction = struct {
             const value = switch (token.kind) {
                 .literal => raw,
                 .scalar => if (token.scalar) |name|
-                    resolveMacroScalar(self, name) orelse missingPlanMacro(raw, self.waf.config.macro_missing_policy)
+                    scalar_batch.get(name) orelse resolveMacroScalar(self, name) orelse
+                        missingPlanMacro(raw, self.waf.config.macro_missing_policy)
                 else
                     missingPlanMacro(raw, self.waf.config.macro_missing_policy),
                 .collection => if (token.collection) |name| blk: {
@@ -1560,9 +1712,83 @@ pub const Transaction = struct {
         return output.toOwnedSlice(self.waf.allocator);
     }
 
+    fn initializePersistentStaged(
+        self: *Transaction,
+        batch: *ShadowBatch,
+        namespace: persistent.Namespace,
+        collection_key: []const u8,
+    ) TransactionError!PersistentInitialization {
+        if (self.persistentNamespaceFailedOpen(namespace)) return .failed_open;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        var snapshot = (session.initialize(namespace, collection_key, try self.persistentNow()) catch |err| {
+            if (try self.handlePersistentFailure(err)) {
+                self.markPersistentNamespaceFailedOpen(namespace);
+                return .failed_open;
+            }
+            return err;
+        }) orelse return .already_initialized;
+        defer snapshot.deinit();
+
+        const collection_name = namespace.collectionName();
+        var existing = self.collection_variables.select(collection_name, .all);
+        while (try existing.next()) |value| {
+            try batch.putCopy(collection_name, value.key, null, value.source);
+        }
+        for (snapshot.values.items) |value| {
+            try batch.putCopy(
+                collection_name,
+                value.name,
+                value.value,
+                .{ .origin = .persistent, .offset = 0, .length = value.value.len },
+            );
+        }
+        return .loaded;
+    }
+
+    fn stagePersistentSetVar(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        name: []const u8,
+        operation: action_config.SetVarOperation,
+        operand: ?[]const u8,
+    ) TransactionError!void {
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        switch (operation) {
+            .set_one => try session.set(namespace, name, "1", null),
+            .set => try session.set(namespace, name, operand orelse "", null),
+            .remove => try session.remove(namespace, name),
+            .add => try session.add(namespace, name, persistent.parseNumericOrZero(operand orelse "")),
+            .subtract => try session.subtract(namespace, name, persistent.parseNumericOrZero(operand orelse "")),
+        }
+    }
+
+    fn stagePersistentExpiry(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        name: []const u8,
+        ttl_seconds: u32,
+    ) TransactionError!void {
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        const ttl_ns = std.math.mul(i64, @as(i64, ttl_seconds), std.time.ns_per_s) catch
+            return error.PersistentTimestampOverflow;
+        const expires_at_ns = std.math.add(i64, try self.persistentNow(), ttl_ns) catch
+            return error.PersistentTimestampOverflow;
+        try session.expire(namespace, name, expires_at_ns);
+    }
+
+    fn persistentNamespaceFailedOpen(self: *const Transaction, namespace: persistent.Namespace) bool {
+        const bit = @as(u8, 1) << @as(u3, @intCast(@backingInt(namespace)));
+        return self.persistent_failed_open & bit != 0;
+    }
+
+    fn markPersistentNamespaceFailedOpen(self: *Transaction, namespace: persistent.Namespace) void {
+        self.persistent_failed_open |= @as(u8, 1) << @as(u3, @intCast(@backingInt(namespace)));
+    }
+
     fn evaluateSetVar(
         self: *Transaction,
         batch: *const ShadowBatch,
+        collection_name: collections.Name,
         name: []const u8,
         operation: action_config.SetVarOperation,
         operand: ?[]const u8,
@@ -1572,10 +1798,10 @@ pub const Transaction = struct {
             .set => try self.waf.allocator.dupe(u8, operand orelse ""),
             .remove => null,
             .add, .subtract => blk: {
-                const current_text = switch (batch.lookup(.tx, name)) {
+                const current_text = switch (batch.lookup(collection_name, name)) {
                     .value => |value| value,
                     .removed => "",
-                    .missing => if (self.collection_variables.first(.tx, name)) |value| value.value else "",
+                    .missing => if (self.collection_variables.first(collection_name, name)) |value| value.value else "",
                 };
                 const current = persistent.parseNumericOrZero(current_text);
                 const delta = persistent.parseNumericOrZero(operand orelse "");
@@ -1785,6 +2011,37 @@ fn validEnvironmentName(name: []const u8) bool {
         if (byte == 0 or byte == '=' or byte == '\r' or byte == '\n') return false;
     }
     return true;
+}
+
+fn effectCollectionName(name: action_config.Collection) collections.Name {
+    return switch (name) {
+        .tx => .tx,
+        .ip => .ip,
+        .session => .session,
+        .user => .user,
+        .global => .global,
+        .resource => .resource,
+    };
+}
+
+fn persistentNamespace(name: action_config.Collection) ?persistent.Namespace {
+    return switch (name) {
+        .tx => null,
+        .ip => .ip,
+        .session => .session,
+        .user => .user,
+        .global => .global,
+        .resource => .resource,
+    };
+}
+
+fn bindingScalar(namespace: persistent.Namespace) variables.Name {
+    return switch (namespace) {
+        .session => .session_id,
+        .user => .user_id,
+        .resource => .resource,
+        .ip, .global => unreachable,
+    };
 }
 
 fn containsLineBreak(value: []const u8) bool {
@@ -2567,6 +2824,89 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
     try std.testing.expectEqualStrings("old", (try tx.collectionFirst(.rule, "msg")).?.value);
     try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
     try std.testing.expect((try tx.collectionFirst(.env, "SHOULD_NOT_COMMIT")) == null);
+}
+
+test "matched-rule effects bind mutate expire and flush persistent namespaces" {
+    const input =
+        \\SecRule ARGS @rx "id:8,initcol:'ip=%{REMOTE_ADDR}',setvar:'ip.score=1',setvar:'ip.score=+2',expirevar:'ip.score=60',setsid:'%{TX.sid}',setvar:'session.flag=1',setuid:'alice',setvar:'user.copy=%{SESSION.flag}',setrsc:'/account',setvar:'resource.hit'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "persistent-effects.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var memory = persistent.InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    var clock: TestClock = .{ .unix_nanoseconds = 5 * std.time.ns_per_s, .awake_nanoseconds = 0 };
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setPersistentBackend(memory.backend());
+    builder.setClockSource(.{ .context = &clock, .nowFn = TestClock.now });
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.setCollectionValue(.tx, "sid", "session-1", .{ .origin = .rule, .offset = 0, .length = 9 });
+
+    const outcome = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    });
+    try std.testing.expectEqual(@as(usize, 10), outcome.effects_applied);
+    try std.testing.expectEqual(@as(usize, 0), outcome.pending_persistent_effects);
+    try std.testing.expectEqualStrings("3", (try tx.collectionFirst(.ip, "score")).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.session, "flag")).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.user, "copy")).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.resource, "hit")).?.value);
+    try std.testing.expectEqualStrings("session-1", (try tx.scalar(.session_id)).?.value);
+    try std.testing.expectEqualStrings("alice", (try tx.scalar(.user_id)).?.value);
+    try std.testing.expectEqualStrings("/account", (try tx.scalar(.resource)).?.value);
+    try std.testing.expectEqual(@as(usize, 4), try tx.flushPersistentCollections());
+
+    var ip_before_expiry = try memory.backend().load(std.testing.allocator, .ip, "192.0.2.20", 65 * std.time.ns_per_s - 1, .{});
+    defer ip_before_expiry.deinit();
+    try std.testing.expectEqualStrings("3", ip_before_expiry.values.items[0].value);
+    var ip_at_expiry = try memory.backend().load(std.testing.allocator, .ip, "192.0.2.20", 65 * std.time.ns_per_s, .{});
+    defer ip_at_expiry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), ip_at_expiry.values.items.len);
+}
+
+test "failed combined effect preflight rolls back persistent session state" {
+    const input =
+        \\SecRule ARGS @rx "id:9,initcol:'ip=%{REMOTE_ADDR}',setvar:'ip.score=1',setvar:'tx.maximum=+1'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "persistent-rollback.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var memory = persistent.InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setPersistentBackend(memory.backend());
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", source);
+    try std.testing.expectError(error.CapacityExceeded, tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = source,
+    }));
+    try std.testing.expect((try tx.collectionFirst(.ip, "score")) == null);
+    try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
+    try std.testing.expectEqual(@as(usize, 0), try tx.flushPersistentCollections());
+    try std.testing.expectEqual(@as(usize, 0), memory.records.items.len);
 }
 
 test "compiled feature discovery is explicit" {
