@@ -70,6 +70,18 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             }
         }
     }
+    for (compiled.macro_programs) |program| {
+        const source = compiled.string(program.source) orelse return error.InvalidPlanFuzzMacro;
+        if (program.tokens_count == 0 or program.tokens_start + program.tokens_count > compiled.macro_tokens.len)
+            return error.InvalidPlanFuzzMacro;
+        for (compiled.macro_tokens[program.tokens_start..][0..program.tokens_count]) |token| {
+            if (token.source_start + token.source_length > source.len) return error.InvalidPlanFuzzMacro;
+            if (token.kind == .literal and (token.name != null or token.key != null)) return error.InvalidPlanFuzzMacro;
+            if (token.kind != .literal and (token.name == null or compiled.string(token.name.?) == null))
+                return error.InvalidPlanFuzzMacro;
+            if (token.key) |key| _ = compiled.string(key) orelse return error.InvalidPlanFuzzMacro;
+        }
+    }
     var chain_members: usize = 0;
     for (compiled.rules) |rule| chain_members += @intFromBool(rule.chain_position != 0);
     if (indexed_rules + chain_members != compiled.rules.len) return error.InvalidPlanFuzzPhaseIndex;

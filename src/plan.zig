@@ -7,7 +7,8 @@ pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
 pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 1;
+pub const MacroProgramId = enum(u32) { _ };
+pub const compiler_abi_version: u32 = 2;
 pub const Fingerprint = [32]u8;
 
 pub const Limits = struct {
@@ -20,6 +21,8 @@ pub const Limits = struct {
     max_graph_edges: usize = 500_000,
     max_generic_directives: usize = 500_000,
     max_markers: usize = 500_000,
+    max_macro_programs: usize = 1_000_000,
+    max_macro_tokens: usize = 8_000_000,
     max_targets: usize = 2_000_000,
     max_actions: usize = 4_000_000,
     max_transformations: usize = 4_000_000,
@@ -43,6 +46,8 @@ pub const Limits = struct {
             self.max_graph_edges == 0 or
             self.max_generic_directives == 0 or
             self.max_markers == 0 or
+            self.max_macro_programs == 0 or
+            self.max_macro_tokens == 0 or
             self.max_targets == 0 or
             self.max_actions == 0 or
             self.max_transformations == 0 or
@@ -67,6 +72,8 @@ pub const Limits = struct {
             self.max_graph_edges > std.math.maxInt(u32) or
             self.max_generic_directives > std.math.maxInt(u32) or
             self.max_markers > std.math.maxInt(u32) or
+            self.max_macro_programs > std.math.maxInt(u32) or
+            self.max_macro_tokens > std.math.maxInt(u32) or
             self.max_targets > std.math.maxInt(u32) or
             self.max_actions > std.math.maxInt(u32) or
             self.max_transformations > std.math.maxInt(u32) or
@@ -92,6 +99,8 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyGraphEdges,
     TooManyGenericDirectives,
     TooManyMarkers,
+    TooManyMacroPrograms,
+    TooManyMacroTokens,
     TooManyTargets,
     TooManyActions,
     TooManyTransformations,
@@ -113,6 +122,8 @@ pub const CompileError = std.mem.Allocator.Error || error{
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
+    UnterminatedMacro,
+    EmptyMacroExpression,
 };
 
 pub const DiagnosticCode = enum {
@@ -122,6 +133,8 @@ pub const DiagnosticCode = enum {
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
+    unterminated_macro,
+    empty_macro_expression,
 
     pub fn id(self: DiagnosticCode) []const u8 {
         return switch (self) {
@@ -131,6 +144,8 @@ pub const DiagnosticCode = enum {
             .dangling_chain => "WAF-PLAN-0104",
             .chain_phase_mismatch => "WAF-PLAN-0105",
             .invalid_transformation => "WAF-PLAN-0106",
+            .unterminated_macro => "WAF-PLAN-0107",
+            .empty_macro_expression => "WAF-PLAN-0108",
         };
     }
 
@@ -142,6 +157,8 @@ pub const DiagnosticCode = enum {
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
+            .unterminated_macro => "runtime macro expression is missing a closing brace",
+            .empty_macro_expression => "runtime macro expression cannot be empty",
         };
     }
 };
@@ -208,6 +225,7 @@ pub const Operator = struct {
     negated: bool,
     implicit_regex: bool,
     prefilter: ?Prefilter,
+    macro: ?MacroProgramId,
 };
 
 pub const PrefilterKind = enum { exact, prefix, suffix, contains, phrases_any };
@@ -223,6 +241,7 @@ pub const Action = struct {
     name: StringId,
     value: ?StringId,
     class: ActionClass,
+    macro: ?MacroProgramId,
 };
 
 pub const ActionClass = enum { transformation, metadata, nondisruptive, disruptive, flow, unknown };
@@ -230,6 +249,22 @@ pub const ActionClass = enum { transformation, metadata, nondisruptive, disrupti
 pub const Marker = struct {
     directive: DirectiveId,
     name: StringId,
+};
+
+pub const MacroTokenKind = enum { literal, scalar, collection };
+
+pub const MacroToken = struct {
+    kind: MacroTokenKind,
+    source_start: u32,
+    source_length: u32,
+    name: ?StringId = null,
+    key: ?StringId = null,
+};
+
+pub const MacroProgram = struct {
+    source: StringId,
+    tokens_start: u32,
+    tokens_count: u32,
 };
 
 pub const Transformation = struct {
@@ -279,6 +314,8 @@ const Component = struct {
     prefilter_literals: []const StringId,
     markers: []const Marker,
     generic_directives: []const DirectiveId,
+    macro_programs: []const MacroProgram,
+    macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
@@ -317,6 +354,8 @@ pub const Plan = struct {
     prefilter_literals: []const StringId,
     markers: []const Marker,
     generic_directives: []const DirectiveId,
+    macro_programs: []const MacroProgram,
+    macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
@@ -481,6 +520,9 @@ const Compiler = struct {
     prefilter_literals: std.ArrayList(StringId) = .empty,
     markers: std.ArrayList(Marker) = .empty,
     generic_directives: std.ArrayList(DirectiveId) = .empty,
+    macro_programs: std.ArrayList(MacroProgram) = .empty,
+    macro_tokens: std.ArrayList(MacroToken) = .empty,
+    macro_program_by_source: std.AutoHashMapUnmanaged(StringId, MacroProgramId) = .empty,
     prefilter_count: usize = 0,
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
@@ -507,6 +549,9 @@ const Compiler = struct {
         self.prefilter_literals.deinit(self.allocator);
         self.markers.deinit(self.allocator);
         self.generic_directives.deinit(self.allocator);
+        self.macro_programs.deinit(self.allocator);
+        self.macro_tokens.deinit(self.allocator);
+        self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
@@ -541,9 +586,11 @@ const Compiler = struct {
                 const rule = self.rules.items[@backingInt(rule_id.?)];
                 action_range = .{ .start = rule.actions_start, .count = rule.actions_count };
             },
-            .sec_action => action_range = try self.addActions(directive.parsed_actions),
+            .sec_action => action_range = self.addActions(directive.parsed_actions) catch |cause|
+                return self.fail(cause, actionSpan(directive), null),
             .sec_default_action => {
-                action_range = try self.addActions(directive.parsed_actions);
+                action_range = self.addActions(directive.parsed_actions) catch |cause|
+                    return self.fail(cause, actionSpan(directive), null);
                 if (self.defaults.items.len == self.limits.max_defaults) return error.TooManyDefaults;
                 const phase = (explicitPhase(directive.parsed_actions) catch
                     return self.fail(error.InvalidPhase, actionSpan(directive), null)) orelse
@@ -595,7 +642,8 @@ const Compiler = struct {
                 .selector = if (target.selector) |selector| try self.interner.intern(selector) else null,
             });
         }
-        const action_range = try self.addActions(directive.parsed_actions);
+        const action_range = self.addActions(directive.parsed_actions) catch |cause|
+            return self.fail(cause, actionSpan(directive), null);
         const parsed_operator = directive.parsed_operator.?;
         const id: RuleId = @fromBackingInt(try typedIndex(self.rules.items.len));
         const pending = self.pending_chain;
@@ -623,6 +671,8 @@ const Compiler = struct {
         const transformation_range = self.addTransformations(self.active_default, action_range) catch |cause|
             return self.fail(cause, actionSpan(directive), null);
         const prefilter = try self.addPrefilter(parsed_operator);
+        const operator_macro = self.addMacro(unquote(parsed_operator.parameter)) catch |cause|
+            return self.fail(cause, directive.operator().?.physical, null);
         try self.rules.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
@@ -641,6 +691,7 @@ const Compiler = struct {
                 .negated = parsed_operator.negated,
                 .implicit_regex = parsed_operator.implicit_regex,
                 .prefilter = prefilter,
+                .macro = operator_macro,
             },
             .actions_start = action_range.start,
             .actions_count = action_range.count,
@@ -677,11 +728,13 @@ const Compiler = struct {
         if (parsed_actions.len > self.limits.max_actions -| self.actions.items.len) return error.TooManyActions;
         const start = try typedIndex(self.actions.items.len);
         for (parsed_actions) |action| {
+            const value_id = if (action.value) |value| try self.interner.intern(value) else null;
             try self.actions.append(self.allocator, .{
                 .raw = try self.interner.intern(action.raw),
                 .name = try self.interner.intern(action.name),
-                .value = if (action.value) |value| try self.interner.intern(value) else null,
+                .value = value_id,
                 .class = classifyAction(action.name),
+                .macro = if (action.value) |value| try self.addMacro(unquote(value)) else null,
             });
         }
         return .{ .start = start, .count = try typedIndex(parsed_actions.len) };
@@ -723,6 +776,7 @@ const Compiler = struct {
             return null;
         const parameter = if (kind == .phrases_any) operator.parameter else normalized;
         if (parameter.len == 0) return null;
+        if (std.mem.indexOf(u8, parameter, "%{") != null) return null;
 
         if (self.prefilter_count == self.limits.max_prefilters) return error.TooManyPrefilters;
         const start = try typedIndex(self.prefilter_literals.items.len);
@@ -749,6 +803,64 @@ const Compiler = struct {
             return error.PrefilterBytesLimitExceeded;
         try self.prefilter_literals.append(self.allocator, try self.interner.intern(literal));
         self.prefilter_bytes += literal.len;
+    }
+
+    fn addMacro(self: *Compiler, source: []const u8) CompileError!?MacroProgramId {
+        if (std.mem.indexOf(u8, source, "%{") == null) return null;
+        const source_id = try self.interner.intern(source);
+        if (self.macro_program_by_source.get(source_id)) |existing| return existing;
+        if (self.macro_programs.items.len == self.limits.max_macro_programs) return error.TooManyMacroPrograms;
+        const program_id: MacroProgramId = @fromBackingInt(try typedIndex(self.macro_programs.items.len));
+        const tokens_start = try typedIndex(self.macro_tokens.items.len);
+        var literal_start: usize = 0;
+        var cursor: usize = 0;
+        while (cursor < source.len) {
+            const marker = std.mem.indexOfPos(u8, source, cursor, "%{") orelse break;
+            if (literal_start < marker) try self.appendMacroToken(.{
+                .kind = .literal,
+                .source_start = try typedIndex(literal_start),
+                .source_length = try typedIndex(marker - literal_start),
+            });
+            const expression_start = marker + 2;
+            const close = std.mem.indexOfScalarPos(u8, source, expression_start, '}') orelse return error.UnterminatedMacro;
+            if (close == expression_start) return error.EmptyMacroExpression;
+            const expression = source[expression_start..close];
+            if (std.mem.indexOfScalar(u8, expression, '.')) |dot| {
+                try self.appendMacroToken(.{
+                    .kind = .collection,
+                    .source_start = try typedIndex(marker),
+                    .source_length = try typedIndex(close + 1 - marker),
+                    .name = try self.interner.intern(expression[0..dot]),
+                    .key = try self.interner.intern(expression[dot + 1 ..]),
+                });
+            } else {
+                try self.appendMacroToken(.{
+                    .kind = .scalar,
+                    .source_start = try typedIndex(marker),
+                    .source_length = try typedIndex(close + 1 - marker),
+                    .name = try self.interner.intern(expression),
+                });
+            }
+            cursor = close + 1;
+            literal_start = cursor;
+        }
+        if (literal_start < source.len) try self.appendMacroToken(.{
+            .kind = .literal,
+            .source_start = try typedIndex(literal_start),
+            .source_length = try typedIndex(source.len - literal_start),
+        });
+        try self.macro_programs.append(self.allocator, .{
+            .source = source_id,
+            .tokens_start = tokens_start,
+            .tokens_count = try typedIndex(self.macro_tokens.items.len - tokens_start),
+        });
+        try self.macro_program_by_source.put(self.allocator, source_id, program_id);
+        return program_id;
+    }
+
+    fn appendMacroToken(self: *Compiler, token: MacroToken) CompileError!void {
+        if (self.macro_tokens.items.len == self.limits.max_macro_tokens) return error.TooManyMacroTokens;
+        try self.macro_tokens.append(self.allocator, token);
     }
 
     fn applyTransformations(self: *Compiler, pipeline: *std.ArrayList(StringId), range: ActionRange) CompileError!void {
@@ -789,6 +901,8 @@ const Compiler = struct {
         const prefilter_literals = try duplicateCounted(StringId, arena_allocator, self.prefilter_literals.items, &owned_bytes, self.limits);
         const markers = try duplicateCounted(Marker, arena_allocator, self.markers.items, &owned_bytes, self.limits);
         const generic_directives = try duplicateCounted(DirectiveId, arena_allocator, self.generic_directives.items, &owned_bytes, self.limits);
+        const macro_programs = try duplicateCounted(MacroProgram, arena_allocator, self.macro_programs.items, &owned_bytes, self.limits);
+        const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
@@ -812,6 +926,8 @@ const Compiler = struct {
             .prefilter_literals = prefilter_literals,
             .markers = markers,
             .generic_directives = generic_directives,
+            .macro_programs = macro_programs,
+            .macro_tokens = macro_tokens,
             .defaults = defaults,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
@@ -840,6 +956,8 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.prefilter_literals = component.prefilter_literals;
     plan.markers = component.markers;
     plan.generic_directives = component.generic_directives;
+    plan.macro_programs = component.macro_programs;
+    plan.macro_tokens = component.macro_tokens;
     plan.defaults = component.defaults;
     plan.phase_rules = component.phase_rules;
     plan.owned_bytes = component.owned_bytes;
@@ -863,6 +981,8 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !std.mem.eql(StringId, first.prefilter_literals, second.prefilter_literals) or
         !slicesEqual(Marker, first.markers, second.markers) or
         !std.mem.eql(DirectiveId, first.generic_directives, second.generic_directives) or
+        !slicesEqual(MacroProgram, first.macro_programs, second.macro_programs) or
+        !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults))
     {
         return false;
@@ -908,6 +1028,7 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashString(&hasher, plan.string(action.name).?);
         hashOptionalString(&hasher, plan, action.value);
         hashU8(&hasher, @intCast(@backingInt(action.class)));
+        hashOptionalId(&hasher, action.macro);
     }
     hashU32(&hasher, @intCast(plan.transformations.len));
     for (plan.transformations) |transformation| hashString(&hasher, plan.string(transformation.name).?);
@@ -929,6 +1050,7 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashString(&hasher, plan.string(rule.operator.parameter).?);
         hashBool(&hasher, rule.operator.negated);
         hashBool(&hasher, rule.operator.implicit_regex);
+        hashOptionalId(&hasher, rule.operator.macro);
         if (rule.operator.prefilter) |prefilter| {
             hashBool(&hasher, true);
             hashU8(&hasher, @intCast(@backingInt(prefilter.kind)));
@@ -958,6 +1080,20 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     }
     hashU32(&hasher, @intCast(plan.generic_directives.len));
     for (plan.generic_directives) |directive| hashU32(&hasher, @backingInt(directive));
+    hashU32(&hasher, @intCast(plan.macro_programs.len));
+    for (plan.macro_programs) |program| {
+        hashString(&hasher, plan.string(program.source).?);
+        hashU32(&hasher, program.tokens_start);
+        hashU32(&hasher, program.tokens_count);
+    }
+    hashU32(&hasher, @intCast(plan.macro_tokens.len));
+    for (plan.macro_tokens) |token| {
+        hashU8(&hasher, @intCast(@backingInt(token.kind)));
+        hashU32(&hasher, token.source_start);
+        hashU32(&hasher, token.source_length);
+        hashOptionalString(&hasher, plan, token.name);
+        hashOptionalString(&hasher, plan, token.key);
+    }
 
     var result: Fingerprint = undefined;
     hasher.final(&result);
@@ -1073,6 +1209,8 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
+        error.UnterminatedMacro => .unterminated_macro,
+        error.EmptyMacroExpression => .empty_macro_expression,
         else => null,
     };
 }
@@ -1602,7 +1740,11 @@ test "plan compilation cleans every injected allocation failure" {
 
     for (0..allocation_count) |failure_index| {
         var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
-        try std.testing.expectError(error.OutOfMemory, compile(failing.allocator(), &parsed.registry, &documents, .{}));
+        if (compile(failing.allocator(), &parsed.registry, &documents, .{})) |compiled| {
+            // Arena growth may recover from a failed resize with a fresh
+            // allocation; successful fallback must still release everything.
+            compiled.deinit();
+        } else |failure| try std.testing.expectEqual(error.OutOfMemory, failure);
         try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
     }
 }
@@ -1615,4 +1757,55 @@ test "plans compile and deinitialize repeatedly without retained allocations" {
         const value = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
         value.deinit();
     }
+}
+
+test "macro-bearing values compile into immutable deduplicated token programs" {
+    const input =
+        \\SecRule ARGS "@contains %{TX.needle}" "id:1,msg:'uri=%{REQUEST_URI} user=%{TX.user}',logdata:'uri=%{REQUEST_URI} user=%{TX.user}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "macros.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), compiled.macro_programs.len);
+    try std.testing.expect(compiled.rules[0].operator.macro != null);
+    try std.testing.expect(compiled.rules[0].operator.prefilter == null);
+    try std.testing.expectEqual(compiled.actions[1].macro, compiled.actions[2].macro);
+    const action_program = compiled.macro_programs[@backingInt(compiled.actions[1].macro.?)];
+    try std.testing.expectEqual(@as(u32, 4), action_program.tokens_count);
+    const tokens = compiled.macro_tokens[action_program.tokens_start..][0..action_program.tokens_count];
+    try std.testing.expectEqual(MacroTokenKind.literal, tokens[0].kind);
+    try std.testing.expectEqual(MacroTokenKind.scalar, tokens[1].kind);
+    try std.testing.expectEqualStrings("REQUEST_URI", compiled.string(tokens[1].name.?).?);
+    try std.testing.expectEqual(MacroTokenKind.collection, tokens[3].kind);
+    try std.testing.expectEqualStrings("TX", compiled.string(tokens[3].name.?).?);
+    try std.testing.expectEqualStrings("user", compiled.string(tokens[3].key.?).?);
+}
+
+test "malformed macros diagnose their containing operator or action" {
+    const cases = [_]struct { input: []const u8, code: DiagnosticCode }{
+        .{ .input = "SecRule ARGS \"@contains %{TX.value\" id:1", .code = .unterminated_macro },
+        .{ .input = "SecAction \"msg:'%{}'\"", .code = .empty_macro_expression },
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bad-macro.conf", case.input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |value| try std.testing.expectEqual(case.code, value.code),
+        }
+    }
+}
+
+test "macro program and token limits fail distinctly" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "macro-limits.conf", "SecAction \"msg:'%{TX.one}',logdata:'%{TX.two}'\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(error.TooManyMacroPrograms, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_programs = 1 }));
+    try std.testing.expectError(error.TooManyMacroTokens, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_tokens = 1 }));
 }
