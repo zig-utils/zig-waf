@@ -327,6 +327,7 @@ pub const TransactionError = error{
     TransactionTerminated,
     ClockBeforeUnixEpoch,
     MacroOutputTooLarge,
+    CollectionSizeOverflow,
 } || variables.StoreError || collections.StoreError || collections.SelectorError;
 
 const Lifecycle = enum {
@@ -342,6 +343,8 @@ const Lifecycle = enum {
     logging,
     deinitialized,
 };
+
+pub const ArgumentOrigin = enum { query, body, path };
 
 /// Isolated per-request mutable state.
 ///
@@ -366,6 +369,8 @@ pub const Transaction = struct {
     started_awake_nanoseconds: i96,
     sequence: u64,
     highest_severity: u8 = 255,
+    args_combined_size: usize = 0,
+    files_combined_size: u64 = 0,
 
     pub fn processConnection(
         self: *Transaction,
@@ -653,6 +658,67 @@ pub const Transaction = struct {
     ) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.collection_variables.add(name, key, value, source);
+    }
+
+    pub fn addArgument(
+        self: *Transaction,
+        argument_origin: ArgumentOrigin,
+        key: []const u8,
+        value: []const u8,
+        source: collections.Source,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const mapping: struct {
+            specific: collections.Name,
+            names: collections.Name,
+            availability: variables.Availability,
+        } = switch (argument_origin) {
+            .query => .{ .specific = .args_get, .names = .args_get_names, .availability = .request_headers },
+            .body => .{ .specific = .args_post, .names = .args_post_names, .availability = .request_body },
+            .path => .{ .specific = .args_path, .names = .args_names, .availability = .request_headers },
+        };
+        const values = [_]collections.Value{
+            .{ .collection = mapping.specific, .key = key, .value = value, .source = source },
+            .{ .collection = mapping.names, .key = key, .value = key, .source = source },
+            .{ .collection = .args, .key = key, .value = value, .source = source },
+            .{ .collection = .args_names, .key = key, .value = key, .source = source },
+        };
+        const added = std.math.add(usize, key.len, value.len) catch return error.CollectionSizeOverflow;
+        const next_combined_size = std.math.add(usize, self.args_combined_size, added) catch return error.CollectionSizeOverflow;
+        try self.collection_variables.addBatch(&values);
+        self.args_combined_size = next_combined_size;
+        try self.setScalarUnsigned(.args_combined_size, self.args_combined_size, .parser, mapping.availability);
+    }
+
+    pub fn addRequestCookie(self: *Transaction, key: []const u8, value: []const u8, source: collections.Source) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.collection_variables.addPair(
+            .{ .collection = .request_cookies, .key = key, .value = value, .source = source },
+            .{ .collection = .request_cookies_names, .key = key, .value = key, .source = source },
+        );
+    }
+
+    pub fn addFileMetadata(
+        self: *Transaction,
+        field: []const u8,
+        original_name: []const u8,
+        temporary_name: []const u8,
+        size: u64,
+        source: collections.Source,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        var size_buffer: [32]u8 = undefined;
+        const size_text = std.fmt.bufPrint(&size_buffer, "{d}", .{size}) catch unreachable;
+        const values = [_]collections.Value{
+            .{ .collection = .files, .key = field, .value = temporary_name, .source = source },
+            .{ .collection = .files_names, .key = field, .value = original_name, .source = source },
+            .{ .collection = .files_sizes, .key = field, .value = size_text, .source = source },
+            .{ .collection = .files_tmp_names, .key = field, .value = temporary_name, .source = source },
+        };
+        const next_combined_size = std.math.add(u64, self.files_combined_size, size) catch return error.CollectionSizeOverflow;
+        try self.collection_variables.addBatch(&values);
+        self.files_combined_size = next_combined_size;
+        try self.setScalarUnsigned(.files_combined_size, self.files_combined_size, .parser, .request_body);
     }
 
     pub fn setCollectionValue(
@@ -1307,6 +1373,36 @@ test "WAF configuration selects macro missing-value compatibility" {
     const expanded = try tx.expandMacro(&compiled, std.testing.allocator);
     defer std.testing.allocator.free(expanded);
     try std.testing.expectEqualStrings("x=TX.missing", expanded);
+}
+
+test "argument cookie and file producers maintain derived collections and sizes" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "POST", "HTTP/1.1");
+
+    const query_source: collections.Source = .{ .origin = .request_target, .offset = 3, .length = 5 };
+    try tx.addArgument(.query, "q", "zig", query_source);
+    try tx.addRequestCookie("Session", "abc", .{ .origin = .request_header, .offset = 20, .length = 3 });
+    try std.testing.expectEqualStrings("zig", (try tx.collectionFirst(.args_get, "q")).?.value);
+    try std.testing.expectEqualStrings("zig", (try tx.collectionFirst(.args, "q")).?.value);
+    try std.testing.expectEqualStrings("q", (try tx.collectionFirst(.args_names, "q")).?.value);
+    try std.testing.expectEqualStrings("4", (try tx.scalar(.args_combined_size)).?.value);
+    try std.testing.expect((try tx.collectionFirst(.request_cookies, "session")) == null);
+    try std.testing.expectEqualStrings("abc", (try tx.collectionFirst(.request_cookies, "Session")).?.value);
+
+    try tx.processRequestHeaders();
+    try tx.addArgument(.body, "name", "alice", .{ .origin = .request_body, .offset = 0, .length = 5 });
+    try tx.addFileMetadata("avatar", "me.png", "/tmp/upload-1", 42, .{ .origin = .request_body, .offset = 10, .length = 42 });
+    try tx.processRequestBody();
+    try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "name")).?.value);
+    try std.testing.expectEqualStrings("13", (try tx.scalar(.args_combined_size)).?.value);
+    try std.testing.expectEqualStrings("42", (try tx.scalar(.files_combined_size)).?.value);
+    try std.testing.expectEqualStrings("me.png", (try tx.collectionFirst(.files_names, "avatar")).?.value);
+    try std.testing.expectEqualStrings("/tmp/upload-1", (try tx.collectionFirst(.files_tmp_names, "avatar")).?.value);
 }
 
 test "compiled feature discovery is explicit" {

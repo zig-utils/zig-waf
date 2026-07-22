@@ -247,16 +247,21 @@ pub const Store = struct {
     /// Atomically append two related values, such as a header value and its
     /// corresponding `*_NAMES` entry.
     pub fn addPair(self: *Store, first_value: Value, second_value: Value) StoreError!void {
-        try self.validateValue(first_value, 2);
-        try self.validateValue(second_value, 2);
-        const added = first_value.key.len + first_value.value.len + second_value.key.len + second_value.value.len;
-        if (added > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
+        return self.addBatch(&.{ first_value, second_value });
+    }
 
-        const first_entry = try self.ownEntry(first_value);
-        const second_entry = try self.ownEntry(second_value);
-        try self.entries.ensureUnusedCapacity(self.arena.allocator(), 2);
-        self.entries.appendAssumeCapacity(first_entry);
-        self.entries.appendAssumeCapacity(second_entry);
+    pub fn addBatch(self: *Store, values: []const Value) StoreError!void {
+        if (values.len > self.limits.max_entries -| self.entries.items.len) return error.TooManyCollectionEntries;
+        var added: usize = 0;
+        for (values) |value| {
+            try self.validateValue(value, values.len);
+            const item_bytes = value.key.len + value.value.len;
+            if (item_bytes > self.limits.max_total_bytes -| added) return error.CollectionStorageLimitExceeded;
+            added += item_bytes;
+        }
+        if (added > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
+        try self.entries.ensureUnusedCapacity(self.arena.allocator(), values.len);
+        for (values) |value| self.entries.appendAssumeCapacity(try self.ownEntry(value));
         self.total_bytes += added;
     }
 
