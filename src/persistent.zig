@@ -236,6 +236,11 @@ const Binding = struct {
     mutations: std.ArrayList(Mutation) = .empty,
 };
 
+pub const Checkpoint = struct {
+    binding_count: usize,
+    mutation_counts: [std.meta.fieldNames(Namespace).len]usize,
+};
+
 /// Per-request persistence state. Creating a session performs no backend I/O;
 /// only explicit collection initialization and flushing invoke callbacks.
 pub const Session = struct {
@@ -348,6 +353,30 @@ pub const Session = struct {
             if (binding.mutations.items.len != 0) return true;
         }
         return false;
+    }
+
+    /// Capture the logical session state before staging a multi-effect rule.
+    /// Arena allocations remain charged after rollback, while bindings and
+    /// mutation logs return to the exact checkpoint boundary.
+    pub fn checkpoint(self: *const Session) Checkpoint {
+        var result: Checkpoint = .{
+            .binding_count = self.bindings.items.len,
+            .mutation_counts = @splat(0),
+        };
+        for (self.bindings.items) |binding| {
+            result.mutation_counts[@backingInt(binding.namespace)] = binding.mutations.items.len;
+        }
+        return result;
+    }
+
+    pub fn rollback(self: *Session, checkpoint_value: Checkpoint) void {
+        std.debug.assert(checkpoint_value.binding_count <= self.bindings.items.len);
+        for (self.bindings.items[0..checkpoint_value.binding_count]) |*binding| {
+            const count = checkpoint_value.mutation_counts[@backingInt(binding.namespace)];
+            std.debug.assert(count <= binding.mutations.items.len);
+            binding.mutations.shrinkRetainingCapacity(count);
+        }
+        self.bindings.shrinkRetainingCapacity(checkpoint_value.binding_count);
     }
 
     /// Roll back a just-created binding when the caller cannot publish its
@@ -834,6 +863,36 @@ test "session creation and unused state perform no backend work" {
     try std.testing.expect(!session.hasDirtyCollections());
     try std.testing.expectEqual(@as(usize, 0), try session.flush(0));
     try std.testing.expectEqual(@as(usize, 0), memory.records.items.len);
+}
+
+test "session checkpoint rolls back new bindings and staged mutations" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const backend = memory.backend();
+    const limits: Limits = .{};
+    var session = try Session.init(std.testing.allocator, backend, limits);
+    defer session.deinit();
+    var ip_snapshot = (try session.initialize(.ip, "192.0.2.5", 0)).?;
+    ip_snapshot.deinit();
+    try session.add(.ip, "score", 1);
+
+    const before_rule = session.checkpoint();
+    try session.add(.ip, "score", 100);
+    var user_snapshot = (try session.initialize(.user, "alice", 0)).?;
+    user_snapshot.deinit();
+    try session.set(.user, "flag", "should-not-commit", null);
+    session.rollback(before_rule);
+
+    try std.testing.expectEqual(@as(usize, 1), try session.flush(0));
+    var ip_result = try backend.load(std.testing.allocator, .ip, "192.0.2.5", 0, limits);
+    defer ip_result.deinit();
+    try std.testing.expectEqualStrings("1", ip_result.values.items[0].value);
+    var user_result = try backend.load(std.testing.allocator, .user, "alice", 0, limits);
+    defer user_result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), user_result.values.items.len);
+
+    var reinitialized = (try session.initialize(.user, "alice", 0)).?;
+    reinitialized.deinit();
 }
 
 test "set preserves expiry and expiry-only state stays hidden" {
