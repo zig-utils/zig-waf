@@ -3,7 +3,7 @@
 const std = @import("std");
 const collections = @import("collections.zig");
 
-pub const backend_abi_version: u32 = 1;
+pub const backend_abi_version: u32 = 2;
 
 pub const BackendFeature = enum(u8) {
     optimistic_revisions,
@@ -158,6 +158,10 @@ pub const Mutation = union(enum) {
         name: []const u8,
         delta: i64,
     },
+    subtract: struct {
+        name: []const u8,
+        delta: i64,
+    },
     expire: struct {
         name: []const u8,
         expires_at_ns: i64,
@@ -295,6 +299,14 @@ pub const Session = struct {
     pub fn add(self: *Session, namespace: Namespace, name: []const u8, delta: i64) SessionError!void {
         if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
         try self.appendMutation(namespace, .{ .add = .{
+            .name = try self.arena.allocator().dupe(u8, name),
+            .delta = delta,
+        } });
+    }
+
+    pub fn subtract(self: *Session, namespace: Namespace, name: []const u8, delta: i64) SessionError!void {
+        if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
+        try self.appendMutation(namespace, .{ .subtract = .{
             .name = try self.arena.allocator().dupe(u8, name),
             .delta = delta,
         } });
@@ -629,6 +641,30 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
                 try record.append(.{ .name = add.name, .value = value });
             }
         },
+        .subtract => |subtract| {
+            if (subtract.name.len == 0 or subtract.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
+            const index = findValue(record.values.items, subtract.name);
+            const current = if (index) |value_index|
+                parseNumericOrZero(record.values.items[value_index].value)
+            else
+                0;
+            const next = std.math.sub(i64, current, subtract.delta) catch return error.CapacityExceeded;
+            var text: [24]u8 = undefined;
+            const value = std.fmt.bufPrint(&text, "{d}", .{next}) catch unreachable;
+            if (value.len > limits.max_variable_value_bytes) return error.CapacityExceeded;
+            const allocator = record.arena.allocator();
+            if (index) |value_index| {
+                record.values.items[value_index] = .{
+                    .name = try allocator.dupe(u8, subtract.name),
+                    .value = try allocator.dupe(u8, value),
+                    .has_value = true,
+                    .expires_at_ns = record.values.items[value_index].expires_at_ns,
+                };
+            } else {
+                if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
+                try record.append(.{ .name = subtract.name, .value = value });
+            }
+        },
         .expire => |expire| {
             if (expire.name.len == 0 or expire.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
             if (findValue(record.values.items, expire.name)) |index| {
@@ -853,6 +889,23 @@ test "sessions reload revisions so concurrent additions compose" {
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 1), result.values.items.len);
     try std.testing.expectEqualStrings("5", result.values.items[0].value);
+}
+
+test "subtraction preserves the full signed operand domain" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const backend = memory.backend();
+    const limits: Limits = .{};
+    var session = try Session.init(std.testing.allocator, backend, limits);
+    defer session.deinit();
+    var snapshot = (try session.initialize(.global, "global", 0)).?;
+    snapshot.deinit();
+    try session.set(.global, "score", "-9223372036854775808", null);
+    try session.subtract(.global, "score", std.math.minInt(i64));
+    try std.testing.expectEqual(@as(usize, 1), try session.flush(0));
+    var result = try backend.load(std.testing.allocator, .global, "global", 0, limits);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("0", result.values.items[0].value);
 }
 
 test "session creation and unused state perform no backend work" {
