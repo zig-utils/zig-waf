@@ -491,7 +491,11 @@ fn explicitPhase(actions: []const seclang.syntax.Action) CompileError!?u8 {
     for (actions) |action| {
         if (!std.ascii.eqlIgnoreCase(action.name, "phase")) continue;
         const value = action.value orelse return error.InvalidPhase;
-        const parsed = parseUnsigned(unquote(value)) catch return error.InvalidPhase;
+        const normalized = unquote(value);
+        if (std.ascii.eqlIgnoreCase(normalized, "request")) return 2;
+        if (std.ascii.eqlIgnoreCase(normalized, "response")) return 4;
+        if (std.ascii.eqlIgnoreCase(normalized, "logging")) return 5;
+        const parsed = parseUnsigned(normalized) catch return error.InvalidPhase;
         if (parsed < 1 or parsed > 5) return error.InvalidPhase;
         return @intCast(parsed);
     }
