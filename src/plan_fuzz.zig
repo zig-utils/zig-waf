@@ -79,7 +79,8 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             rule.targets_start + rule.targets_count > compiled.targets.len or
             rule.actions_start + rule.actions_count > compiled.actions.len or
             rule.transformations_start + rule.transformations_count > compiled.transformations.len or
-            rule.metadata.tags_start + rule.metadata.tags_count > compiled.metadata_tags.len)
+            rule.metadata.tags_start + rule.metadata.tags_count > compiled.metadata_tags.len or
+            rule.effects_start + rule.effects_count > compiled.nondisruptive_effects.len)
         {
             return error.InvalidPlanFuzzRange;
         }
@@ -89,6 +90,12 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
         try validateMetadataText(compiled, rule.metadata.version);
         for (compiled.metadata_tags[rule.metadata.tags_start..][0..rule.metadata.tags_count]) |tag|
             try validateMetadataText(compiled, tag);
+        for (compiled.nondisruptive_effects[rule.effects_start..][0..rule.effects_count]) |effect| {
+            if (effect.action_index >= compiled.actions.len) return error.InvalidPlanFuzzEffect;
+            try validateEffectText(compiled, effect.name);
+            try validateEffectText(compiled, effect.value);
+            try validateEffectText(compiled, effect.auxiliary);
+        }
         if (rule.chain_position == 0 and rule.chain_head != @as(plan.RuleId, @fromBackingInt(@intCast(index))))
             return error.InvalidPlanFuzzChain;
         if (rule.operator.negated and rule.operator.prefilter != null) return error.InvalidPlanFuzzPrefilter;
@@ -145,6 +152,13 @@ fn validateMetadataText(compiled: *const plan.Plan, maybe_text: ?plan.MetadataTe
     _ = compiled.string(metadata.value) orelse return error.InvalidPlanFuzzMetadata;
     if (metadata.macro) |program| if (@backingInt(program) >= compiled.macro_programs.len)
         return error.InvalidPlanFuzzMetadata;
+}
+
+fn validateEffectText(compiled: *const plan.Plan, maybe_text: ?plan.EffectText) !void {
+    const effect = maybe_text orelse return;
+    _ = compiled.string(effect.value) orelse return error.InvalidPlanFuzzEffect;
+    if (effect.macro) |program| if (@backingInt(program) >= compiled.macro_programs.len)
+        return error.InvalidPlanFuzzEffect;
 }
 
 test "plan fuzz oracle accepts valid malformed and arbitrary bytes" {

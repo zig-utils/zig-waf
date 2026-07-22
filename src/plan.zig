@@ -42,6 +42,7 @@ pub const Limits = struct {
     max_target_expansion: usize = 4_000_000,
     max_action_expansion: usize = 8_000_000,
     max_metadata_tags: usize = 2_000_000,
+    max_nondisruptive_effects: usize = 4_000_000,
     max_configuration_warnings: usize = 1_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
@@ -74,6 +75,7 @@ pub const Limits = struct {
             self.max_target_expansion == 0 or
             self.max_action_expansion == 0 or
             self.max_metadata_tags == 0 or
+            self.max_nondisruptive_effects == 0 or
             self.max_configuration_warnings == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
@@ -106,6 +108,7 @@ pub const Limits = struct {
             self.max_target_expansion > std.math.maxInt(u32) or
             self.max_action_expansion > std.math.maxInt(u32) or
             self.max_metadata_tags > std.math.maxInt(u32) or
+            self.max_nondisruptive_effects > std.math.maxInt(u32) or
             self.max_configuration_warnings > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
@@ -141,6 +144,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TargetExpansionLimitExceeded,
     ActionExpansionLimitExceeded,
     TooManyMetadataTags,
+    TooManyNondisruptiveEffects,
     TooManyConfigurationWarnings,
     TooManyArguments,
     TooManyStrings,
@@ -162,6 +166,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidRuleTargetUpdate,
     InvalidRuleActionUpdate,
     InvalidRuleMetadata,
+    InvalidNondisruptiveAction,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -183,6 +188,7 @@ pub const DiagnosticCode = enum {
     invalid_rule_target_update,
     invalid_rule_action_update,
     invalid_rule_metadata,
+    invalid_nondisruptive_action,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -208,6 +214,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_target_update => "WAF-PLAN-0115",
             .invalid_rule_action_update => "WAF-PLAN-0116",
             .invalid_rule_metadata => "WAF-PLAN-0117",
+            .invalid_nondisruptive_action => "WAF-PLAN-0118",
         };
     }
 
@@ -225,6 +232,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_target_update => "rule target update contains invalid target syntax",
             .invalid_rule_action_update => "rule action update contains a forbidden or invalid action",
             .invalid_rule_metadata => "rule metadata value is missing, malformed, or outside its supported range",
+            .invalid_nondisruptive_action => "non-disruptive action value is missing or malformed",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -384,6 +392,41 @@ pub const RuleMetadata = struct {
     tags_count: u32 = 0,
 };
 
+pub const EffectText = struct {
+    value: StringId,
+    macro: ?MacroProgramId,
+};
+
+pub const EffectKind = enum {
+    capture,
+    log,
+    nolog,
+    auditlog,
+    noauditlog,
+    setenv,
+    setvar,
+    initcol,
+    expirevar,
+    deprecatevar,
+    setuid,
+    setsid,
+    setrsc,
+};
+
+/// Typed request-path descriptor. Field meanings are selected by `kind`:
+/// setenv uses name/value; setvar uses collection/name/value/operation;
+/// init/bind uses collection/value; expiry uses collection/name/value; and
+/// deprecation additionally uses auxiliary for the period.
+pub const NondisruptiveEffect = struct {
+    action_index: u32,
+    kind: EffectKind,
+    collection: ?action_config.Collection = null,
+    operation: ?action_config.SetVarOperation = null,
+    name: ?EffectText = null,
+    value: ?EffectText = null,
+    auxiliary: ?EffectText = null,
+};
+
 pub const Rule = struct {
     directive: DirectiveId,
     source: seclang.source.Span,
@@ -401,6 +444,8 @@ pub const Rule = struct {
     transformations_start: u32,
     transformations_count: u32,
     metadata: RuleMetadata,
+    effects_start: u32,
+    effects_count: u32,
     removed_by: ?DirectiveId,
 };
 
@@ -443,6 +488,7 @@ const Component = struct {
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     metadata_tags: []const MetadataText,
+    nondisruptive_effects: []const NondisruptiveEffect,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -489,6 +535,7 @@ pub const Plan = struct {
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
     metadata_tags: []const MetadataText,
+    nondisruptive_effects: []const NondisruptiveEffect,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -792,6 +839,7 @@ const Compiler = struct {
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     metadata_tags: std.ArrayList(MetadataText) = .empty,
+    nondisruptive_effects: std.ArrayList(NondisruptiveEffect) = .empty,
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
     id_requests: std.ArrayList(rule_config.IdInterval) = .empty,
     rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
@@ -832,6 +880,7 @@ const Compiler = struct {
         self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.metadata_tags.deinit(self.allocator);
+        self.nondisruptive_effects.deinit(self.allocator);
         self.id_intervals.deinit(self.allocator);
         self.id_requests.deinit(self.allocator);
         self.rule_removal_operations.deinit(self.allocator);
@@ -1186,6 +1235,8 @@ const Compiler = struct {
             .transformations_start = transformation_range.start,
             .transformations_count = transformation_range.count,
             .metadata = .{},
+            .effects_start = 0,
+            .effects_count = 0,
             .removed_by = null,
         });
         if (pending) |previous_id| {
@@ -1690,11 +1741,147 @@ const Compiler = struct {
         return .{ .value = try self.interner.intern(value), .macro = action.macro };
     }
 
+    fn compileNondisruptiveEffects(self: *Compiler) CompileError!void {
+        for (0..self.rules.items.len) |rule_index| {
+            const rule = self.rules.items[rule_index];
+            const start = try typedIndex(self.nondisruptive_effects.items.len);
+            if (rule.default) |default_id| {
+                const snapshot = self.defaults.items[@backingInt(default_id)];
+                try self.compileEffectRange(rule, snapshot.actions_start, snapshot.actions_count);
+            }
+            try self.compileEffectRange(rule, rule.actions_start, rule.actions_count);
+            self.rules.items[rule_index].effects_start = start;
+            self.rules.items[rule_index].effects_count = try typedIndex(self.nondisruptive_effects.items.len - start);
+        }
+    }
+
+    fn compileEffectRange(self: *Compiler, rule: Rule, start: u32, count: u32) CompileError!void {
+        for (self.actions.items[start..][0..count], 0..) |action, offset| {
+            const name = self.interner.values.items[@backingInt(action.name)];
+            const action_index = std.math.add(u32, start, @as(u32, @intCast(offset))) catch return error.TypedIdOverflow;
+            if (std.ascii.eqlIgnoreCase(name, "capture")) {
+                try self.appendFlagEffect(rule, action, action_index, .capture);
+            } else if (std.ascii.eqlIgnoreCase(name, "log")) {
+                try self.appendFlagEffect(rule, action, action_index, .log);
+            } else if (std.ascii.eqlIgnoreCase(name, "nolog")) {
+                try self.appendFlagEffect(rule, action, action_index, .nolog);
+            } else if (std.ascii.eqlIgnoreCase(name, "auditlog")) {
+                try self.appendFlagEffect(rule, action, action_index, .auditlog);
+            } else if (std.ascii.eqlIgnoreCase(name, "noauditlog")) {
+                try self.appendFlagEffect(rule, action, action_index, .noauditlog);
+            } else if (std.ascii.eqlIgnoreCase(name, "setenv")) {
+                const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                const assignment = action_config.parseAssignment(raw) catch
+                    return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                if (assignment.value.len == 0) return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                try self.appendEffect(.{
+                    .action_index = action_index,
+                    .kind = .setenv,
+                    .name = try self.effectText(assignment.name),
+                    .value = try self.effectText(assignment.value),
+                });
+            } else if (std.ascii.eqlIgnoreCase(name, "setvar")) {
+                const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                const parsed = action_config.parseSetVar(raw) catch
+                    return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                try self.appendEffect(.{
+                    .action_index = action_index,
+                    .kind = .setvar,
+                    .collection = parsed.collection,
+                    .operation = parsed.operation,
+                    .name = try self.effectText(parsed.key),
+                    .value = if (parsed.operand) |operand| try self.effectText(operand) else null,
+                });
+            } else if (std.ascii.eqlIgnoreCase(name, "initcol")) {
+                const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                const parsed = action_config.parseInitCollection(raw) catch
+                    return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                try self.appendEffect(.{
+                    .action_index = action_index,
+                    .kind = .initcol,
+                    .collection = parsed.collection,
+                    .value = try self.effectText(parsed.key),
+                });
+            } else if (std.ascii.eqlIgnoreCase(name, "expirevar")) {
+                const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                const parsed = action_config.parseExpiration(raw) catch
+                    return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                if (std.mem.indexOf(u8, parsed.seconds, "%{") == null)
+                    _ = action_config.parsePositiveU32(parsed.seconds) catch
+                        return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                try self.appendEffect(.{
+                    .action_index = action_index,
+                    .kind = .expirevar,
+                    .collection = parsed.collection,
+                    .name = try self.effectText(parsed.key),
+                    .value = try self.effectText(parsed.seconds),
+                });
+            } else if (std.ascii.eqlIgnoreCase(name, "deprecatevar")) {
+                const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                const parsed = action_config.parseDeprecation(raw) catch
+                    return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                if (std.mem.indexOf(u8, parsed.amount, "%{") == null)
+                    _ = action_config.parsePositiveU32(parsed.amount) catch
+                        return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                if (std.mem.indexOf(u8, parsed.period_seconds, "%{") == null)
+                    _ = action_config.parsePositiveU32(parsed.period_seconds) catch
+                        return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+                try self.appendEffect(.{
+                    .action_index = action_index,
+                    .kind = .deprecatevar,
+                    .collection = parsed.collection,
+                    .name = try self.effectText(parsed.key),
+                    .value = try self.effectText(parsed.amount),
+                    .auxiliary = try self.effectText(parsed.period_seconds),
+                });
+            } else if (std.ascii.eqlIgnoreCase(name, "setuid")) {
+                try self.appendBindingEffect(rule, action, action_index, .setuid, .user);
+            } else if (std.ascii.eqlIgnoreCase(name, "setsid")) {
+                try self.appendBindingEffect(rule, action, action_index, .setsid, .session);
+            } else if (std.ascii.eqlIgnoreCase(name, "setrsc")) {
+                try self.appendBindingEffect(rule, action, action_index, .setrsc, .resource);
+            }
+        }
+    }
+
+    fn appendFlagEffect(self: *Compiler, rule: Rule, action: Action, action_index: u32, kind: EffectKind) CompileError!void {
+        if (action.value != null) return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+        try self.appendEffect(.{ .action_index = action_index, .kind = kind });
+    }
+
+    fn appendBindingEffect(
+        self: *Compiler,
+        rule: Rule,
+        action: Action,
+        action_index: u32,
+        kind: EffectKind,
+        collection: action_config.Collection,
+    ) CompileError!void {
+        const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+        try self.appendEffect(.{
+            .action_index = action_index,
+            .kind = kind,
+            .collection = collection,
+            .value = try self.effectText(raw),
+        });
+    }
+
+    fn effectText(self: *Compiler, value: []const u8) CompileError!EffectText {
+        return .{ .value = try self.interner.intern(value), .macro = try self.addMacro(value) };
+    }
+
+    fn appendEffect(self: *Compiler, effect: NondisruptiveEffect) CompileError!void {
+        if (self.nondisruptive_effects.items.len == self.limits.max_nondisruptive_effects)
+            return error.TooManyNondisruptiveEffects;
+        try self.nondisruptive_effects.append(self.allocator, effect);
+    }
+
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
         try self.applyRuleRemovals();
         try self.applyRuleTargetUpdates();
         try self.applyRuleActionUpdates();
         try self.compileRuleMetadata();
+        try self.compileNondisruptiveEffects();
         try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
@@ -1723,6 +1910,7 @@ const Compiler = struct {
         const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         const metadata_tags = try duplicateCounted(MetadataText, arena_allocator, self.metadata_tags.items, &owned_bytes, self.limits);
+        const nondisruptive_effects = try duplicateCounted(NondisruptiveEffect, arena_allocator, self.nondisruptive_effects.items, &owned_bytes, self.limits);
         const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
         const missing_rule_references = try duplicateCounted(MissingRuleReference, arena_allocator, self.missing_rule_references.items, &owned_bytes, self.limits);
         const remote_sources = try duplicateCounted(RemoteSource, arena_allocator, self.remote_sources.items, &owned_bytes, self.limits);
@@ -1754,6 +1942,7 @@ const Compiler = struct {
             .macro_tokens = macro_tokens,
             .defaults = defaults,
             .metadata_tags = metadata_tags,
+            .nondisruptive_effects = nondisruptive_effects,
             .rule_removals = rule_removals,
             .missing_rule_references = missing_rule_references,
             .remote_sources = remote_sources,
@@ -1790,6 +1979,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.macro_tokens = component.macro_tokens;
     plan.defaults = component.defaults;
     plan.metadata_tags = component.metadata_tags;
+    plan.nondisruptive_effects = component.nondisruptive_effects;
     plan.rule_removals = component.rule_removals;
     plan.missing_rule_references = component.missing_rule_references;
     plan.remote_sources = component.remote_sources;
@@ -1821,6 +2011,7 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
         !slicesEqual(MetadataText, first.metadata_tags, second.metadata_tags) or
+        !slicesEqual(NondisruptiveEffect, first.nondisruptive_effects, second.nondisruptive_effects) or
         !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals) or
         !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references) or
         !slicesEqual(RemoteSource, first.remote_sources, second.remote_sources) or
@@ -1928,6 +2119,8 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashMetadataText(&hasher, plan, rule.metadata.version);
         hashU32(&hasher, rule.metadata.tags_start);
         hashU32(&hasher, rule.metadata.tags_count);
+        hashU32(&hasher, rule.effects_start);
+        hashU32(&hasher, rule.effects_count);
         hashOptionalId(&hasher, rule.removed_by);
     }
 
@@ -1935,6 +2128,22 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     for (plan.metadata_tags) |tag| {
         hashString(&hasher, plan.string(tag.value).?);
         hashOptionalId(&hasher, tag.macro);
+    }
+    hashU32(&hasher, @intCast(plan.nondisruptive_effects.len));
+    for (plan.nondisruptive_effects) |effect| {
+        hashU32(&hasher, effect.action_index);
+        hashU8(&hasher, @intCast(@backingInt(effect.kind)));
+        if (effect.collection) |collection| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, @intCast(@backingInt(collection)));
+        } else hashBool(&hasher, false);
+        if (effect.operation) |operation| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, @intCast(@backingInt(operation)));
+        } else hashBool(&hasher, false);
+        hashEffectText(&hasher, plan, effect.name);
+        hashEffectText(&hasher, plan, effect.value);
+        hashEffectText(&hasher, plan, effect.auxiliary);
     }
 
     hashU32(&hasher, @intCast(plan.defaults.len));
@@ -2024,6 +2233,14 @@ fn hashOptionalString(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value:
 }
 
 fn hashMetadataText(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value: ?MetadataText) void {
+    if (value) |text| {
+        hashBool(hasher, true);
+        hashString(hasher, plan.string(text.value).?);
+        hashOptionalId(hasher, text.macro);
+    } else hashBool(hasher, false);
+}
+
+fn hashEffectText(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value: ?EffectText) void {
     if (value) |text| {
         hashBool(hasher, true);
         hashString(hasher, plan.string(text.value).?);
@@ -2176,6 +2393,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidRuleTargetUpdate => .invalid_rule_target_update,
         error.InvalidRuleActionUpdate => .invalid_rule_action_update,
         error.InvalidRuleMetadata => .invalid_rule_metadata,
+        error.InvalidNondisruptiveAction => .invalid_nondisruptive_action,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -3348,6 +3566,79 @@ test "metadata tag storage has an independent resource limit" {
     defer parsed.deinit();
     var documents = [_]seclang.parser.Document{parsed.document};
     try std.testing.expectError(error.TooManyMetadataTags, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_metadata_tags = 1 }));
+}
+
+test "non-disruptive actions compile into ordered typed effect descriptors" {
+    const input =
+        \\SecDefaultAction "phase:2,log,auditlog,pass"
+        \\SecRule ARGS @rx "id:1,capture,nolog,setenv:'FLAG=%{TX.flag}',setvar:'tx.score=+%{TX.delta}',initcol:'ip=%{REMOTE_ADDR}',expirevar:'ip.score=60',deprecatevar:'ip.score=5/60',setuid:'%{TX.user}',setsid:'%{TX.session}',setrsc:'%{REQUEST_URI}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "effects.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    const rule = compiled.rules[0];
+    const effects = compiled.nondisruptive_effects[rule.effects_start..][0..rule.effects_count];
+    try std.testing.expectEqual(@as(usize, 12), effects.len);
+    try std.testing.expectEqual(EffectKind.log, effects[0].kind);
+    try std.testing.expectEqual(EffectKind.auditlog, effects[1].kind);
+    try std.testing.expectEqual(EffectKind.capture, effects[2].kind);
+    try std.testing.expectEqual(EffectKind.nolog, effects[3].kind);
+    try std.testing.expectEqual(EffectKind.setenv, effects[4].kind);
+    try std.testing.expectEqualStrings("FLAG", compiled.string(effects[4].name.?.value).?);
+    try std.testing.expect(effects[4].value.?.macro != null);
+    try std.testing.expectEqual(EffectKind.setvar, effects[5].kind);
+    try std.testing.expectEqual(action_config.Collection.tx, effects[5].collection.?);
+    try std.testing.expectEqual(action_config.SetVarOperation.add, effects[5].operation.?);
+    try std.testing.expectEqualStrings("score", compiled.string(effects[5].name.?.value).?);
+    try std.testing.expectEqualStrings("%{TX.delta}", compiled.string(effects[5].value.?.value).?);
+    try std.testing.expectEqual(EffectKind.initcol, effects[6].kind);
+    try std.testing.expectEqual(action_config.Collection.ip, effects[6].collection.?);
+    try std.testing.expectEqual(EffectKind.expirevar, effects[7].kind);
+    try std.testing.expectEqualStrings("60", compiled.string(effects[7].value.?.value).?);
+    try std.testing.expectEqual(EffectKind.deprecatevar, effects[8].kind);
+    try std.testing.expectEqualStrings("5", compiled.string(effects[8].value.?.value).?);
+    try std.testing.expectEqualStrings("60", compiled.string(effects[8].auxiliary.?.value).?);
+    try std.testing.expectEqual(EffectKind.setuid, effects[9].kind);
+    try std.testing.expectEqual(action_config.Collection.user, effects[9].collection.?);
+    try std.testing.expectEqual(EffectKind.setsid, effects[10].kind);
+    try std.testing.expectEqual(EffectKind.setrsc, effects[11].kind);
+}
+
+test "invalid non-disruptive action syntax has a stable diagnostic" {
+    const cases = [_][]const u8{
+        "SecRule ARGS @rx \"id:1,capture:bad\"",
+        "SecRule ARGS @rx \"id:1,setenv:FLAG\"",
+        "SecRule ARGS @rx \"id:1,setenv:FLAG=\"",
+        "SecRule ARGS @rx \"id:1,setvar:ARGS.score=1\"",
+        "SecRule ARGS @rx \"id:1,initcol:session=key\"",
+        "SecRule ARGS @rx \"id:1,expirevar:tx.score=60\"",
+        "SecRule ARGS @rx \"id:1,expirevar:ip.score=0\"",
+        "SecRule ARGS @rx \"id:1,deprecatevar:ip.score=5\"",
+        "SecRule ARGS @rx \"id:1,deprecatevar:ip.score=0/60\"",
+        "SecRule ARGS @rx \"id:1,setuid\"",
+    };
+    for (cases) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-effect.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |diagnostic| try std.testing.expectEqual(DiagnosticCode.invalid_nondisruptive_action, diagnostic.code),
+        }
+    }
+    try std.testing.expectEqualStrings("WAF-PLAN-0118", DiagnosticCode.invalid_nondisruptive_action.id());
+}
+
+test "non-disruptive effect storage has an independent resource limit" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "effect-limits.conf", "SecRule ARGS @rx \"id:1,log,auditlog\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(error.TooManyNondisruptiveEffects, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_nondisruptive_effects = 1 }));
 }
 
 test "structural plan evidence is valid and pinned to compiler ABI" {
