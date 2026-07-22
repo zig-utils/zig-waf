@@ -52,11 +52,7 @@ const CIntervention = extern struct {
     reserved: [4]u64,
 };
 
-const feature_bits: u64 =
-    (@as(u64, 1) << 0) |
-    (@as(u64, 1) << 1) |
-    (@as(u64, 1) << 2) |
-    (@as(u64, 1) << 3);
+const feature_bits: u64 = waf.FeatureSet.allCompiled().bits;
 
 export fn zig_waf_abi_version() callconv(.c) u32 {
     return abi_version;

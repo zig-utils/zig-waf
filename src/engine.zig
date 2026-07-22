@@ -8,6 +8,33 @@ pub const Mode = enum {
     detection_only,
 };
 
+pub const Feature = enum(u6) {
+    transaction_lifecycle,
+    bounded_streaming_bodies,
+    detection_only,
+    native_sqli,
+    scalar_variables,
+    atomic_hot_reload,
+};
+
+pub const FeatureSet = struct {
+    bits: u64,
+
+    pub fn allCompiled() FeatureSet {
+        var bits: u64 = 0;
+        inline for (std.meta.tags(Feature)) |feature| bits |= bit(feature);
+        return .{ .bits = bits };
+    }
+
+    pub fn has(self: FeatureSet, feature: Feature) bool {
+        return self.bits & bit(feature) != 0;
+    }
+
+    fn bit(feature: Feature) u64 {
+        return @as(u64, 1) << @backingInt(feature);
+    }
+};
+
 pub const Phase = enum(u8) {
     connection = 1,
     request_headers = 2,
@@ -93,6 +120,12 @@ pub const Builder = struct {
         };
         return waf;
     }
+
+    pub fn buildRuntime(self: *const Builder) (ConfigError || RuntimeInitError)!*Runtime {
+        const waf = try self.build();
+        errdefer waf.deinit() catch unreachable;
+        return Runtime.init(self.allocator, waf);
+    }
 };
 
 /// Immutable, thread-safe compiled WAF state.
@@ -115,10 +148,102 @@ pub const Waf = struct {
         return self.active_transactions.load(.acquire);
     }
 
+    pub fn features(_: *const Waf) FeatureSet {
+        return FeatureSet.allCompiled();
+    }
+
     pub fn deinit(self: *Waf) DeinitError!void {
         if (self.active_transactions.load(.acquire) != 0) return error.TransactionsActive;
         const allocator = self.allocator;
         allocator.destroy(self);
+    }
+};
+
+pub const RuntimeError = error{
+    ShuttingDown,
+    SameGeneration,
+    GenerationInUse,
+};
+
+pub const RuntimeInitError = std.mem.Allocator.Error || error{GenerationInUse};
+
+pub const RuntimeDeinitError = error{TransactionsActive};
+
+/// Stable owner for atomically published immutable WAF generations.
+///
+/// The mutex protects only generation pointer acquisition and replacement.
+/// Once returned, a transaction executes without touching the runtime lock and
+/// remains pinned to the generation from which it was created.
+pub const Runtime = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.atomic.Mutex = .unlocked,
+    active: ?*Waf,
+
+    pub fn init(allocator: std.mem.Allocator, initial: *Waf) RuntimeInitError!*Runtime {
+        if (initial.activeTransactionCount() != 0) return error.GenerationInUse;
+        const runtime = try allocator.create(Runtime);
+        runtime.* = .{ .allocator = allocator, .active = initial };
+        return runtime;
+    }
+
+    pub fn newTransaction(self: *Runtime) RuntimeError!Transaction {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.active orelse return error.ShuttingDown).newTransaction();
+    }
+
+    /// Publish `replacement` and transfer ownership of the prior generation to
+    /// the returned retirement handle. A replacement with existing requests is
+    /// rejected because its ownership is not exclusive.
+    pub fn reload(self: *Runtime, replacement: *Waf) RuntimeError!RetiredGeneration {
+        if (replacement.activeTransactionCount() != 0) return error.GenerationInUse;
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        const current = self.active orelse return error.ShuttingDown;
+        if (current == replacement) return error.SameGeneration;
+        self.active = replacement;
+        return .{ .waf = current };
+    }
+
+    pub fn activeTransactionCount(self: *Runtime) RuntimeError!usize {
+        lock(&self.mutex);
+        defer self.mutex.unlock();
+        return (self.active orelse return error.ShuttingDown).activeTransactionCount();
+    }
+
+    /// Destroy the runtime and its active generation. Callers must first stop
+    /// creating transactions and separately reclaim every retired generation.
+    pub fn deinit(self: *Runtime) RuntimeDeinitError!void {
+        lock(&self.mutex);
+        const active = self.active orelse unreachable;
+        if (active.activeTransactionCount() != 0) {
+            self.mutex.unlock();
+            return error.TransactionsActive;
+        }
+        self.active = null;
+        self.mutex.unlock();
+
+        active.deinit() catch unreachable;
+        const allocator = self.allocator;
+        allocator.destroy(self);
+    }
+};
+
+pub const RetiredGeneration = struct {
+    waf: ?*Waf,
+
+    pub fn activeTransactionCount(self: *const RetiredGeneration) usize {
+        return (self.waf orelse return 0).activeTransactionCount();
+    }
+
+    pub fn tryReclaim(self: *RetiredGeneration) DeinitError!void {
+        const waf = self.waf orelse return;
+        try waf.deinit();
+        self.waf = null;
+    }
+
+    pub fn isReclaimed(self: *const RetiredGeneration) bool {
+        return self.waf == null;
     }
 };
 
@@ -415,6 +540,10 @@ pub const Transaction = struct {
     }
 };
 
+fn lock(mutex: *std.atomic.Mutex) void {
+    while (!mutex.tryLock()) std.atomic.spinLoopHint();
+}
+
 fn validAddress(address: []const u8) bool {
     if (address.len == 0 or address.len > 255) return false;
     return !containsLineBreak(address) and std.mem.indexOfScalar(u8, address, 0) == null;
@@ -441,6 +570,31 @@ fn validToken(token: []const u8) bool {
 fn containsLineBreak(value: []const u8) bool {
     return std.mem.indexOfAny(u8, value, "\r\n\x00") != null;
 }
+
+const ReloadWorker = struct {
+    runtime: *Runtime,
+    pinned: *std.atomic.Value(usize),
+    release: *std.atomic.Value(bool),
+    failures: *std.atomic.Value(usize),
+
+    fn run(self: *ReloadWorker) void {
+        var pinned_tx = self.runtime.newTransaction() catch {
+            _ = self.failures.fetchAdd(1, .monotonic);
+            return;
+        };
+        _ = self.pinned.fetchAdd(1, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        pinned_tx.deinit();
+
+        for (0..500) |_| {
+            var tx = self.runtime.newTransaction() catch {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            };
+            tx.deinit();
+        }
+    }
+};
 
 test "executes the complete connector lifecycle" {
     var builder = Builder.init(std.testing.allocator);
@@ -543,4 +697,87 @@ test "owns scalar variables and exposes them only in valid phases" {
     try tx.processRequestHeaders();
     try tx.processResponseHeaders(403, "HTTP/2");
     try std.testing.expectEqualStrings("403", (try tx.scalar(.response_status)).?.value);
+}
+
+test "compiled feature discovery is explicit" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    const compiled = waf.features();
+    try std.testing.expect(compiled.has(.transaction_lifecycle));
+    try std.testing.expect(compiled.has(.scalar_variables));
+    try std.testing.expect(compiled.has(.atomic_hot_reload));
+}
+
+test "hot reload pins requests to retired generations until drain" {
+    var initial_builder = Builder.init(std.testing.allocator);
+    const runtime = try initial_builder.buildRuntime();
+
+    var old_tx = try runtime.newTransaction();
+    try old_tx.recordIntervention(.deny, 403, 1);
+    try std.testing.expect((try old_tx.intervention()).?.enforced);
+
+    var replacement_builder = Builder.init(std.testing.allocator);
+    replacement_builder.setMode(.detection_only);
+    const replacement = try replacement_builder.build();
+    var retired = try runtime.reload(replacement);
+    try std.testing.expectEqual(@as(usize, 1), retired.activeTransactionCount());
+    try std.testing.expectError(error.TransactionsActive, retired.tryReclaim());
+
+    var new_tx = try runtime.newTransaction();
+    try new_tx.recordIntervention(.deny, 403, 2);
+    try std.testing.expect(!(try new_tx.intervention()).?.enforced);
+    old_tx.deinit();
+    try retired.tryReclaim();
+    try std.testing.expect(retired.isReclaimed());
+
+    try std.testing.expectError(error.TransactionsActive, runtime.deinit());
+    new_tx.deinit();
+    try runtime.deinit();
+}
+
+test "runtime rejects ambiguous generation ownership" {
+    var builder = Builder.init(std.testing.allocator);
+    const initial = try builder.build();
+    const runtime = try Runtime.init(std.testing.allocator, initial);
+    defer runtime.deinit() catch unreachable;
+
+    try std.testing.expectError(error.SameGeneration, runtime.reload(initial));
+
+    const in_use = try builder.build();
+    var tx = in_use.newTransaction();
+    try std.testing.expectError(error.GenerationInUse, runtime.reload(in_use));
+    tx.deinit();
+    try in_use.deinit();
+}
+
+test "concurrent request pinning is safe across reload" {
+    var builder = Builder.init(std.testing.allocator);
+    const runtime = try builder.buildRuntime();
+    const replacement = try builder.build();
+
+    var pinned = std.atomic.Value(usize).init(0);
+    var release = std.atomic.Value(bool).init(false);
+    var failures = std.atomic.Value(usize).init(0);
+    var workers: [4]ReloadWorker = undefined;
+    var threads: [workers.len]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{
+            .runtime = runtime,
+            .pinned = &pinned,
+            .release = &release,
+            .failures = &failures,
+        };
+        thread.* = try std.Thread.spawn(.{}, ReloadWorker.run, .{worker});
+    }
+
+    while (pinned.load(.acquire) != workers.len) std.atomic.spinLoopHint();
+    var retired = try runtime.reload(replacement);
+    try std.testing.expectEqual(workers.len, retired.activeTransactionCount());
+    release.store(true, .release);
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+    try retired.tryReclaim();
+    try runtime.deinit();
 }

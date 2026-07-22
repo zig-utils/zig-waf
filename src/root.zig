@@ -7,9 +7,13 @@ pub const operators = @import("operators.zig");
 pub const variables = @import("variables.zig");
 
 pub const Waf = engine.Waf;
+pub const Runtime = engine.Runtime;
+pub const RetiredGeneration = engine.RetiredGeneration;
 pub const Transaction = engine.Transaction;
 pub const Intervention = engine.Intervention;
 pub const Phase = engine.Phase;
+pub const Feature = engine.Feature;
+pub const FeatureSet = engine.FeatureSet;
 
 test {
     _ = version;
