@@ -174,13 +174,16 @@ const Entry = struct {
     key: []u8,
     value: []u8,
     source: Source,
+    active: bool = true,
 };
+
+pub const SelectorError = error{ MatcherLimitExceeded, MatcherFailed };
 
 pub const Matcher = struct {
     context: *anyopaque,
-    matchesFn: *const fn (context: *anyopaque, key: []const u8) bool,
+    matchesFn: *const fn (context: *anyopaque, key: []const u8) SelectorError!bool,
 
-    pub fn matches(self: Matcher, key: []const u8) bool {
+    pub fn matches(self: Matcher, key: []const u8) SelectorError!bool {
         return self.matchesFn(self.context, key);
     }
 };
@@ -189,6 +192,12 @@ pub const Selector = union(enum) {
     all,
     key: []const u8,
     key_matcher: Matcher,
+};
+
+pub const Target = struct {
+    collection: Name,
+    selector: Selector = .all,
+    count_only: bool = false,
 };
 
 pub const StoreError = std.mem.Allocator.Error || error{
@@ -255,16 +264,69 @@ pub const Store = struct {
         return .{ .store = self, .collection = collection, .selector = selector };
     }
 
-    pub fn count(self: *const Store, collection: Name, selector: Selector) usize {
+    pub fn selectTarget(self: *const Store, target: Target, exclusions: []const Target) TargetIterator {
+        return .{
+            .base = self.select(target.collection, target.selector),
+            .exclusions = exclusions,
+        };
+    }
+
+    pub fn countTarget(self: *const Store, target: Target, exclusions: []const Target) SelectorError!usize {
+        var iterator = self.selectTarget(target, exclusions);
+        var result: usize = 0;
+        while (try iterator.next() != null) result += 1;
+        return result;
+    }
+
+    pub fn count(self: *const Store, collection: Name, selector: Selector) SelectorError!usize {
         var iterator = self.select(collection, selector);
         var result: usize = 0;
-        while (iterator.next() != null) result += 1;
+        while (try iterator.next() != null) result += 1;
         return result;
     }
 
     pub fn first(self: *const Store, collection: Name, key: []const u8) ?View {
-        var iterator = self.select(collection, .{ .key = key });
-        return iterator.next();
+        for (self.entries.items) |entry| {
+            if (!entry.active or entry.collection != collection or !keysEqual(collection, entry.key, key)) continue;
+            return view(entry);
+        }
+        return null;
+    }
+
+    pub fn firstAny(self: *const Store, collection: Name) ?View {
+        for (self.entries.items) |entry| {
+            if (entry.active and entry.collection == collection) return view(entry);
+        }
+        return null;
+    }
+
+    /// Replace a map-style key or create it. Superseded arena bytes remain
+    /// charged to the physical allocation limit, preventing update churn from
+    /// becoming unbounded hidden memory growth.
+    pub fn set(self: *Store, collection: Name, key: []const u8, value: []const u8, source: Source) StoreError!void {
+        if (key.len > self.limits.max_key_bytes) return error.CollectionKeyTooLarge;
+        if (value.len > self.limits.max_value_bytes) return error.CollectionValueTooLarge;
+        if (source.offset > std.math.maxInt(usize) - source.length) return error.InvalidSourceRange;
+        for (self.entries.items) |*entry| {
+            if (entry.collection != collection or !keysEqual(collection, entry.key, key)) continue;
+            if (value.len > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
+            entry.value = try self.arena.allocator().dupe(u8, value);
+            entry.source = source;
+            entry.active = true;
+            self.total_bytes += value.len;
+            return;
+        }
+        return self.add(collection, key, value, source);
+    }
+
+    pub fn remove(self: *Store, collection: Name, selector: Selector) SelectorError!usize {
+        var removed: usize = 0;
+        for (self.entries.items) |*entry| {
+            if (!entry.active or entry.collection != collection or !try selected(collection, entry.key, selector)) continue;
+            entry.active = false;
+            removed += 1;
+        }
+        return removed;
     }
 
     pub fn deinit(self: *Store) void {
@@ -299,39 +361,67 @@ pub const Iterator = struct {
     selector: Selector,
     index: usize = 0,
 
-    pub fn next(self: *Iterator) ?View {
+    pub fn next(self: *Iterator) SelectorError!?View {
         while (self.index < self.store.entries.items.len) {
             const entry = &self.store.entries.items[self.index];
             self.index += 1;
-            if (entry.collection != self.collection or !selected(self.collection, entry.key, self.selector)) continue;
-            return .{
-                .collection = entry.collection,
-                .key = entry.key,
-                .value = entry.value,
-                .source = entry.source,
-            };
+            if (!entry.active or entry.collection != self.collection or !try selected(self.collection, entry.key, self.selector)) continue;
+            return view(entry.*);
         }
         return null;
     }
 };
 
-fn selected(collection: Name, key: []const u8, selector: Selector) bool {
+pub const TargetIterator = struct {
+    base: Iterator,
+    exclusions: []const Target,
+
+    pub fn next(self: *TargetIterator) SelectorError!?View {
+        while (try self.base.next()) |candidate| {
+            var excluded = false;
+            for (self.exclusions) |exclusion| {
+                if (exclusion.collection == candidate.collection and try selected(candidate.collection, candidate.key, exclusion.selector)) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (!excluded) return candidate;
+        }
+        return null;
+    }
+};
+
+fn selected(collection: Name, key: []const u8, selector: Selector) SelectorError!bool {
     return switch (selector) {
         .all => true,
-        .key => |wanted| switch (collection.keyPolicy()) {
-            .sensitive => std.mem.eql(u8, key, wanted),
-            .ascii_insensitive => std.ascii.eqlIgnoreCase(key, wanted),
-        },
-        .key_matcher => |matcher| matcher.matches(key),
+        .key => |wanted| keysEqual(collection, key, wanted),
+        .key_matcher => |matcher| try matcher.matches(key),
     };
+}
+
+fn keysEqual(collection: Name, first_key: []const u8, second_key: []const u8) bool {
+    return switch (collection.keyPolicy()) {
+        .sensitive => std.mem.eql(u8, first_key, second_key),
+        .ascii_insensitive => std.ascii.eqlIgnoreCase(first_key, second_key),
+    };
+}
+
+fn view(entry: Entry) View {
+    return .{ .collection = entry.collection, .key = entry.key, .value = entry.value, .source = entry.source };
 }
 
 const PrefixMatcher = struct {
     prefix: []const u8,
 
-    fn matches(context: *anyopaque, key: []const u8) bool {
+    fn matches(context: *anyopaque, key: []const u8) SelectorError!bool {
         const self: *PrefixMatcher = @ptrCast(@alignCast(context));
         return std.mem.startsWith(u8, key, self.prefix);
+    }
+};
+
+const ErrorMatcher = struct {
+    fn matches(_: *anyopaque, _: []const u8) SelectorError!bool {
+        return error.MatcherLimitExceeded;
     }
 };
 
@@ -354,7 +444,7 @@ test "store owns repeated values and preserves source origins" {
     value[0] = 'x';
     try store.add(.request_headers, "x-test", "second", .{ .origin = .request_header, .offset = 30, .length = 6 });
 
-    try std.testing.expectEqual(@as(usize, 2), store.count(.request_headers, .{ .key = "X-TEST" }));
+    try std.testing.expectEqual(@as(usize, 2), try store.count(.request_headers, .{ .key = "X-TEST" }));
     const first = store.first(.request_headers, "x-test").?;
     try std.testing.expectEqualStrings("first", first.value);
     try std.testing.expectEqual(@as(usize, 10), first.source.offset);
@@ -367,7 +457,7 @@ test "selector callback scans keys without allocating" {
     try store.add(.args_get, "admin", "false", .{ .origin = .request_target, .offset = 20, .length = 5 });
     var prefix: PrefixMatcher = .{ .prefix = "user." };
     const matcher: Matcher = .{ .context = &prefix, .matchesFn = PrefixMatcher.matches };
-    try std.testing.expectEqual(@as(usize, 1), store.count(.args_get, .{ .key_matcher = matcher }));
+    try std.testing.expectEqual(@as(usize, 1), try store.count(.args_get, .{ .key_matcher = matcher }));
 }
 
 test "collection limits fail before taking ownership" {
@@ -392,5 +482,40 @@ test "paired insertion is atomic under entry and byte limits" {
         .{ .collection = .request_headers, .key = "x", .value = "1", .source = source },
         .{ .collection = .request_headers_names, .key = "x", .value = "x", .source = source },
     ));
-    try std.testing.expectEqual(@as(usize, 0), store.count(.request_headers, .all));
+    try std.testing.expectEqual(@as(usize, 0), try store.count(.request_headers, .all));
+}
+
+test "map replacement and removal stay physically bounded" {
+    var store = Store.init(std.testing.allocator, .{ .max_total_bytes = 12, .max_value_bytes = 12 });
+    defer store.deinit();
+    const source: Source = .{ .origin = .rule, .offset = 0, .length = 0 };
+    try store.set(.tx, "k", "one", source);
+    try store.set(.tx, "K", "two", source);
+    try std.testing.expectEqualStrings("two", store.first(.tx, "k").?.value);
+    try std.testing.expectEqual(@as(usize, 1), try store.remove(.tx, .{ .key = "K" }));
+    try std.testing.expect(store.first(.tx, "k") == null);
+    try store.set(.tx, "k", "3", source);
+    try std.testing.expectEqualStrings("3", store.first(.tx, "K").?.value);
+    try std.testing.expectError(error.CollectionStorageLimitExceeded, store.set(.tx, "k", "123456", source));
+}
+
+test "target exclusions and count semantics compose without allocation" {
+    var store = Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    const source: Source = .{ .origin = .request_target, .offset = 0, .length = 1 };
+    try store.add(.args_get, "user", "a", source);
+    try store.add(.args_get, "password", "b", source);
+    try store.add(.args_get, "token", "c", source);
+    const target: Target = .{ .collection = .args_get, .count_only = true };
+    const exclusions = [_]Target{.{ .collection = .args_get, .selector = .{ .key = "password" } }};
+    try std.testing.expectEqual(@as(usize, 2), try store.countTarget(target, &exclusions));
+}
+
+test "selector matcher failures never become non-matches" {
+    var store = Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    try store.add(.args, "x", "1", .{ .origin = .request_target, .offset = 0, .length = 1 });
+    var context: u8 = 0;
+    const matcher: Matcher = .{ .context = &context, .matchesFn = ErrorMatcher.matches };
+    try std.testing.expectError(error.MatcherLimitExceeded, store.count(.args, .{ .key_matcher = matcher }));
 }

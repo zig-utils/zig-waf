@@ -75,6 +75,7 @@ pub const Limits = struct {
 pub const Config = struct {
     mode: Mode = .enabled,
     limits: Limits = .{},
+    macro_missing_policy: macros.MissingPolicy = .empty,
 };
 
 pub const ClockSample = struct {
@@ -144,6 +145,10 @@ pub const Builder = struct {
 
     pub fn setLimits(self: *Builder, limits: Limits) void {
         self.config.limits = limits;
+    }
+
+    pub fn setMacroMissingPolicy(self: *Builder, policy: macros.MissingPolicy) void {
+        self.config.macro_missing_policy = policy;
     }
 
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
@@ -322,7 +327,7 @@ pub const TransactionError = error{
     TransactionTerminated,
     ClockBeforeUnixEpoch,
     MacroOutputTooLarge,
-} || variables.StoreError || collections.StoreError;
+} || variables.StoreError || collections.StoreError || collections.SelectorError;
 
 const Lifecycle = enum {
     created,
@@ -624,7 +629,19 @@ pub const Transaction = struct {
 
     pub fn collectionFirst(self: *const Transaction, name: collections.Name, key: []const u8) TransactionError!?collections.View {
         var iterator = (try self.collection(name, .{ .key = key })) orelse return null;
-        return iterator.next();
+        return try iterator.next();
+    }
+
+    pub fn collectionTarget(self: *const Transaction, target: collections.Target, exclusions: []const collections.Target) TransactionError!?collections.TargetIterator {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const availability = self.currentAvailability() orelse return null;
+        if (@backingInt(availability) < @backingInt(target.collection.minimumAvailability())) return null;
+        return self.collection_variables.selectTarget(target, exclusions);
+    }
+
+    pub fn collectionCount(self: *const Transaction, target: collections.Target, exclusions: []const collections.Target) TransactionError!?usize {
+        if ((try self.collectionTarget(target, exclusions)) == null) return null;
+        return try self.collection_variables.countTarget(target, exclusions);
     }
 
     pub fn addCollectionValue(
@@ -638,11 +655,26 @@ pub const Transaction = struct {
         try self.collection_variables.add(name, key, value, source);
     }
 
+    pub fn setCollectionValue(
+        self: *Transaction,
+        name: collections.Name,
+        key: []const u8,
+        value: []const u8,
+        source: collections.Source,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.collection_variables.set(name, key, value, source);
+    }
+
+    pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        return try self.collection_variables.remove(name, selector);
+    }
+
     pub fn expandMacro(
         self: *Transaction,
         compiled: *const macros.Compiled,
         allocator: std.mem.Allocator,
-        missing_policy: macros.MissingPolicy,
     ) TransactionError![]u8 {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.updateDuration();
@@ -650,7 +682,7 @@ pub const Transaction = struct {
             .context = self,
             .scalarFn = resolveMacroScalar,
             .collectionFn = resolveMacroCollection,
-        }, missing_policy) catch |err| switch (err) {
+        }, self.waf.config.macro_missing_policy) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.MacroOutputTooLarge => return error.MacroOutputTooLarge,
         };
@@ -915,8 +947,11 @@ fn resolveMacroCollection(context: *anyopaque, name: collections.Name, key: ?[]c
     const transaction: *Transaction = @ptrCast(@alignCast(context));
     const availability = transaction.currentAvailability() orelse return null;
     if (@backingInt(availability) < @backingInt(name.minimumAvailability())) return null;
-    var iterator = transaction.collection_variables.select(name, if (key) |selected_key| .{ .key = selected_key } else .all);
-    return (iterator.next() orelse return null).value;
+    const found = if (key) |selected_key|
+        transaction.collection_variables.first(name, selected_key)
+    else
+        transaction.collection_variables.firstAny(name);
+    return (found orelse return null).value;
 }
 
 const ReloadWorker = struct {
@@ -1200,16 +1235,16 @@ test "publishes repeated header collections with phase gates and origins" {
     first_value[0] = 'x';
     try tx.addRequestHeader("x-test", "two");
     var headers = (try tx.collection(.request_headers, .{ .key = "X-TEST" })).?;
-    const first = headers.next().?;
+    const first = (try headers.next()).?;
     try std.testing.expectEqualStrings("one", first.value);
     try std.testing.expectEqual(variables.Origin.request_header, first.source.origin);
-    try std.testing.expectEqualStrings("two", headers.next().?.value);
-    try std.testing.expect(headers.next() == null);
+    try std.testing.expectEqualStrings("two", (try headers.next()).?.value);
+    try std.testing.expect(try headers.next() == null);
     try std.testing.expect((try tx.collection(.response_headers, .all)) == null);
 
     var names = (try tx.collection(.request_headers_names, .all)).?;
-    try std.testing.expectEqualStrings("X-Test", names.next().?.value);
-    try std.testing.expectEqualStrings("x-test", names.next().?.value);
+    try std.testing.expectEqualStrings("X-Test", (try names.next()).?.value);
+    try std.testing.expectEqualStrings("x-test", (try names.next()).?.value);
 
     try tx.processRequestHeaders();
     try tx.addResponseHeader("Content-Type", "text/plain");
@@ -1230,9 +1265,48 @@ test "transaction macros resolve current scalar and collection state" {
     try tx.addCollectionValue(.tx, "tenant", "north", .{ .origin = .rule, .offset = 0, .length = 5 });
     var compiled = try macros.Compiled.compile(std.testing.allocator, "%{REQUEST_METHOD} %{TX.tenant} %{RESPONSE_STATUS}", .{});
     defer compiled.deinit();
-    const expanded = try tx.expandMacro(&compiled, std.testing.allocator, .empty);
+    const expanded = try tx.expandMacro(&compiled, std.testing.allocator);
     defer std.testing.allocator.free(expanded);
     try std.testing.expectEqualStrings("GET north ", expanded);
+}
+
+test "transaction collection targets apply exclusions, counts, replacement, and removal" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.addRequestHeader("X-One", "1");
+    try tx.addRequestHeader("Authorization", "secret");
+
+    const target: collections.Target = .{ .collection = .request_headers, .count_only = true };
+    const exclusions = [_]collections.Target{.{ .collection = .request_headers, .selector = .{ .key = "authorization" } }};
+    try std.testing.expectEqual(@as(usize, 1), (try tx.collectionCount(target, &exclusions)).?);
+
+    const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try tx.setCollectionValue(.tx, "score", "1", source);
+    try tx.setCollectionValue(.tx, "SCORE", "2", source);
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.tx, "score")).?.value);
+    try std.testing.expectEqual(@as(usize, 1), try tx.removeCollectionValues(.tx, .{ .key = "score" }));
+    try std.testing.expect((try tx.collectionFirst(.tx, "score")) == null);
+}
+
+test "WAF configuration selects macro missing-value compatibility" {
+    var builder = Builder.init(std.testing.allocator);
+    builder.setMacroMissingPolicy(.expression);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    var compiled = try macros.Compiled.compile(std.testing.allocator, "x=%{TX.missing}", .{});
+    defer compiled.deinit();
+    const expanded = try tx.expandMacro(&compiled, std.testing.allocator);
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqualStrings("x=TX.missing", expanded);
 }
 
 test "compiled feature discovery is explicit" {
