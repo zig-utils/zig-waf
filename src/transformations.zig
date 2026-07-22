@@ -225,6 +225,7 @@ pub const Executor = struct {
             .base64_decode => self.base64Decode(input, false),
             .base64_decode_ext => self.base64Decode(input, true),
             .base64_encode => self.base64Encode(input),
+            .cmd_line => self.cmdLine(input),
             .css_decode => self.cssDecode(input),
             .escape_seq_decode => self.escapeSeqDecode(input),
             .html_entity_decode => self.htmlEntityDecode(input),
@@ -290,6 +291,40 @@ pub const Executor = struct {
         const generated = try self.writable(input.len);
         for (input) |byte| generated.buffer.appendAssumeCapacity(if (uppercase) std.ascii.toUpper(byte) else std.ascii.toLower(byte));
         return finish(generated, input, true);
+    }
+
+    fn cmdLine(self: *Executor, input: []const u8) ApplyError!Result {
+        var needs_transform = false;
+        for (input) |byte| {
+            if ((byte >= 'A' and byte <= 'Z') or isCmdLineSpecial(byte)) {
+                needs_transform = true;
+                break;
+            }
+        }
+        if (!needs_transform) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+
+        const generated = try self.writable(input.len);
+        var space = false;
+        for (input) |byte| {
+            switch (byte) {
+                '"', '\'', '\\', '^' => {},
+                ' ', ',', ';', '\t', '\r', '\n' => if (!space) {
+                    generated.buffer.appendAssumeCapacity(' ');
+                    space = true;
+                },
+                '/', '(' => {
+                    if (space) _ = generated.buffer.pop();
+                    generated.buffer.appendAssumeCapacity(byte);
+                    space = false;
+                },
+                else => {
+                    generated.buffer.appendAssumeCapacity(std.ascii.toLower(byte));
+                    space = false;
+                },
+            }
+        }
+        const changed = if (self.profile == .coraza) true else generated.buffer.items.len != input.len;
+        return finish(generated, input, changed);
     }
 
     fn cssDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1037,6 +1072,13 @@ fn isNull(byte: u8) bool {
     return byte == 0;
 }
 
+fn isCmdLineSpecial(byte: u8) bool {
+    return switch (byte) {
+        '"', '\'', '\\', '^', ' ', ',', ';', '\t', '\r', '\n', '/', '(' => true,
+        else => false,
+    };
+}
+
 fn startsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
     return input.len >= prefix.len and std.ascii.eqlIgnoreCase(input[0..prefix.len], prefix);
 }
@@ -1641,6 +1683,26 @@ test "comment transformations preserve pinned marker state machines" {
     try std.testing.expect(!closer_only.changed);
 }
 
+test "command-line canonicalization preserves profile changed flags" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("command/c dir", (try modsecurity.apply(.cmd_line, "C^OMMAND /C DIR")).bytes);
+    try std.testing.expectEqualStrings("cmd/c dir", (try modsecurity.apply(.cmd_line, "\"cmd\",;/c DiR")).bytes);
+    try std.testing.expectEqualStrings("(test)/path", (try modsecurity.apply(.cmd_line, " (TEST) /PATH")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 'a' }, (try modsecurity.apply(.cmd_line, &.{ 0xff, 'A' })).bytes);
+
+    const lowercase_only = try modsecurity.apply(.cmd_line, "UPPER");
+    try std.testing.expectEqualStrings("upper", lowercase_only.bytes);
+    try std.testing.expect(!lowercase_only.changed);
+    try std.testing.expect((try coraza.apply(.cmd_line, "UPPER")).changed);
+    const ordinary = try coraza.apply(.cmd_line, "ordinary");
+    try std.testing.expectEqual(Storage.borrowed, ordinary.storage);
+    try std.testing.expect(!ordinary.changed);
+}
+
 test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
@@ -1652,7 +1714,7 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
-    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.cmd_line, "x"));
+    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.normalise_path, "x"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
