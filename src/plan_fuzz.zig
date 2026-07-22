@@ -66,6 +66,7 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             const rule = compiled.rules[index];
             if (rule.phase != phase or rule.chain_position != 0 or rule.chain_head != rule_id)
                 return error.InvalidPlanFuzzPhaseIndex;
+            if (rule.removed_by != null) return error.InvalidPlanFuzzRemovedRule;
             if (previous) |prior| if (prior >= index) return error.InvalidPlanFuzzOrdering;
             previous = @intCast(index);
             indexed_rules += 1;
@@ -104,9 +105,32 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             if (token.key) |key| _ = compiled.string(key) orelse return error.InvalidPlanFuzzMacro;
         }
     }
-    var chain_members: usize = 0;
-    for (compiled.rules) |rule| chain_members += @intFromBool(rule.chain_position != 0);
-    if (indexed_rules + chain_members != compiled.rules.len) return error.InvalidPlanFuzzPhaseIndex;
+    var nonindexed_rules: usize = 0;
+    for (compiled.rules) |rule| {
+        nonindexed_rules += @intFromBool(rule.chain_position != 0 or rule.removed_by != null);
+    }
+    if (indexed_rules + nonindexed_rules != compiled.rules.len) return error.InvalidPlanFuzzPhaseIndex;
+    for (compiled.rule_removals) |removal| {
+        if (@backingInt(removal.directive) >= compiled.directives.len or @backingInt(removal.chain_head) >= compiled.rules.len)
+            return error.InvalidPlanFuzzRemoval;
+        if (compiled.rules[@backingInt(removal.chain_head)].removed_by != removal.directive)
+            return error.InvalidPlanFuzzRemoval;
+    }
+    for (compiled.skip_after_targets) |target| {
+        if (@backingInt(target.rule) >= compiled.rules.len or target.action_index >= compiled.actions.len)
+            return error.InvalidPlanFuzzMarker;
+        if (!target.dynamic) {
+            if (target.marker) |marker| {
+                if (@backingInt(marker) >= compiled.markers.len) return error.InvalidPlanFuzzMarker;
+            }
+        }
+        if (target.resume_rule) |resume_rule| if (@backingInt(resume_rule) >= compiled.rules.len)
+            return error.InvalidPlanFuzzMarker;
+    }
+    for (compiled.missing_rule_references) |reference| {
+        if (@backingInt(reference.directive) >= compiled.directives.len or reference.interval.first > reference.interval.last)
+            return error.InvalidPlanFuzzMissingReference;
+    }
 }
 
 test "plan fuzz oracle accepts valid malformed and arbitrary bytes" {
@@ -116,6 +140,11 @@ test "plan fuzz oracle accepts valid malformed and arbitrary bytes" {
         "SecRule ARGS @rx chain",
         "SecRule ARGS @rx id:1\nSecRule TX @rx id:1",
         "SecDefaultAction \"phase:2,t:lowercase,pass\"\nSecRule ARGS \"@pm one two\" \"id:2,deny\"",
+        "SecRule ARGS @rx id:1\nSecRule ARGS @rx id:2\nSecRuleRemoveById 2",
+        "SecRule ARGS @rx \"id:1,tag:'group',msg:'hello',deny,t:lowercase\"\nSecRuleUpdateTargetById 1 \"!ARGS:secret|TX\"\nSecRuleUpdateTargetByTag group FILES\nSecRuleUpdateActionById 1 \"pass,t:none,t:trim\"",
+        "SecRule ARGS @rx \"id:1,skipAfter:END\"\nSecRule TX @rx id:2\nSecMarker END\nSecRule ARGS @rx id:3",
+        "SecRuleRemoveById \"99 100-110\"\nSecRuleUpdateActionById 200 pass",
+        "SecRemoteRulesFailAction Warn\nSecRemoteRules key https://rules.example.test/bundle",
         "\x00\xff\x80",
     };
     for (cases) |input| try fuzzOne(std.testing.allocator, input);
