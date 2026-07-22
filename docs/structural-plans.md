@@ -91,6 +91,7 @@ Semantic failures use stable codes:
 | `WAF-PLAN-0113` | Update selected a non-head chain member; related span is that member |
 | `WAF-PLAN-0114` | Static `skipAfter` target has no following marker |
 | `WAF-PLAN-0115` | Rule target update contains invalid target syntax |
+| `WAF-PLAN-0116` | Rule action update is malformed or attempts `id`, `phase`, or `chain` |
 
 Default actions require an explicit phase and a disruptive action. A phase may
 be defined once per compiled configuration context. Metadata and flow actions,
@@ -129,6 +130,16 @@ Negated targets remain explicit exclusion records, preserving collection/key,
 regex-key, and count semantics for the execution engine. Expansion is bounded
 independently by `max_target_expansion` and by total plan target capacity;
 non-head chain selection remains WAF-PLAN-0113.
+
+`SecRuleUpdateActionById` materializes a new immutable explicit-action range
+for every selected chain head. Disruptive actions share one replacement
+family; `log`/`nolog` and `auditlog`/`noauditlog` are paired families; other
+singletons replace the same action name. Transformations, tags, variable and
+control actions, and the other upstream-repeatable actions append in source
+order. `id`, `phase`, and `chain` are rejected to protect plan identity and
+graph invariants. Transformation pipelines and action macros are rebuilt after
+each overlay, including `t:none` reset semantics. `max_action_expansion`
+independently bounds materialization amplification.
 
 Allocation and configured capacity failures remain distinct typed errors.
 

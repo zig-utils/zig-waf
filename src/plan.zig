@@ -38,6 +38,7 @@ pub const Limits = struct {
     max_id_intervals: usize = 1_000_000,
     max_flow_targets: usize = 500_000,
     max_target_expansion: usize = 4_000_000,
+    max_action_expansion: usize = 8_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
     max_string_bytes: usize = 1024 * 1024,
@@ -67,6 +68,7 @@ pub const Limits = struct {
             self.max_id_intervals == 0 or
             self.max_flow_targets == 0 or
             self.max_target_expansion == 0 or
+            self.max_action_expansion == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
             self.max_string_bytes == 0 or
@@ -96,6 +98,7 @@ pub const Limits = struct {
             self.max_id_intervals > std.math.maxInt(u32) or
             self.max_flow_targets > std.math.maxInt(u32) or
             self.max_target_expansion > std.math.maxInt(u32) or
+            self.max_action_expansion > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
         {
@@ -128,6 +131,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyIdIntervals,
     TooManyFlowTargets,
     TargetExpansionLimitExceeded,
+    ActionExpansionLimitExceeded,
     TooManyArguments,
     TooManyStrings,
     StringTooLarge,
@@ -146,6 +150,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     PartialChainSelection,
     MissingStaticMarker,
     InvalidRuleTargetUpdate,
+    InvalidRuleActionUpdate,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -164,6 +169,7 @@ pub const DiagnosticCode = enum {
     partial_chain_selection,
     missing_static_marker,
     invalid_rule_target_update,
+    invalid_rule_action_update,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -187,6 +193,7 @@ pub const DiagnosticCode = enum {
             .partial_chain_selection => "WAF-PLAN-0113",
             .missing_static_marker => "WAF-PLAN-0114",
             .invalid_rule_target_update => "WAF-PLAN-0115",
+            .invalid_rule_action_update => "WAF-PLAN-0116",
         };
     }
 
@@ -202,6 +209,7 @@ pub const DiagnosticCode = enum {
             .partial_chain_selection => "rule update cannot select a non-head chain member",
             .missing_static_marker => "static skipAfter target has no following SecMarker",
             .invalid_rule_target_update => "rule target update contains invalid target syntax",
+            .invalid_rule_action_update => "rule action update contains a forbidden or invalid action",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -645,6 +653,15 @@ const RuleTargetUpdate = struct {
     targets_count: u32,
 };
 
+const RuleActionUpdate = struct {
+    directive: DirectiveId,
+    source: seclang.source.Span,
+    intervals_start: u32,
+    intervals_count: u32,
+    actions_start: u32,
+    actions_count: u32,
+};
+
 const Compiler = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -668,8 +685,10 @@ const Compiler = struct {
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
     rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
     rule_target_updates: std.ArrayList(RuleTargetUpdate) = .empty,
+    rule_action_updates: std.ArrayList(RuleActionUpdate) = .empty,
     rule_removals: std.ArrayList(RuleRemoval) = .empty,
     target_expansion: usize = 0,
+    action_expansion: usize = 0,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
     active_defaults: [5]?DefaultId = .{ null, null, null, null, null },
@@ -701,6 +720,7 @@ const Compiler = struct {
         self.id_intervals.deinit(self.allocator);
         self.rule_removal_operations.deinit(self.allocator);
         self.rule_target_updates.deinit(self.allocator);
+        self.rule_action_updates.deinit(self.allocator);
         self.rule_removals.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
@@ -779,6 +799,8 @@ const Compiler = struct {
                     try self.addRuleTargetUpdate(directive_id, directive, .tag);
                 } else if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleUpdateTargetByMsg")) {
                     try self.addRuleTargetUpdate(directive_id, directive, .message);
+                } else if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleUpdateActionById")) {
+                    try self.addRuleActionUpdate(directive_id, directive);
                 }
             },
             else => {},
@@ -911,6 +933,47 @@ const Compiler = struct {
             .pattern = pattern,
             .targets_start = targets_start,
             .targets_count = try typedIndex(parsed_targets.len),
+        });
+    }
+
+    fn addRuleActionUpdate(self: *Compiler, directive_id: DirectiveId, directive: seclang.parser.Directive) CompileError!void {
+        if (self.rule_action_updates.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
+        if (directive.arguments.len != 2) return;
+        if (self.id_intervals.items.len == self.limits.max_id_intervals) return error.TooManyIdIntervals;
+        var id_selector = rule_config.IdSelector.parse(self.allocator, &.{directive.arguments[0].content()}, .{
+            .max_fragments = 1,
+            .max_input_bytes = self.limits.max_string_bytes,
+            .max_intervals = self.limits.max_id_intervals - self.id_intervals.items.len,
+        }, null) catch |cause| switch (cause) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooManyIdIntervals => return error.TooManyIdIntervals,
+            else => return,
+        };
+        defer id_selector.deinit();
+        const parsed_actions = seclang.syntax.parseActions(self.allocator, directive.arguments[1].content(), .{
+            .max_targets = 1,
+            .max_actions = @max(@as(usize, 1), self.limits.max_actions -| self.actions.items.len),
+        }) catch |cause| switch (cause) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooManyActions => return error.TooManyActions,
+            else => return self.fail(error.InvalidRuleActionUpdate, directive.arguments[1].physical, null),
+        };
+        defer self.allocator.free(parsed_actions);
+        for (parsed_actions) |action| {
+            if (equalsAny(action.name, &.{ "id", "phase", "chain" }))
+                return self.fail(error.InvalidRuleActionUpdate, directive.arguments[1].physical, null);
+        }
+        const intervals_start = try typedIndex(self.id_intervals.items.len);
+        try self.id_intervals.appendSlice(self.allocator, id_selector.intervals);
+        const action_range = self.addActions(parsed_actions) catch |cause|
+            return self.fail(cause, directive.arguments[1].physical, null);
+        try self.rule_action_updates.append(self.allocator, .{
+            .directive = directive_id,
+            .source = directive.physical,
+            .intervals_start = intervals_start,
+            .intervals_count = try typedIndex(id_selector.intervals.len),
+            .actions_start = action_range.start,
+            .actions_count = action_range.count,
         });
     }
 
@@ -1271,6 +1334,50 @@ const Compiler = struct {
         }
     }
 
+    fn applyRuleActionUpdates(self: *Compiler) CompileError!void {
+        var effective: std.ArrayList(Action) = .empty;
+        defer effective.deinit(self.allocator);
+        for (self.rule_action_updates.items) |update| {
+            const intervals = self.id_intervals.items[update.intervals_start..][0..update.intervals_count];
+            for (0..self.rules.items.len) |rule_index| {
+                const rule = self.rules.items[rule_index];
+                const external_id = rule.external_id orelse continue;
+                if (!matchesIntervals(intervals, external_id)) continue;
+                if (rule.chain_position != 0)
+                    return self.fail(error.PartialChainSelection, update.source, rule.source);
+                effective.clearRetainingCapacity();
+                try effective.appendSlice(self.allocator, self.actions.items[rule.actions_start..][0..rule.actions_count]);
+                const updates = self.actions.items[update.actions_start..][0..update.actions_count];
+                for (updates) |replacement| {
+                    const replacement_name = self.interner.values.items[@backingInt(replacement.name)];
+                    if (!isRepeatableAction(replacement_name)) {
+                        var write: usize = 0;
+                        for (effective.items) |existing| {
+                            if (sameActionFamily(self, existing, replacement)) continue;
+                            effective.items[write] = existing;
+                            write += 1;
+                        }
+                        effective.shrinkRetainingCapacity(write);
+                    }
+                    try effective.append(self.allocator, replacement);
+                }
+                if (effective.items.len > self.limits.max_action_expansion -| self.action_expansion)
+                    return error.ActionExpansionLimitExceeded;
+                if (effective.items.len > self.limits.max_actions -| self.actions.items.len) return error.TooManyActions;
+                const actions_start = try typedIndex(self.actions.items.len);
+                try self.actions.appendSlice(self.allocator, effective.items);
+                const action_range: ActionRange = .{ .start = actions_start, .count = try typedIndex(effective.items.len) };
+                self.rules.items[rule_index].actions_start = action_range.start;
+                self.rules.items[rule_index].actions_count = action_range.count;
+                const transformations = self.addTransformations(rule.default, action_range) catch |cause|
+                    return self.fail(cause, update.source, null);
+                self.rules.items[rule_index].transformations_start = transformations.start;
+                self.rules.items[rule_index].transformations_count = transformations.count;
+                self.action_expansion += effective.items.len;
+            }
+        }
+    }
+
     fn ruleActionMatches(
         self: *Compiler,
         rule: Rule,
@@ -1329,6 +1436,7 @@ const Compiler = struct {
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
         try self.applyRuleRemovals();
         try self.applyRuleTargetUpdates();
+        try self.applyRuleActionUpdates();
         try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
@@ -1682,6 +1790,22 @@ fn classifyAction(name: []const u8) ActionClass {
     return .unknown;
 }
 
+fn isRepeatableAction(name: []const u8) bool {
+    return equalsAny(name, &.{
+        "t",           "tag",             "setvar",               "setenv",                "ctl",                    "initcol", "expirevar", "deprecatevar", "exec",
+        "sanitizeArg", "sanitizeMatched", "sanitizeMatchedBytes", "sanitizeRequestHeader", "sanitizeResponseHeader",
+    });
+}
+
+fn sameActionFamily(compiler: *const Compiler, existing: Action, replacement: Action) bool {
+    if (existing.class == .disruptive and replacement.class == .disruptive) return true;
+    const existing_name = compiler.interner.values.items[@backingInt(existing.name)];
+    const replacement_name = compiler.interner.values.items[@backingInt(replacement.name)];
+    if (equalsAny(existing_name, &.{ "log", "nolog" }) and equalsAny(replacement_name, &.{ "log", "nolog" })) return true;
+    if (equalsAny(existing_name, &.{ "auditlog", "noauditlog" }) and equalsAny(replacement_name, &.{ "auditlog", "noauditlog" })) return true;
+    return std.ascii.eqlIgnoreCase(existing_name, replacement_name);
+}
+
 fn equalsAny(value: []const u8, candidates: []const []const u8) bool {
     for (candidates) |candidate| if (std.ascii.eqlIgnoreCase(value, candidate)) return true;
     return false;
@@ -1689,6 +1813,14 @@ fn equalsAny(value: []const u8, candidates: []const []const u8) bool {
 
 fn actionSpan(directive: seclang.parser.Directive) seclang.source.Span {
     return if (directive.actions()) |argument| argument.physical else directive.physical;
+}
+
+fn countActions(plan: *const Plan, actions: []const Action, name: []const u8) usize {
+    var count: usize = 0;
+    for (actions) |action| if (std.ascii.eqlIgnoreCase(plan.string(action.name).?, name)) {
+        count += 1;
+    };
+    return count;
 }
 
 fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
@@ -1703,6 +1835,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.PartialChainSelection => .partial_chain_selection,
         error.MissingStaticMarker => .missing_static_marker,
         error.InvalidRuleTargetUpdate => .invalid_rule_target_update,
+        error.InvalidRuleActionUpdate => .invalid_rule_action_update,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -2152,6 +2285,59 @@ test "invalid target update syntax has a stable diagnostic" {
     }
 }
 
+test "action updates replace singleton families append repeatables and rebuild transforms" {
+    const input =
+        \\SecRule ARGS @rx "id:1,deny,status:403,msg:'old',tag:'a',t:lowercase,log,auditlog"
+        \\SecRule TX @rx "id:2,deny"
+        \\SecRuleUpdateActionById 1-2 "pass,status:204,tag:'b',t:none,t:trim,nolog,noauditlog,msg:'new'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "action-updates.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    const first = compiled.rules[0];
+    const actions = compiled.actions[first.actions_start..][0..first.actions_count];
+    try std.testing.expectEqual(@as(usize, 0), countActions(compiled, actions, "deny"));
+    try std.testing.expectEqual(@as(usize, 1), countActions(compiled, actions, "pass"));
+    try std.testing.expectEqual(@as(usize, 1), countActions(compiled, actions, "status"));
+    try std.testing.expectEqual(@as(usize, 2), countActions(compiled, actions, "tag"));
+    try std.testing.expectEqual(@as(usize, 3), countActions(compiled, actions, "t"));
+    try std.testing.expectEqual(@as(usize, 0), countActions(compiled, actions, "log"));
+    try std.testing.expectEqual(@as(usize, 1), countActions(compiled, actions, "nolog"));
+    try std.testing.expectEqual(@as(usize, 0), countActions(compiled, actions, "auditlog"));
+    try std.testing.expectEqual(@as(usize, 1), countActions(compiled, actions, "noauditlog"));
+    try std.testing.expectEqual(@as(usize, 1), first.transformations_count);
+    try std.testing.expectEqualStrings("trim", compiled.string(compiled.transformations[first.transformations_start].name).?);
+    const second_actions = compiled.actions[compiled.rules[1].actions_start..][0..compiled.rules[1].actions_count];
+    try std.testing.expectEqual(@as(usize, 0), countActions(compiled, second_actions, "deny"));
+    try std.testing.expectEqual(@as(usize, 1), countActions(compiled, second_actions, "pass"));
+}
+
+test "action updates reject id phase chain and malformed lists" {
+    const cases = [_][]const u8{
+        "SecRuleUpdateActionById 1 id:2",
+        "SecRuleUpdateActionById 1 phase:3",
+        "SecRuleUpdateActionById 1 chain",
+        "SecRuleUpdateActionById 1 \"msg:'open\"",
+    };
+    for (cases) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-action-update.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |value| {
+                try std.testing.expectEqual(DiagnosticCode.invalid_rule_action_update, value.code);
+                try std.testing.expectEqualStrings("WAF-PLAN-0116", value.code.id());
+            },
+        }
+    }
+}
+
 test "static skipAfter targets resolve to the next marker and phase rule" {
     const input =
         \\SecMarker END
@@ -2418,6 +2604,7 @@ test "phase chain marker and generic resource limits fail distinctly" {
         .{ .input = "SecRuleRemoveById \"1 3\"", .limits = .{ .max_id_intervals = 1 }, .failure = error.TooManyIdIntervals },
         .{ .input = "SecRule ARGS @rx skipAfter:END\nSecRule TX @rx skipAfter:END\nSecMarker END", .limits = .{ .max_flow_targets = 1 }, .failure = error.TooManyFlowTargets },
         .{ .input = "SecRule ARGS @rx id:1\nSecRuleUpdateTargetById 1 TX", .limits = .{ .max_target_expansion = 1 }, .failure = error.TargetExpansionLimitExceeded },
+        .{ .input = "SecRule ARGS @rx \"id:1,deny\"\nSecRuleUpdateActionById 1 pass", .limits = .{ .max_action_expansion = 1 }, .failure = error.ActionExpansionLimitExceeded },
     };
     for (cases) |case| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bounded.conf", case.input, .{}, .{});
