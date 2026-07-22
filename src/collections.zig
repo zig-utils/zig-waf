@@ -132,6 +132,13 @@ pub const Name = enum {
             else => .request_headers,
         };
     }
+
+    pub fn keysEqual(self: Name, first: []const u8, second: []const u8) bool {
+        return switch (self.keyPolicy()) {
+            .sensitive => std.mem.eql(u8, first, second),
+            .ascii_insensitive => std.ascii.eqlIgnoreCase(first, second),
+        };
+    }
 };
 
 pub const KeyPolicy = enum { sensitive, ascii_insensitive };
@@ -167,6 +174,11 @@ pub const Value = struct {
     key: []const u8,
     value: []const u8,
     source: Source,
+};
+
+pub const Key = struct {
+    collection: Name,
+    key: []const u8,
 };
 
 const Entry = struct {
@@ -321,12 +333,21 @@ pub const Store = struct {
     /// entries in the collection. Every staged value must name one of the
     /// replacement keys; keys omitted from `values` are cleared.
     pub fn replaceKeys(self: *Store, collection: Name, keys: []const []const u8, values: []const Value) StoreError!void {
+        const grouped = try self.arena.child_allocator.alloc(Key, keys.len);
+        defer self.arena.child_allocator.free(grouped);
+        for (keys, grouped) |key, *destination| destination.* = .{ .collection = collection, .key = key };
+        return self.replaceKeyGroups(grouped, values);
+    }
+
+    /// Atomically replace key sets spanning multiple collections. This is the
+    /// commit primitive for a preflighted rule-effect batch.
+    pub fn replaceKeyGroups(self: *Store, keys: []const Key, values: []const Value) StoreError!void {
         if (values.len > self.limits.max_entries -| self.entries.items.len)
             return error.TooManyCollectionEntries;
-        for (keys) |key| if (key.len > self.limits.max_key_bytes) return error.CollectionKeyTooLarge;
+        for (keys) |key| if (key.key.len > self.limits.max_key_bytes) return error.CollectionKeyTooLarge;
         var added: usize = 0;
         for (values) |value| {
-            if (value.collection != collection or !containsKey(collection, keys, value.key))
+            if (!containsGroupedKey(keys, value.collection, value.key))
                 return error.InvalidCollectionBatch;
             try self.validateValue(value, values.len);
             const item_bytes = value.key.len + value.value.len;
@@ -356,7 +377,7 @@ pub const Store = struct {
             };
         }
         for (self.entries.items) |*entry| {
-            if (entry.collection == collection and containsKey(collection, keys, entry.key)) entry.active = false;
+            if (containsGroupedKey(keys, entry.collection, entry.key)) entry.active = false;
         }
         for (staged) |entry| self.entries.appendAssumeCapacity(entry);
         self.total_bytes += added;
@@ -502,14 +523,13 @@ fn selected(collection: Name, key: []const u8, selector: Selector) SelectorError
 }
 
 fn keysEqual(collection: Name, first_key: []const u8, second_key: []const u8) bool {
-    return switch (collection.keyPolicy()) {
-        .sensitive => std.mem.eql(u8, first_key, second_key),
-        .ascii_insensitive => std.ascii.eqlIgnoreCase(first_key, second_key),
-    };
+    return collection.keysEqual(first_key, second_key);
 }
 
-fn containsKey(collection: Name, keys: []const []const u8, key: []const u8) bool {
-    for (keys) |candidate| if (keysEqual(collection, candidate, key)) return true;
+fn containsGroupedKey(keys: []const Key, collection: Name, key: []const u8) bool {
+    for (keys) |candidate| {
+        if (candidate.collection == collection and collection.keysEqual(candidate.key, key)) return true;
+    }
     return false;
 }
 
@@ -655,6 +675,60 @@ test "key replacement clears stale values and preserves unrelated entries" {
         .{ .collection = .tx, .key = "outside", .value = "x", .source = source },
     }));
     try std.testing.expectEqualStrings("new", store.first(.tx, "0").?.value);
+}
+
+test "grouped key replacement commits collections together" {
+    var store = Store.init(std.testing.allocator, .{});
+    defer store.deinit();
+    const source: Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try store.add(.rule, "msg", "old", source);
+    try store.add(.tx, "score", "7", source);
+    try store.add(.env, "KEEP", "yes", source);
+    const keys = [_]Key{
+        .{ .collection = .rule, .key = "msg" },
+        .{ .collection = .tx, .key = "score" },
+        .{ .collection = .env, .key = "NEW" },
+    };
+    try store.replaceKeyGroups(&keys, &.{
+        .{ .collection = .rule, .key = "msg", .value = "new", .source = source },
+        .{ .collection = .env, .key = "NEW", .value = "value", .source = source },
+    });
+    try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
+    try std.testing.expect(store.first(.tx, "score") == null);
+    try std.testing.expectEqualStrings("value", store.first(.env, "NEW").?.value);
+    try std.testing.expectEqualStrings("yes", store.first(.env, "KEEP").?.value);
+
+    try std.testing.expectError(error.InvalidCollectionBatch, store.replaceKeyGroups(&keys, &.{
+        .{ .collection = .tx, .key = "outside", .value = "x", .source = source },
+    }));
+    try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
+    try std.testing.expectEqualStrings("value", store.first(.env, "NEW").?.value);
+}
+
+test "grouped key replacement preserves all collections across allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = Store.init(allocator, .{});
+            defer store.deinit();
+            const source: Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+            try store.add(.rule, "msg", "old", source);
+            try store.add(.tx, "score", "7", source);
+            const keys = [_]Key{
+                .{ .collection = .rule, .key = "msg" },
+                .{ .collection = .tx, .key = "score" },
+            };
+            store.replaceKeyGroups(&keys, &.{
+                .{ .collection = .rule, .key = "msg", .value = "new", .source = source },
+                .{ .collection = .tx, .key = "score", .value = "8", .source = source },
+            }) catch |err| {
+                try std.testing.expectEqualStrings("old", store.first(.rule, "msg").?.value);
+                try std.testing.expectEqualStrings("7", store.first(.tx, "score").?.value);
+                return err;
+            };
+            try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
+            try std.testing.expectEqualStrings("8", store.first(.tx, "score").?.value);
+        }
+    }.run, .{});
 }
 
 test "map replacement and removal stay physically bounded" {
