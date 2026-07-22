@@ -62,6 +62,7 @@
         "src/engine.zig",
         "include/zig_waf.h",
         "tests/c_api_smoke.c",
+        "benchmarks/lifecycle.zig",
         "docs/architecture.md"
       ],
       "notes": "Connection setup is pre-phase; the five stable phase numbers, legal transitions, early exits, terminal drop behavior, and exactly-once logging finalization are enforced."

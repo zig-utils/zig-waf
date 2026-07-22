@@ -85,4 +85,18 @@ pub fn build(b: *std.Build) void {
     const run_ownership_benchmark = b.addRunArtifact(ownership_benchmark);
     const benchmark_step = b.step("bench-ownership", "Benchmark transaction ownership and generation pinning");
     benchmark_step.dependOn(&run_ownership_benchmark.step);
+
+    const lifecycle_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/lifecycle.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    lifecycle_benchmark_module.addImport("waf", waf);
+    const lifecycle_benchmark = b.addExecutable(.{
+        .name = "lifecycle-benchmark",
+        .root_module = lifecycle_benchmark_module,
+    });
+    const run_lifecycle_benchmark = b.addRunArtifact(lifecycle_benchmark);
+    const lifecycle_benchmark_step = b.step("bench-lifecycle", "Benchmark the complete connector lifecycle");
+    lifecycle_benchmark_step.dependOn(&run_lifecycle_benchmark.step);
 }
