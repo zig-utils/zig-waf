@@ -206,6 +206,7 @@ pub const StoreError = std.mem.Allocator.Error || error{
     CollectionValueTooLarge,
     CollectionStorageLimitExceeded,
     InvalidSourceRange,
+    InvalidCollectionBatch,
 };
 
 pub const Store = struct {
@@ -262,6 +263,57 @@ pub const Store = struct {
         if (added > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
         try self.entries.ensureUnusedCapacity(self.arena.allocator(), values.len);
         for (values) |value| self.entries.appendAssumeCapacity(try self.ownEntry(value));
+        self.total_bytes += added;
+    }
+
+    /// Replace every active entry in one collection as a single logical
+    /// commit. Validation and ownership allocation complete before any prior
+    /// entry is deactivated, so malformed input, capacity failures, and OOM
+    /// preserve the visible collection. Arena bytes allocated by a failed
+    /// attempt remain charged to the physical byte limit.
+    pub fn replaceCollection(self: *Store, collection: Name, values: []const Value) StoreError!void {
+        if (values.len > self.limits.max_entries -| self.entries.items.len)
+            return error.TooManyCollectionEntries;
+        var added: usize = 0;
+        for (values) |value| {
+            if (value.collection != collection) return error.InvalidCollectionBatch;
+            try self.validateValue(value, values.len);
+            const item_bytes = value.key.len + value.value.len;
+            if (item_bytes > self.limits.max_total_bytes -| added)
+                return error.CollectionStorageLimitExceeded;
+            added += item_bytes;
+        }
+        if (added > self.limits.max_total_bytes -| self.total_bytes)
+            return error.CollectionStorageLimitExceeded;
+        if (values.len == 0) {
+            for (self.entries.items) |*entry| {
+                if (entry.collection == collection) entry.active = false;
+            }
+            return;
+        }
+
+        const arena_allocator = self.arena.allocator();
+        try self.entries.ensureUnusedCapacity(arena_allocator, values.len);
+        const staged = try self.arena.child_allocator.alloc(Entry, values.len);
+        defer self.arena.child_allocator.free(staged);
+        var staged_bytes: usize = 0;
+        errdefer self.total_bytes += staged_bytes;
+        for (values, staged) |value, *entry| {
+            const key = try arena_allocator.dupe(u8, value.key);
+            staged_bytes += value.key.len;
+            const owned_value = try arena_allocator.dupe(u8, value.value);
+            staged_bytes += value.value.len;
+            entry.* = .{
+                .collection = value.collection,
+                .key = key,
+                .value = owned_value,
+                .source = value.source,
+            };
+        }
+        for (self.entries.items) |*entry| {
+            if (entry.collection == collection) entry.active = false;
+        }
+        for (staged) |entry| self.entries.appendAssumeCapacity(entry);
         self.total_bytes += added;
     }
 
@@ -488,6 +540,49 @@ test "paired insertion is atomic under entry and byte limits" {
         .{ .collection = .request_headers_names, .key = "x", .value = "x", .source = source },
     ));
     try std.testing.expectEqual(@as(usize, 0), try store.count(.request_headers, .all));
+}
+
+test "collection replacement validates before changing visible state" {
+    var store = Store.init(std.testing.allocator, .{ .max_entries = 8, .max_value_bytes = 4, .max_total_bytes = 64 });
+    defer store.deinit();
+    const source: Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try store.add(.rule, "msg", "old", source);
+    try std.testing.expectError(error.CollectionValueTooLarge, store.replaceCollection(.rule, &.{
+        .{ .collection = .rule, .key = "msg", .value = "oversized", .source = source },
+    }));
+    try std.testing.expectEqualStrings("old", store.first(.rule, "msg").?.value);
+    try std.testing.expectError(error.InvalidCollectionBatch, store.replaceCollection(.rule, &.{
+        .{ .collection = .tx, .key = "msg", .value = "new", .source = source },
+    }));
+    try std.testing.expectEqualStrings("old", store.first(.rule, "msg").?.value);
+    try store.replaceCollection(.rule, &.{
+        .{ .collection = .rule, .key = "msg", .value = "new", .source = source },
+        .{ .collection = .rule, .key = "id", .value = "42", .source = source },
+    });
+    try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
+    try std.testing.expectEqualStrings("42", store.first(.rule, "id").?.value);
+    try store.replaceCollection(.rule, &.{});
+    try std.testing.expect(store.first(.rule, "msg") == null);
+}
+
+test "collection replacement preserves visible state across allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var store = Store.init(allocator, .{});
+            defer store.deinit();
+            const source: Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+            try store.add(.rule, "msg", "old", source);
+            store.replaceCollection(.rule, &.{
+                .{ .collection = .rule, .key = "msg", .value = "new", .source = source },
+                .{ .collection = .rule, .key = "id", .value = "42", .source = source },
+            }) catch |err| {
+                try std.testing.expectEqualStrings("old", store.first(.rule, "msg").?.value);
+                try std.testing.expect(store.first(.rule, "id") == null);
+                return err;
+            };
+            try std.testing.expectEqualStrings("new", store.first(.rule, "msg").?.value);
+        }
+    }.run, .{});
 }
 
 test "map replacement and removal stay physically bounded" {
