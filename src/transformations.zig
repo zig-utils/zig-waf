@@ -225,6 +225,7 @@ pub const Executor = struct {
             .base64_decode_ext => self.base64Decode(input, true),
             .base64_encode => self.base64Encode(input),
             .css_decode => self.cssDecode(input),
+            .escape_seq_decode => self.escapeSeqDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
             .trim => trimResult(input, true, true),
@@ -331,6 +332,46 @@ pub const Executor = struct {
                 generated.buffer.appendAssumeCapacity(input[index]);
                 index += 1;
             }
+        }
+        return finish(generated, input, changed);
+    }
+
+    fn escapeSeqDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOfScalar(u8, input, '\\') orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var changed = false;
+        var index = first;
+        while (index < input.len) {
+            if (input[index] != '\\' or index + 1 == input.len) {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+                continue;
+            }
+
+            const escaped = input[index + 1];
+            if (cEscapeByte(escaped)) |decoded| {
+                generated.buffer.appendAssumeCapacity(decoded);
+                index += 2;
+            } else if ((escaped == 'x' or escaped == 'X') and index + 3 < input.len and
+                isHex(input[index + 2]) and isHex(input[index + 3]))
+            {
+                generated.buffer.appendAssumeCapacity(hexNibble(input[index + 2]).? * 16 + hexNibble(input[index + 3]).?);
+                index += 4;
+            } else if (isOctal(escaped)) {
+                var digits: usize = 1;
+                var decoded: u16 = escaped - '0';
+                while (digits < 3 and index + 1 + digits < input.len and isOctal(input[index + 1 + digits])) : (digits += 1) {
+                    decoded = decoded * 8 + input[index + 1 + digits] - '0';
+                }
+                generated.buffer.appendAssumeCapacity(@truncate(decoded));
+                index += 1 + digits;
+            } else {
+                generated.buffer.appendAssumeCapacity(escaped);
+                index += 2;
+            }
+            changed = true;
         }
         return finish(generated, input, changed);
     }
@@ -695,6 +736,24 @@ fn isNull(byte: u8) bool {
     return byte == 0;
 }
 
+fn cEscapeByte(byte: u8) ?u8 {
+    return switch (byte) {
+        'a' => 0x07,
+        'b' => 0x08,
+        'f' => 0x0c,
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'v' => 0x0b,
+        '\\', '?', '\'', '"' => byte,
+        else => null,
+    };
+}
+
+fn isOctal(byte: u8) bool {
+    return byte >= '0' and byte <= '7';
+}
+
 fn isHex(byte: u8) bool {
     return hexNibble(byte) != null;
 }
@@ -929,6 +988,23 @@ test "CSS decoding preserves six-digit boundaries and profile changed flags" {
     try std.testing.expect(!escaped_literal.changed);
     try std.testing.expect((try coraza.apply(.css_decode, "\\q")).changed);
     try std.testing.expectEqualSlices(u8, &.{ 0, 'x' }, (try modsecurity.apply(.css_decode, "\\0x")).bytes);
+}
+
+test "C escape decoding handles simple hex octal and malformed sequences" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x07, 0x08, 0x0c, '\n', '\r', '\t', 0x0b, '?', '\'', '"', 0, 10, 'S', 0, 0xff },
+        (try executor.apply(.escape_seq_decode, "\\a\\b\\f\\n\\r\\t\\v\\?\\'\\\"\\0\\12\\123\\x00\\xff")).bytes,
+    );
+    try std.testing.expectEqualSlices(u8, &.{ '8', '9', 0xb6, 'x', 'a', 'g', 'x', 'g', 'a', 10, '3' }, (try executor.apply(.escape_seq_decode, "\\8\\9\\666\\xag\\xga\\0123")).bytes);
+
+    const trailing = try executor.apply(.escape_seq_decode, "value\\");
+    try std.testing.expectEqualStrings("value\\", trailing.bytes);
+    try std.testing.expect(!trailing.changed);
+    try std.testing.expectEqualStrings("q", (try executor.apply(.escape_seq_decode, "\\q")).bytes);
 }
 
 test "executor validates deterministic input and output limits" {
