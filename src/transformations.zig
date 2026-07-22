@@ -224,6 +224,7 @@ pub const Executor = struct {
             .base64_decode => self.base64Decode(input, false),
             .base64_decode_ext => self.base64Decode(input, true),
             .base64_encode => self.base64Encode(input),
+            .css_decode => self.cssDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
             .trim => trimResult(input, true, true),
@@ -281,6 +282,57 @@ pub const Executor = struct {
         const generated = try self.writable(input.len);
         for (input) |byte| generated.buffer.appendAssumeCapacity(if (uppercase) std.ascii.toUpper(byte) else std.ascii.toLower(byte));
         return finish(generated, input, true);
+    }
+
+    fn cssDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOfScalar(u8, input, '\\') orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var changed = self.profile == .coraza;
+        var index = first;
+        while (index < input.len) {
+            if (input[index] != '\\') {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+                continue;
+            }
+            if (index + 1 == input.len) {
+                changed = true;
+                index += 1;
+                continue;
+            }
+
+            index += 1;
+            var digits: usize = 0;
+            while (digits < 6 and index + digits < input.len and isHex(input[index + digits])) : (digits += 1) {}
+            if (digits != 0) {
+                var decoded = if (digits == 1)
+                    hexNibble(input[index]).?
+                else
+                    hexNibble(input[index + digits - 2]).? * 16 + hexNibble(input[index + digits - 1]).?;
+                const full_width_check = digits == 4 or
+                    (digits == 5 and input[index] == '0') or
+                    (digits == 6 and input[index] == '0' and input[index + 1] == '0');
+                if (full_width_check and decoded > 0 and decoded < 0x5f and
+                    (input[index + digits - 4] == 'f' or input[index + digits - 4] == 'F') and
+                    (input[index + digits - 3] == 'f' or input[index + digits - 3] == 'F'))
+                {
+                    decoded += 0x20;
+                }
+                generated.buffer.appendAssumeCapacity(decoded);
+                index += digits;
+                if (index < input.len and isAsciiWhitespace(input[index])) index += 1;
+                changed = true;
+            } else if (input[index] == '\n') {
+                index += 1;
+                changed = true;
+            } else {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            }
+        }
+        return finish(generated, input, changed);
     }
 
     fn compressWhitespace(self: *Executor, input: []const u8) ApplyError!Result {
@@ -860,6 +912,23 @@ test "URL Unicode decoding matches profile flags and IIS full-width folding" {
     });
     defer mapped.deinit();
     try std.testing.expectEqualStrings("zB", (try mapped.apply(.url_decode_uni, "%u0041%u0042")).bytes);
+}
+
+test "CSS decoding preserves six-digit boundaries and profile changed flags" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("\x1a\x01AV7V7\x01x\x01x", (try modsecurity.apply(.css_decode, "\\1A\\1 A\\1234567\\123456 7\\1x\\1 x")).bytes);
+    try std.testing.expectEqualStrings("\n\x0b\x0fnrtv?'\"\x00\x12#4EV!~\x00  string", (try modsecurity.apply(.css_decode, "\\a\\b\\f\\n\\r\\t\\v\\?\\'\\\"\\\x00\\12\\123\\1234\\12345\\123456\\ff01\\ff5e\\\n\\\x00  string")).bytes);
+    try std.testing.expectEqualStrings("test", (try modsecurity.apply(.css_decode, "test\\")).bytes);
+
+    const escaped_literal = try modsecurity.apply(.css_decode, "\\q");
+    try std.testing.expectEqualStrings("q", escaped_literal.bytes);
+    try std.testing.expect(!escaped_literal.changed);
+    try std.testing.expect((try coraza.apply(.css_decode, "\\q")).changed);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 'x' }, (try modsecurity.apply(.css_decode, "\\0x")).bytes);
 }
 
 test "executor validates deterministic input and output limits" {
