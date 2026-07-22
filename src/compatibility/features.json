@@ -223,7 +223,7 @@
       "id": "engine.disruptive-flow-runtime-controls",
       "area": "engine",
       "name": "Typed disruptive decisions, flow cursor, and transaction runtime controls",
-      "status": "partial",
+      "status": "verified",
       "issue": "https://github.com/zig-utils/zig-waf/issues/16",
       "modsecurity": true,
       "coraza": true,
@@ -239,7 +239,7 @@
         "benchmarks/actions.zig",
         "docs/disruptive-flow-controls.md"
       ],
-      "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact and bounded zig-regex target exclusions, capability-gated proxy, exhaustive allocation rollback, fuzzing, and ReleaseFast decision/cursor/exclusion benchmarks are executable. Exact hosted closing-SHA verification remains."
+      "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact rule-tag and exact/bounded zig-regex rule-target exclusions, capability-gated proxy, exhaustive allocation rollback, fuzzing, and ReleaseFast decision/cursor/exclusion benchmarks are executable. Pause duration parsing and execution remain explicitly assigned to WAF-21."
     },
     {
       "id": "fleet.postgresql-18",

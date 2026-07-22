@@ -42,6 +42,10 @@
     "benchmark": "zig build bench-actions -Doptimize=ReleaseFast",
     "corpus": "zig build test-plan-corpus with pinned CRS, ModSecurity, and Coraza roots",
     "unexplainedMismatches": 0,
+    "hostedImplementationGate": {
+      "commit": "0b803704e22b8c5b86c4f4927fe555d3542fb83f",
+      "run": "https://github.com/zig-utils/zig-waf/actions/runs/29963857555"
+    },
     "releaseFastFlowResults": {
       "iterationsPerScenario": 5000,
       "cursorNoop": {

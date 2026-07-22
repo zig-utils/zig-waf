@@ -27,6 +27,11 @@ Regex target selectors compile through the pinned `zig-regex` dependency and
 use pointer-stable compiled programs with isolated per-transaction workers;
 matcher limits surface as explicit transaction errors.
 
+The connector ABI reserves explicit pause capability/intervention tags so a
+connector cannot silently treat pause as pass. Parsing a duration, enforcing a
+configured duration bound, and scheduling nonblocking pause execution are
+owned by WAF-21; WAF-15 does not publish a partially functional pause action.
+
 Executable evidence is recorded in
 `src/compatibility/evidence/disruptive-flow-controls.json`. CI runs unit and
 integration tests, the pinned five-root plan corpus, 10,000 deterministic action
@@ -39,3 +44,8 @@ and exclusion-heavy traversal plus a regex target probe at p99 292 ns. The last
 scenario records four bounded first-use matcher-cache allocations (142 bytes)
 per transaction; cursor traversal itself only advances immutable plan slices
 and transaction-local counters.
+
+The implementation gate passed the complete hosted workflow on commit
+`0b803704e22b8c5b86c4f4927fe555d3542fb83f`, including dependency-lock and
+no-submodule checks, 219 tests, the pinned CRS/ModSecurity/Coraza corpora,
+10,000-case fuzz steps, and all ReleaseFast benchmarks.
