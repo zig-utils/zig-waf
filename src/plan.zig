@@ -1842,7 +1842,7 @@ const Compiler = struct {
         disruptive: *DisruptiveDecision,
         flow: ?*FlowDecision,
     ) CompileError!void {
-        var disruptive_seen = false;
+        var disruptive_seen: ?Action = null;
         for (self.actions.items[start..][0..count], 0..) |action, offset| {
             const name = self.interner.values.items[@backingInt(action.name)];
             const action_index = std.math.add(u32, start, @as(u32, @intCast(offset))) catch return error.TypedIdOverflow;
@@ -1855,8 +1855,12 @@ const Compiler = struct {
                 continue;
             }
             if (equalsAny(name, &.{ "allow", "block", "deny", "drop", "pass", "proxy", "redirect" })) {
-                if (disruptive_seen) return self.fail(error.InvalidDisruptiveAction, rule.source, null);
-                disruptive_seen = true;
+                if (disruptive_seen) |existing| {
+                    if (!self.sameDisruptiveAction(existing, action))
+                        return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    continue;
+                }
+                disruptive_seen = action;
                 disruptive.destination = null;
                 disruptive.declared_block = false;
                 if (std.ascii.eqlIgnoreCase(name, "allow")) {
@@ -1911,6 +1915,18 @@ const Compiler = struct {
                 mutable_flow.multi_match = true;
             }
         }
+    }
+
+    fn sameDisruptiveAction(self: *const Compiler, first: Action, second: Action) bool {
+        const first_name = self.interner.values.items[@backingInt(first.name)];
+        const second_name = self.interner.values.items[@backingInt(second.name)];
+        if (!std.ascii.eqlIgnoreCase(first_name, second_name)) return false;
+        if (first.value == null or second.value == null) return first.value == null and second.value == null;
+        return std.mem.eql(
+            u8,
+            unquote(self.interner.values.items[@backingInt(first.value.?)]),
+            unquote(self.interner.values.items[@backingInt(second.value.?)]),
+        );
     }
 
     fn compileEffectRange(self: *Compiler, rule: Rule, start: u32, count: u32) CompileError!void {
@@ -3849,6 +3865,7 @@ test "disruptive and flow actions compile to effective typed decisions" {
         \\SecRule ARGS @rx "id:2,redirect:'https://example.test/%{TX.path}',status:307,skip:2,skipAfter:END,multiMatch"
         \\SecMarker END
         \\SecRule ARGS @rx "id:3,block,status:451"
+        \\SecRule ARGS @rx "id:4,deny,deny"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "decisions.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -3876,6 +3893,7 @@ test "disruptive and flow actions compile to effective typed decisions" {
     try std.testing.expectEqual(DisruptiveKind.deny, block.kind);
     try std.testing.expectEqual(@as(u16, 451), block.status);
     try std.testing.expect(block.status_explicit);
+    try std.testing.expectEqual(DisruptiveKind.deny, compiled.rules[3].disruptive.kind);
 }
 
 test "invalid disruptive and flow values have a stable diagnostic" {
