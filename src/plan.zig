@@ -327,6 +327,16 @@ pub const Plan = struct {
         allocator.destroy(self);
     }
 
+    /// Create another owned handle to the same immutable payload.
+    pub fn retain(self: *const Plan, allocator: std.mem.Allocator) std.mem.Allocator.Error!*Plan {
+        const retained = try allocator.create(Plan);
+        self.component.retain();
+        retained.allocator = allocator;
+        attachComponent(retained, self.component);
+        retained.fingerprint = self.fingerprint;
+        return retained;
+    }
+
     pub fn sharedReferenceCount(self: *const Plan) usize {
         return self.component.references.load(.acquire);
     }

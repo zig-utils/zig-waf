@@ -2,8 +2,10 @@
 
 const std = @import("std");
 const collections = @import("collections.zig");
+const compiled_plan = @import("plan.zig");
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
+const seclang = @import("seclang/root.zig");
 const variables = @import("variables.zig");
 
 pub const Mode = enum {
@@ -21,6 +23,7 @@ pub const Feature = enum(u6) {
     runtime_macros,
     persistent_collections,
     atomic_hot_reload,
+    compiled_execution_plan,
 };
 
 pub const FeatureSet = struct {
@@ -127,6 +130,7 @@ pub const Builder = struct {
     config: Config = .{},
     io: std.Io,
     clock_source: ?ClockSource = null,
+    retained_plan: ?*const compiled_plan.Plan = null,
 
     pub fn init(allocator: std.mem.Allocator) Builder {
         return .{
@@ -173,18 +177,42 @@ pub const Builder = struct {
         self.config.persistent_required_features = required;
     }
 
+    /// Retain the plan when `build` succeeds. The caller keeps ownership of its
+    /// handle and only needs to keep it alive until `build` returns.
+    pub fn setRetainedPlan(self: *Builder, value: *const compiled_plan.Plan) void {
+        self.retained_plan = value;
+    }
+
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
+        try self.validate();
+        const retained = if (self.retained_plan) |value| try value.retain(self.allocator) else null;
+        errdefer if (retained) |value| value.deinit();
+        return self.allocate(retained);
+    }
+
+    /// Transfer `value` to the new WAF only on success. On error, ownership
+    /// remains with the caller.
+    pub fn buildTransferringPlan(self: *const Builder, value: *compiled_plan.Plan) (ConfigError || std.mem.Allocator.Error)!*Waf {
+        try self.validate();
+        return self.allocate(value);
+    }
+
+    fn validate(self: *const Builder) ConfigError!void {
         try self.config.limits.validate();
         self.config.persistent_limits.validate() catch return error.InvalidLimit;
         if (self.config.persistent_backend) |backend| {
             if (!backend.features.containsAll(self.config.persistent_required_features)) return error.MissingPersistentBackendFeature;
         }
+    }
+
+    fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
         const waf = try self.allocator.create(Waf);
         waf.* = .{
             .allocator = self.allocator,
             .config = self.config,
             .io = self.io,
             .clock_source = self.clock_source,
+            .plan = owned_plan,
             .active_transactions = std.atomic.Value(usize).init(0),
             .transaction_sequence = std.atomic.Value(u64).init(0),
         };
@@ -207,6 +235,7 @@ pub const Waf = struct {
     config: Config,
     io: std.Io,
     clock_source: ?ClockSource,
+    plan: ?*compiled_plan.Plan,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
 
@@ -237,6 +266,10 @@ pub const Waf = struct {
         return FeatureSet.allCompiled();
     }
 
+    pub fn compiledPlan(self: *const Waf) ?*const compiled_plan.Plan {
+        return self.plan;
+    }
+
     fn now(self: *const Waf) ClockSample {
         if (self.clock_source) |source| return source.now();
         return .{
@@ -248,6 +281,7 @@ pub const Waf = struct {
     pub fn deinit(self: *Waf) DeinitError!void {
         if (self.active_transactions.load(.acquire) != 0) return error.TransactionsActive;
         const allocator = self.allocator;
+        if (self.plan) |value| value.deinit();
         allocator.destroy(self);
     }
 };
@@ -414,6 +448,10 @@ pub const Transaction = struct {
     highest_severity: u8 = 255,
     args_combined_size: usize = 0,
     files_combined_size: u64 = 0,
+
+    pub fn compiledPlan(self: *const Transaction) ?*const compiled_plan.Plan {
+        return self.waf.compiledPlan();
+    }
 
     pub fn processConnection(
         self: *Transaction,
@@ -1778,6 +1816,71 @@ test "compiled feature discovery is explicit" {
     try std.testing.expect(compiled.has(.transaction_lifecycle));
     try std.testing.expect(compiled.has(.scalar_variables));
     try std.testing.expect(compiled.has(.atomic_hot_reload));
+    try std.testing.expect(compiled.has(.compiled_execution_plan));
+}
+
+test "builder retains or transfers compiled plans explicitly" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "builder.conf", "SecRule ARGS @rx id:1", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+
+    const retained_plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    var retained_builder = Builder.init(std.testing.allocator);
+    retained_builder.setRetainedPlan(retained_plan);
+    const retained_waf = try retained_builder.build();
+    try std.testing.expectEqual(@as(usize, 2), retained_plan.sharedReferenceCount());
+    retained_plan.deinit();
+    try std.testing.expectEqual(@as(usize, 1), retained_waf.compiledPlan().?.sharedReferenceCount());
+    try std.testing.expectEqual(@as(usize, 1), retained_waf.compiledPlan().?.rules.len);
+    try retained_waf.deinit();
+
+    const transferred_plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    var transfer_builder = Builder.init(std.testing.allocator);
+    const transferred_waf = try transfer_builder.buildTransferringPlan(transferred_plan);
+    try std.testing.expectEqual(transferred_plan, transferred_waf.compiledPlan().?);
+    try transferred_waf.deinit();
+}
+
+test "failed builds preserve caller plan ownership" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "failed-build.conf", "SecAction pass", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const value = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer value.deinit();
+
+    var builder = Builder.init(std.testing.allocator);
+    builder.setLimits(.{ .max_header_count = 0 });
+    builder.setRetainedPlan(value);
+    try std.testing.expectError(error.InvalidLimit, builder.build());
+    try std.testing.expectEqual(@as(usize, 1), value.sharedReferenceCount());
+    try std.testing.expectError(error.InvalidLimit, builder.buildTransferringPlan(value));
+    try std.testing.expectEqual(@as(usize, 1), value.sharedReferenceCount());
+}
+
+test "transactions remain pinned to their compiled plan across reload" {
+    var first_parsed = try seclang.parser.parseBytes(std.testing.allocator, "first.conf", "SecRule ARGS \"@contains first\" id:1", .{}, .{});
+    defer first_parsed.deinit();
+    var second_parsed = try seclang.parser.parseBytes(std.testing.allocator, "second.conf", "SecRule ARGS \"@contains second\" id:2", .{}, .{});
+    defer second_parsed.deinit();
+    var first_documents = [_]seclang.parser.Document{first_parsed.document};
+    var second_documents = [_]seclang.parser.Document{second_parsed.document};
+    const first_plan = try compiled_plan.compile(std.testing.allocator, &first_parsed.registry, &first_documents, .{});
+    const second_plan = try compiled_plan.compile(std.testing.allocator, &second_parsed.registry, &second_documents, .{});
+
+    var builder = Builder.init(std.testing.allocator);
+    const runtime = try Runtime.init(std.testing.allocator, try builder.buildTransferringPlan(first_plan));
+    var old_transaction = try runtime.newTransaction();
+    const old_fingerprint = old_transaction.compiledPlan().?.fingerprint;
+    const replacement = try builder.buildTransferringPlan(second_plan);
+    var retired = try runtime.reload(replacement);
+    var new_transaction = try runtime.newTransaction();
+    try std.testing.expectEqualSlices(u8, &old_fingerprint, &old_transaction.compiledPlan().?.fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, &old_transaction.compiledPlan().?.fingerprint, &new_transaction.compiledPlan().?.fingerprint));
+    try std.testing.expectError(error.TransactionsActive, retired.tryReclaim());
+    old_transaction.deinit();
+    try retired.tryReclaim();
+    new_transaction.deinit();
+    try runtime.deinit();
 }
 
 test "hot reload pins requests to retired generations until drain" {
