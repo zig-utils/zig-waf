@@ -1,0 +1,52 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zig-waf
+      - uses: actions/checkout@v4
+        with:
+          repository: zig-utils/zig-injection
+          ref: 239232e62d366da676bff58ec6d30fd3db391735
+          path: zig-injection
+      - uses: actions/checkout@v4
+        with:
+          repository: zig-utils/zig-regex
+          ref: 86159c5b9e0996ce6942b99d4ea76ed6c80a9a24
+          path: zig-regex
+      - uses: actions/checkout@v4
+        with:
+          repository: zig-utils/zig-tls
+          ref: 59a68477e2036035d005e5b6ef57bf8bcb7a82f8
+          path: zig-tls
+      - uses: actions/checkout@v4
+        with:
+          repository: stacksjs/stx
+          ref: 38b8e9bfd8079dd3987427894b74608bf4d47876
+          path: stx
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1441+d5181a9c9
+      - name: Reject Git submodules
+        working-directory: zig-waf
+        run: test ! -f .gitmodules
+      - name: Format
+        working-directory: zig-waf
+        run: zig fmt --check build.zig src
+      - name: Test
+        working-directory: zig-waf
+        run: zig build test
+      - name: Compile
+        working-directory: zig-waf
+        run: zig build check

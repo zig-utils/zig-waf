@@ -1,0 +1,8 @@
+dependencies:
+  zig: 0.17.0-dev
+  postgres: ^18
+  postgresql.org/libpq: ^18
+
+services:
+  autoStart:
+    - postgres

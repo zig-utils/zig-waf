@@ -1,0 +1,19 @@
+.{
+    .name = .waf,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0-dev.1441+d5181a9c9",
+    .fingerprint = 0x76c8394cfc892bf7, // Changing this has security and trust implications.
+.paths = .{
+        "README.md",
+        "LICENSE",
+        "SECURITY.md",
+        "build.zig",
+        "build.zig.zon",
+        "console",
+        "dependencies.lock.json",
+        "deps.yaml",
+        "docs",
+        "include",
+        "src",
+    },
+}

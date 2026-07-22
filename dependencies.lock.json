@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "repositories": {
+    "zig-injection": {
+      "repository": "zig-utils/zig-injection",
+      "commit": "239232e62d366da676bff58ec6d30fd3db391735",
+      "localPath": "../zig-injection"
+    },
+    "zig-regex": {
+      "repository": "zig-utils/zig-regex",
+      "commit": "86159c5b9e0996ce6942b99d4ea76ed6c80a9a24",
+      "localPath": "../zig-regex"
+    },
+    "zig-tls": {
+      "repository": "zig-utils/zig-tls",
+      "commit": "59a68477e2036035d005e5b6ef57bf8bcb7a82f8",
+      "localPath": "../zig-tls"
+    },
+    "stx": {
+      "repository": "stacksjs/stx",
+      "commit": "38b8e9bfd8079dd3987427894b74608bf4d47876",
+      "localPath": "../../Tools/stx"
+    }
+  }
+}
