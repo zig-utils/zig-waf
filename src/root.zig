@@ -4,6 +4,7 @@ pub const version = "0.0.0-dev";
 pub const compatibility = @import("compatibility.zig");
 pub const engine = @import("engine.zig");
 pub const operators = @import("operators.zig");
+pub const variables = @import("variables.zig");
 
 pub const Waf = engine.Waf;
 pub const Transaction = engine.Transaction;
@@ -15,4 +16,5 @@ test {
     _ = compatibility;
     _ = engine;
     _ = operators;
+    _ = variables;
 }

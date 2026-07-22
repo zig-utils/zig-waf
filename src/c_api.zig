@@ -299,6 +299,8 @@ fn mapError(err: anyerror) Status {
         error.HeadersTooLarge,
         error.RequestBodyLimitExceeded,
         error.ResponseBodyLimitExceeded,
+        error.ScalarValueTooLarge,
+        error.ScalarStorageLimitExceeded,
         => .limit_exceeded,
         error.TransactionsActive => .busy,
         else => .internal,

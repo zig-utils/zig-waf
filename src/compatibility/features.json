@@ -57,6 +57,21 @@
       "notes": "Interventions preserve evidence and are marked non-enforcing; action precedence remains."
     },
     {
+      "id": "engine.scalar-variables",
+      "area": "engine",
+      "name": "Bounded scalar transaction variables with phase availability and origins",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/8",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/variables.zig",
+        "src/engine.zig"
+      ],
+      "notes": "Connection, request-target, body-length, response, identity, match, and severity scalar foundations are implemented; the remaining stable scalar union and differential fixtures remain."
+    },
+    {
       "id": "operator.detect-sqli",
       "area": "operators",
       "name": "SQL injection detection",

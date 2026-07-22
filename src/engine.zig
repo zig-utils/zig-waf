@@ -1,6 +1,7 @@
 //! Core WAF ownership and transaction lifecycle contracts.
 
 const std = @import("std");
+const variables = @import("variables.zig");
 
 pub const Mode = enum {
     enabled,
@@ -22,13 +23,17 @@ pub const Limits = struct {
     max_header_bytes: usize = 64 * 1024,
     max_request_body_bytes: usize = 16 * 1024 * 1024,
     max_response_body_bytes: usize = 16 * 1024 * 1024,
+    max_scalar_value_bytes: usize = 16 * 1024,
+    max_scalar_storage_bytes: usize = 64 * 1024,
 
     fn validate(self: Limits) ConfigError!void {
         if (self.max_request_target_bytes == 0 or
             self.max_header_count == 0 or
             self.max_header_bytes == 0 or
             self.max_request_body_bytes == 0 or
-            self.max_response_body_bytes == 0)
+            self.max_response_body_bytes == 0 or
+            self.max_scalar_value_bytes == 0 or
+            self.max_scalar_storage_bytes < self.max_scalar_value_bytes)
         {
             return error.InvalidLimit;
         }
@@ -103,7 +108,7 @@ pub const Waf = struct {
 
     pub fn newTransaction(self: *const Waf) Transaction {
         _ = @constCast(&self.active_transactions).fetchAdd(1, .monotonic);
-        return .{ .waf = self };
+        return .{ .waf = self, .scalar_variables = variables.Store.init(self.allocator) };
     }
 
     pub fn activeTransactionCount(self: *const Waf) usize {
@@ -130,7 +135,7 @@ pub const TransactionError = error{
     RequestBodyLimitExceeded,
     ResponseBodyLimitExceeded,
     InvalidInterventionStatus,
-};
+} || variables.StoreError;
 
 const Lifecycle = enum {
     created,
@@ -161,6 +166,7 @@ pub const Transaction = struct {
     request_body_bytes: usize = 0,
     response_body_bytes: usize = 0,
     pending_intervention: ?Intervention = null,
+    scalar_variables: variables.Store,
 
     pub fn processConnection(
         self: *Transaction,
@@ -173,6 +179,10 @@ pub const Transaction = struct {
         if (!validAddress(client_address) or !validAddress(server_address) or client_port == 0 or server_port == 0) {
             return error.InvalidConnectionAddress;
         }
+        try self.setScalar(.remote_addr, client_address, .connection, .connection);
+        try self.setScalarUnsigned(.remote_port, client_port, .connection, .connection);
+        try self.setScalar(.server_addr, server_address, .connection, .connection);
+        try self.setScalarUnsigned(.server_port, server_port, .connection, .connection);
         self.lifecycle = .connection;
     }
 
@@ -188,6 +198,15 @@ pub const Transaction = struct {
         }
         if (!validToken(method)) return error.InvalidMethod;
         if (!validProtocol(protocol)) return error.InvalidProtocol;
+        try self.setScalar(.request_uri_raw, uri, .request_target, .request_headers);
+        try self.setScalar(.request_uri, uri, .request_target, .request_headers);
+        const query_start = std.mem.indexOfScalar(u8, uri, '?');
+        const filename = if (query_start) |index| uri[0..index] else uri;
+        const query = if (query_start) |index| uri[index + 1 ..] else "";
+        try self.setScalar(.request_filename, filename, .request_target, .request_headers);
+        try self.setScalar(.query_string, query, .request_target, .request_headers);
+        try self.setScalar(.request_method, method, .request_target, .request_headers);
+        try self.setScalar(.request_protocol, protocol, .request_target, .request_headers);
         self.lifecycle = .uri;
     }
 
@@ -206,7 +225,9 @@ pub const Transaction = struct {
         if (chunk.len > self.waf.config.limits.max_request_body_bytes - self.request_body_bytes) {
             return error.RequestBodyLimitExceeded;
         }
-        self.request_body_bytes += chunk.len;
+        const next_body_bytes = self.request_body_bytes + chunk.len;
+        try self.setScalarUnsigned(.request_body_length, next_body_bytes, .request_body, .request_body);
+        self.request_body_bytes = next_body_bytes;
         self.lifecycle = .request_body_writing;
     }
 
@@ -224,6 +245,8 @@ pub const Transaction = struct {
         try self.requireAny(&.{ .request_headers, .request_body });
         if (status < 100 or status > 999) return error.InvalidInterventionStatus;
         if (!validProtocol(protocol)) return error.InvalidProtocol;
+        try self.setScalarUnsigned(.response_status, status, .response, .response_headers);
+        try self.setScalar(.response_protocol, protocol, .response, .response_headers);
         self.lifecycle = .response_headers;
     }
 
@@ -232,7 +255,9 @@ pub const Transaction = struct {
         if (chunk.len > self.waf.config.limits.max_response_body_bytes - self.response_body_bytes) {
             return error.ResponseBodyLimitExceeded;
         }
-        self.response_body_bytes += chunk.len;
+        const next_body_bytes = self.response_body_bytes + chunk.len;
+        try self.setScalarUnsigned(.response_body_length, next_body_bytes, .response, .response_body);
+        self.response_body_bytes = next_body_bytes;
         self.lifecycle = .response_body_writing;
     }
 
@@ -286,8 +311,34 @@ pub const Transaction = struct {
         };
     }
 
+    pub fn scalar(self: *const Transaction, name: variables.Name) TransactionError!?variables.View {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const availability = self.currentAvailability() orelse return null;
+        return self.scalar_variables.get(name, availability);
+    }
+
+    pub fn scalarBySecLangName(self: *const Transaction, name: []const u8) TransactionError!?variables.View {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const availability = self.currentAvailability() orelse return null;
+        return self.scalar_variables.getBySecLangName(name, availability);
+    }
+
+    pub fn setIdentity(self: *Transaction, remote_user: []const u8, user_id: []const u8) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.setScalar(.remote_user, remote_user, .connector, .request_headers);
+        try self.setScalar(.user_id, user_id, .connector, .request_headers);
+    }
+
+    pub fn recordMatch(self: *Transaction, name: []const u8, value: []const u8, severity: u8) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.setScalar(.matched_var_name, name, .rule, .request_headers);
+        try self.setScalar(.matched_var, value, .rule, .request_headers);
+        try self.setScalarUnsigned(.highest_severity, severity, .rule, .request_headers);
+    }
+
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
+        self.scalar_variables.deinit();
         self.lifecycle = .deinitialized;
         _ = @constCast(&self.waf.active_transactions).fetchSub(1, .release);
     }
@@ -316,6 +367,51 @@ pub const Transaction = struct {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         for (expected) |candidate| if (self.lifecycle == candidate) return;
         return error.InvalidLifecycle;
+    }
+
+    fn currentAvailability(self: *const Transaction) ?variables.Availability {
+        return switch (self.currentPhase() orelse return null) {
+            .connection => .connection,
+            .request_headers => .request_headers,
+            .request_body => .request_body,
+            .response_headers => .response_headers,
+            .response_body => .response_body,
+            .logging => .logging,
+        };
+    }
+
+    fn setScalar(
+        self: *Transaction,
+        name: variables.Name,
+        value: []const u8,
+        origin: variables.Origin,
+        available_from: variables.Availability,
+    ) TransactionError!void {
+        try self.scalar_variables.set(
+            name,
+            value,
+            origin,
+            available_from,
+            self.waf.config.limits.max_scalar_value_bytes,
+            self.waf.config.limits.max_scalar_storage_bytes,
+        );
+    }
+
+    fn setScalarUnsigned(
+        self: *Transaction,
+        name: variables.Name,
+        value: anytype,
+        origin: variables.Origin,
+        available_from: variables.Availability,
+    ) TransactionError!void {
+        try self.scalar_variables.setUnsigned(
+            name,
+            value,
+            origin,
+            available_from,
+            self.waf.config.limits.max_scalar_value_bytes,
+            self.waf.config.limits.max_scalar_storage_bytes,
+        );
     }
 };
 
@@ -425,4 +521,26 @@ test "detection-only interventions are visible but not enforced" {
     const pending = (try tx.intervention()).?;
     try std.testing.expectEqual(Intervention.Action.deny, pending.action);
     try std.testing.expect(!pending.enforced);
+}
+
+test "owns scalar variables and exposes them only in valid phases" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    var client = [_]u8{ '1', '9', '2', '.', '0', '.', '2', '.', '1' };
+    try tx.processConnection(&client, 54321, "198.51.100.10", 443);
+    client[0] = '9';
+    try std.testing.expectEqualStrings("192.0.2.1", (try tx.scalar(.remote_addr)).?.value);
+    try std.testing.expect((try tx.scalar(.request_method)) == null);
+
+    try tx.processUri("/search?q=zig", "GET", "HTTP/2");
+    try std.testing.expectEqualStrings("q=zig", (try tx.scalarBySecLangName("QUERY_STRING")).?.value);
+    try std.testing.expectEqualStrings("/search", (try tx.scalar(.request_filename)).?.value);
+    try std.testing.expect((try tx.scalar(.response_status)) == null);
+    try tx.processRequestHeaders();
+    try tx.processResponseHeaders(403, "HTTP/2");
+    try std.testing.expectEqualStrings("403", (try tx.scalar(.response_status)).?.value);
 }
