@@ -56,6 +56,15 @@ pub const Control = struct {
     value: []const u8,
 };
 
+pub const IdRange = struct {
+    first: u64,
+    last: u64,
+
+    pub fn contains(self: IdRange, value: u64) bool {
+        return value >= self.first and value <= self.last;
+    }
+};
+
 pub const Severity = enum(u3) {
     emergency = 0,
     alert = 1,
@@ -294,6 +303,21 @@ pub fn parsePositiveUsize(value: []const u8) ParseError!usize {
     return @intCast(number);
 }
 
+pub fn parseIdRange(value: []const u8) ParseError!IdRange {
+    const dash = std.mem.indexOfScalar(u8, value, '-');
+    const first_text = if (dash) |index| value[0..index] else value;
+    const last_text = if (dash) |index| value[index + 1 ..] else value;
+    if (first_text.len == 0 or last_text.len == 0 or
+        (dash != null and std.mem.indexOfScalarPos(u8, value, dash.? + 1, '-') != null))
+    {
+        return error.InvalidOperation;
+    }
+    const first = parseUnsigned(first_text) catch return error.InvalidNumber;
+    const last = parseUnsigned(last_text) catch return error.InvalidNumber;
+    if (first > last) return error.NumberOutOfRange;
+    return .{ .first = first, .last = last };
+}
+
 fn parseVariable(value: []const u8) ParseError!struct { collection: Collection, key: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return error.InvalidVariable;
     if (dot == 0 or dot + 1 == value.len) return error.InvalidVariable;
@@ -385,4 +409,8 @@ test "runtime control names and body values parse without allocation" {
     try std.testing.expectError(error.MissingValue, parseControl("ruleEngine="));
     try std.testing.expectError(error.InvalidOperation, parseBodyProcessor("multipart"));
     try std.testing.expectError(error.NumberOutOfRange, parsePositiveUsize("0"));
+    try std.testing.expectEqualDeep(IdRange{ .first = 10, .last = 10 }, try parseIdRange("10"));
+    try std.testing.expectEqualDeep(IdRange{ .first = 10, .last = 20 }, try parseIdRange("10-20"));
+    try std.testing.expectError(error.NumberOutOfRange, parseIdRange("20-10"));
+    try std.testing.expectError(error.InvalidOperation, parseIdRange("1-2-3"));
 }

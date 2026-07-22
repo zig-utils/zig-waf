@@ -41,6 +41,7 @@ pub const MatchIntent = engine.MatchIntent;
 pub const FlowState = engine.FlowState;
 pub const PhaseCursor = engine.PhaseCursor;
 pub const ControlState = engine.ControlState;
+pub const RuleExclusion = engine.RuleExclusion;
 
 test {
     _ = version;
