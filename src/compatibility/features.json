@@ -53,25 +53,33 @@
       "id": "api.transaction-lifecycle",
       "area": "engine",
       "name": "Five inspection phases plus logging lifecycle",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/7",
       "modsecurity": true,
       "coraza": true,
       "crs_required": true,
-      "evidence": ["src/engine.zig"],
-      "notes": "Connector transitions and limits are implemented; rule execution in each phase remains."
+      "evidence": [
+        "src/engine.zig",
+        "include/zig_waf.h",
+        "tests/c_api_smoke.c",
+        "docs/architecture.md"
+      ],
+      "notes": "Connection setup is pre-phase; the five stable phase numbers, legal transitions, early exits, terminal drop behavior, and exactly-once logging finalization are enforced."
     },
     {
       "id": "api.detection-only",
       "area": "engine",
       "name": "Detection-only interventions",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/7",
       "modsecurity": true,
       "coraza": true,
       "crs_required": true,
-      "evidence": ["src/engine.zig"],
-      "notes": "Interventions preserve evidence and are marked non-enforcing; action precedence remains."
+      "evidence": [
+        "src/engine.zig",
+        "tests/c_api_smoke.c"
+      ],
+      "notes": "Interventions preserve evidence, are marked non-enforcing, and do not interrupt or terminate detection-only transactions. Detailed action precedence remains scoped to WAF-15."
     },
     {
       "id": "engine.scalar-variables",

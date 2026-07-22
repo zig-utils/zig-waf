@@ -13,6 +13,7 @@ int main(void) {
     assert((features.feature_bits & ZIG_WAF_FEATURE_TRANSACTION_LIFECYCLE) != 0);
     assert((features.feature_bits & ZIG_WAF_FEATURE_SCALAR_VARIABLES) != 0);
     assert((features.feature_bits & ZIG_WAF_FEATURE_ATOMIC_HOT_RELOAD) != 0);
+    assert(features.highest_phase == ZIG_WAF_PHASE_LOGGING);
 
     zig_waf_config_t config = {0};
     config.struct_size = sizeof(config);

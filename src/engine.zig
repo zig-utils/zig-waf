@@ -36,12 +36,11 @@ pub const FeatureSet = struct {
 };
 
 pub const Phase = enum(u8) {
-    connection = 1,
-    request_headers = 2,
-    request_body = 3,
-    response_headers = 4,
-    response_body = 5,
-    logging = 6,
+    request_headers = 1,
+    request_body = 2,
+    response_headers = 3,
+    response_body = 4,
+    logging = 5,
 };
 
 pub const Limits = struct {
@@ -260,6 +259,8 @@ pub const TransactionError = error{
     RequestBodyLimitExceeded,
     ResponseBodyLimitExceeded,
     InvalidInterventionStatus,
+    InterventionAlreadyRecorded,
+    TransactionTerminated,
 } || variables.StoreError;
 
 const Lifecycle = enum {
@@ -292,6 +293,8 @@ pub const Transaction = struct {
     response_body_bytes: usize = 0,
     pending_intervention: ?Intervention = null,
     scalar_variables: variables.Store,
+    phase_interrupted: bool = false,
+    transaction_terminated: bool = false,
 
     pub fn processConnection(
         self: *Transaction,
@@ -342,6 +345,7 @@ pub const Transaction = struct {
 
     pub fn processRequestHeaders(self: *Transaction) TransactionError!void {
         try self.require(.uri);
+        self.phase_interrupted = false;
         self.lifecycle = .request_headers;
     }
 
@@ -358,6 +362,7 @@ pub const Transaction = struct {
 
     pub fn processRequestBody(self: *Transaction) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body_writing });
+        self.phase_interrupted = false;
         self.lifecycle = .request_body;
     }
 
@@ -368,10 +373,11 @@ pub const Transaction = struct {
 
     pub fn processResponseHeaders(self: *Transaction, status: u16, protocol: []const u8) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body });
-        if (status < 100 or status > 999) return error.InvalidInterventionStatus;
+        if (status < 100 or status > 599) return error.InvalidInterventionStatus;
         if (!validProtocol(protocol)) return error.InvalidProtocol;
         try self.setScalarUnsigned(.response_status, status, .response, .response_headers);
         try self.setScalar(.response_protocol, protocol, .response, .response_headers);
+        self.phase_interrupted = false;
         self.lifecycle = .response_headers;
     }
 
@@ -388,16 +394,16 @@ pub const Transaction = struct {
 
     pub fn processResponseBody(self: *Transaction) TransactionError!void {
         try self.requireAny(&.{ .response_headers, .response_body_writing });
+        self.phase_interrupted = false;
         self.lifecycle = .response_body;
     }
 
     pub fn processLogging(self: *Transaction) TransactionError!void {
-        try self.requireAny(&.{
-            .request_headers,
-            .request_body,
-            .response_headers,
-            .response_body,
-        });
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (self.lifecycle == .created or self.lifecycle == .connection or self.lifecycle == .logging) {
+            return error.InvalidLifecycle;
+        }
+        self.phase_interrupted = false;
         self.lifecycle = .logging;
     }
 
@@ -415,25 +421,42 @@ pub const Transaction = struct {
         rule_id: ?u32,
     ) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
-        if (status < 100 or status > 999) return error.InvalidInterventionStatus;
+        if (self.currentPhase() == null) return error.InvalidLifecycle;
+        if (self.pending_intervention != null) return error.InterventionAlreadyRecorded;
+        if (status < 100 or status > 599) return error.InvalidInterventionStatus;
         self.pending_intervention = .{
             .action = action,
             .status = status,
             .rule_id = rule_id,
             .enforced = self.waf.config.mode == .enabled,
         };
+        if (self.waf.config.mode == .enabled) {
+            self.phase_interrupted = true;
+            self.transaction_terminated = action == .drop;
+        }
     }
 
     pub fn currentPhase(self: *const Transaction) ?Phase {
         return switch (self.lifecycle) {
-            .created, .deinitialized => null,
-            .connection => .connection,
+            .created, .connection, .deinitialized => null,
             .uri, .request_headers => .request_headers,
             .request_body_writing, .request_body => .request_body,
             .response_headers => .response_headers,
             .response_body_writing, .response_body => .response_body,
             .logging => .logging,
         };
+    }
+
+    pub fn isPhaseInterrupted(self: *const Transaction) bool {
+        return self.phase_interrupted;
+    }
+
+    pub fn isTerminated(self: *const Transaction) bool {
+        return self.transaction_terminated;
+    }
+
+    pub fn isLoggingFinalized(self: *const Transaction) bool {
+        return self.lifecycle == .logging;
     }
 
     pub fn scalar(self: *const Transaction, name: variables.Name) TransactionError!?variables.View {
@@ -485,22 +508,25 @@ pub const Transaction = struct {
 
     fn require(self: *const Transaction, expected: Lifecycle) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (self.transaction_terminated) return error.TransactionTerminated;
         if (self.lifecycle != expected) return error.InvalidLifecycle;
     }
 
     fn requireAny(self: *const Transaction, expected: []const Lifecycle) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (self.transaction_terminated) return error.TransactionTerminated;
         for (expected) |candidate| if (self.lifecycle == candidate) return;
         return error.InvalidLifecycle;
     }
 
     fn currentAvailability(self: *const Transaction) ?variables.Availability {
-        return switch (self.currentPhase() orelse return null) {
+        return switch (self.lifecycle) {
+            .created, .deinitialized => null,
             .connection => .connection,
-            .request_headers => .request_headers,
-            .request_body => .request_body,
+            .uri, .request_headers => .request_headers,
+            .request_body_writing, .request_body => .request_body,
             .response_headers => .response_headers,
-            .response_body => .response_body,
+            .response_body_writing, .response_body => .response_body,
             .logging => .logging,
         };
     }
@@ -602,8 +628,9 @@ test "executes the complete connector lifecycle" {
 
     var tx = waf.newTransaction();
     try tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
-    try std.testing.expectEqual(Phase.connection, tx.currentPhase().?);
+    try std.testing.expect(tx.currentPhase() == null);
     try tx.processUri("/login", "POST", "HTTP/1.1");
+    try std.testing.expectEqual(Phase.request_headers, tx.currentPhase().?);
     try tx.addRequestHeader("content-type", "application/json");
     try tx.processRequestHeaders();
     try tx.writeRequestBody("{\"user\":");
@@ -617,6 +644,14 @@ test "executes the complete connector lifecycle" {
     try std.testing.expectEqual(Phase.logging, tx.currentPhase().?);
     tx.deinit();
     try waf.deinit();
+}
+
+test "uses the five stable SecLang phase numbers" {
+    try std.testing.expectEqual(@as(u8, 1), @backingInt(Phase.request_headers));
+    try std.testing.expectEqual(@as(u8, 2), @backingInt(Phase.request_body));
+    try std.testing.expectEqual(@as(u8, 3), @backingInt(Phase.response_headers));
+    try std.testing.expectEqual(@as(u8, 4), @backingInt(Phase.response_body));
+    try std.testing.expectEqual(@as(u8, 5), @backingInt(Phase.logging));
 }
 
 test "rejects invalid phase order and use after deinit" {
@@ -671,10 +706,54 @@ test "detection-only interventions are visible but not enforced" {
     var tx = waf.newTransaction();
     defer tx.deinit();
 
+    try tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
     try tx.recordIntervention(.deny, 403, 941100);
     const pending = (try tx.intervention()).?;
     try std.testing.expectEqual(Intervention.Action.deny, pending.action);
     try std.testing.expect(!pending.enforced);
+    try std.testing.expect(!tx.isPhaseInterrupted());
+    try std.testing.expect(!tx.isTerminated());
+}
+
+test "enabled interventions interrupt a phase and logging finalizes once" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.recordIntervention(.deny, 403, 1001);
+    try std.testing.expect(tx.isPhaseInterrupted());
+    try std.testing.expect(!tx.isTerminated());
+    try std.testing.expectError(error.InterventionAlreadyRecorded, tx.recordIntervention(.deny, 404, 1002));
+
+    try tx.processResponseHeaders(403, "HTTP/1.1");
+    try std.testing.expect(!tx.isPhaseInterrupted());
+    try tx.processLogging();
+    try std.testing.expect(tx.isLoggingFinalized());
+    try std.testing.expectError(error.InvalidLifecycle, tx.processLogging());
+}
+
+test "drop terminates inspection but still permits logging finalization" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.recordIntervention(.drop, 403, 1001);
+    try std.testing.expect(tx.isTerminated());
+    try std.testing.expectError(error.TransactionTerminated, tx.processResponseHeaders(403, "HTTP/1.1"));
+    try tx.processLogging();
+    try std.testing.expect(tx.isLoggingFinalized());
 }
 
 test "owns scalar variables and exposes them only in valid phases" {
@@ -714,6 +793,9 @@ test "hot reload pins requests to retired generations until drain" {
     const runtime = try initial_builder.buildRuntime();
 
     var old_tx = try runtime.newTransaction();
+    try old_tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
+    try old_tx.processUri("/", "GET", "HTTP/1.1");
+    try old_tx.processRequestHeaders();
     try old_tx.recordIntervention(.deny, 403, 1);
     try std.testing.expect((try old_tx.intervention()).?.enforced);
 
@@ -725,6 +807,9 @@ test "hot reload pins requests to retired generations until drain" {
     try std.testing.expectError(error.TransactionsActive, retired.tryReclaim());
 
     var new_tx = try runtime.newTransaction();
+    try new_tx.processConnection("127.0.0.1", 12345, "127.0.0.1", 443);
+    try new_tx.processUri("/", "GET", "HTTP/1.1");
+    try new_tx.processRequestHeaders();
     try new_tx.recordIntervention(.deny, 403, 2);
     try std.testing.expect(!(try new_tx.intervention()).?.enforced);
     old_tx.deinit();

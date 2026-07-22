@@ -38,6 +38,14 @@ typedef enum zig_waf_action {
     ZIG_WAF_ACTION_PAUSE = 3
 } zig_waf_action_t;
 
+typedef enum zig_waf_phase {
+    ZIG_WAF_PHASE_REQUEST_HEADERS = 1,
+    ZIG_WAF_PHASE_REQUEST_BODY = 2,
+    ZIG_WAF_PHASE_RESPONSE_HEADERS = 3,
+    ZIG_WAF_PHASE_RESPONSE_BODY = 4,
+    ZIG_WAF_PHASE_LOGGING = 5
+} zig_waf_phase_t;
+
 enum zig_waf_feature_bit {
     ZIG_WAF_FEATURE_TRANSACTION_LIFECYCLE = UINT64_C(1) << 0,
     ZIG_WAF_FEATURE_BOUNDED_STREAMING_BODIES = UINT64_C(1) << 1,

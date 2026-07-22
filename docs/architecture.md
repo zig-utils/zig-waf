@@ -15,6 +15,14 @@ The core API separates immutable, shareable policy from isolated request state:
 - Detection-only mode retains interventions and marks them non-enforcing so
   audit and diagnostics do not diverge from enabled mode.
 
+Connection setup precedes SecLang evaluation and therefore has no public phase
+number. The stable five rule phases are request headers (1), request body (2),
+response headers (3), response body (4), and logging (5). Enforced disruptive
+interventions mark the current phase interrupted; `drop` additionally terminates
+inspection. Detection-only interventions preserve the same evidence without
+interrupting execution. Logging remains available after a terminal intervention
+and may be finalized exactly once.
+
 `Runtime` publishes a fully validated replacement generation in one critical
 operation. Existing transactions remain pinned to the retired generation and
 new transactions use the replacement. A retired generation cannot be reclaimed
