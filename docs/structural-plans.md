@@ -90,6 +90,7 @@ Semantic failures use stable codes:
 | `WAF-PLAN-0112` | Invalid rule-selection syntax after directive validation |
 | `WAF-PLAN-0113` | Update selected a non-head chain member; related span is that member |
 | `WAF-PLAN-0114` | Static `skipAfter` target has no following marker |
+| `WAF-PLAN-0115` | Rule target update contains invalid target syntax |
 
 Default actions require an explicit phase and a disruptive action. A phase may
 be defined once per compiled configuration context. Metadata and flow actions,
@@ -119,6 +120,15 @@ source-order behavior. Macro-bearing targets retain a compiled macro plus the
 allocation-free `resolveMarkerAfter` lookup for WAF-15. Marker resolution is
 bounded by `max_flow_targets`; neither static nor dynamic execution needs a
 filesystem, database, network call, or regex compilation.
+
+`SecRuleUpdateTargetById`, `SecRuleUpdateTargetByTag`, and
+`SecRuleUpdateTargetByMsg` reuse the bounded ID/`zig-regex` selector machinery.
+Each matching chain head receives a new immutable effective target range:
+prior targets are copied first and update targets follow in directive order.
+Negated targets remain explicit exclusion records, preserving collection/key,
+regex-key, and count semantics for the execution engine. Expansion is bounded
+independently by `max_target_expansion` and by total plan target capacity;
+non-head chain selection remains WAF-PLAN-0113.
 
 Allocation and configured capacity failures remain distinct typed errors.
 
