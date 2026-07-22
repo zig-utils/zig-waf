@@ -44,6 +44,8 @@ source order. It exposes:
 - action-family tags for transformations, metadata, non-disruptive,
   disruptive, flow, and unknown actions;
 - addressable marker and generic-directive indexes;
+- canonical bounded ID selectors, filtered phase indexes, and retained
+  `SecRuleRemoveById` evidence;
 - conservative exact, prefix, suffix, contains, phrase-any, and literal-regex
   prefilters; and
 - deduplicated runtime macro programs for operator parameters and action
@@ -85,12 +87,21 @@ Semantic failures use stable codes:
 | `WAF-PLAN-0109` | Action is not permitted in `SecDefaultAction` |
 | `WAF-PLAN-0110` | Duplicate default for a phase; related span is the first definition |
 | `WAF-PLAN-0111` | Default is missing a disruptive action |
+| `WAF-PLAN-0112` | Invalid rule-selection syntax after directive validation |
+| `WAF-PLAN-0113` | Update selected a non-head chain member; related span is that member |
 
 Default actions require an explicit phase and a disruptive action. A phase may
 be defined once per compiled configuration context. Metadata and flow actions,
 duplicate phase actions, and `t:none` are rejected before publication. Rules
 inherit only the snapshot for their effective phase; explicit per-rule
 transformations retain the ModSecurity-compatible `t:none` reset behavior.
+
+Valid `SecRuleRemoveById` selectors are canonicalized into sorted, merged
+unsigned 64-bit intervals. Matching uses binary search during candidate
+compilation. Selecting a chain head removes every member; selecting an
+identified non-head member is rejected. Removed rules remain in immutable
+source/evidence storage with their responsible directive ID, but chain heads
+are removed from phase execution indexes before publication.
 
 Allocation and configured capacity failures remain distinct typed errors.
 

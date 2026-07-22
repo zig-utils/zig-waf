@@ -2,13 +2,14 @@
 
 const std = @import("std");
 const seclang = @import("seclang/root.zig");
+const rule_config = @import("rule_config.zig");
 
 pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
 pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 2;
+pub const compiler_abi_version: u32 = 3;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
@@ -31,6 +32,8 @@ pub const Limits = struct {
     max_prefilter_literals: usize = 2_000_000,
     max_prefilter_bytes: usize = 128 * 1024 * 1024,
     max_defaults: usize = 100_000,
+    max_rule_updates: usize = 500_000,
+    max_id_intervals: usize = 1_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
     max_string_bytes: usize = 1024 * 1024,
@@ -56,6 +59,8 @@ pub const Limits = struct {
             self.max_prefilter_literals == 0 or
             self.max_prefilter_bytes == 0 or
             self.max_defaults == 0 or
+            self.max_rule_updates == 0 or
+            self.max_id_intervals == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
             self.max_string_bytes == 0 or
@@ -81,6 +86,8 @@ pub const Limits = struct {
             self.max_prefilters > std.math.maxInt(u32) or
             self.max_prefilter_literals > std.math.maxInt(u32) or
             self.max_defaults > std.math.maxInt(u32) or
+            self.max_rule_updates > std.math.maxInt(u32) or
+            self.max_id_intervals > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
         {
@@ -109,6 +116,8 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyPrefilterLiterals,
     PrefilterBytesLimitExceeded,
     TooManyDefaults,
+    TooManyRuleUpdates,
+    TooManyIdIntervals,
     TooManyArguments,
     TooManyStrings,
     StringTooLarge,
@@ -123,6 +132,8 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidDefaultAction,
     DuplicateDefaultPhase,
     MissingDefaultDisruptiveAction,
+    InvalidRuleSelector,
+    PartialChainSelection,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -137,6 +148,8 @@ pub const DiagnosticCode = enum {
     invalid_default_action,
     duplicate_default_phase,
     missing_default_disruptive_action,
+    invalid_rule_selector,
+    partial_chain_selection,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -156,6 +169,8 @@ pub const DiagnosticCode = enum {
             .invalid_default_action => "WAF-PLAN-0109",
             .duplicate_default_phase => "WAF-PLAN-0110",
             .missing_default_disruptive_action => "WAF-PLAN-0111",
+            .invalid_rule_selector => "WAF-PLAN-0112",
+            .partial_chain_selection => "WAF-PLAN-0113",
         };
     }
 
@@ -167,6 +182,8 @@ pub const DiagnosticCode = enum {
             .invalid_default_action => "action is not permitted in SecDefaultAction",
             .duplicate_default_phase => "SecDefaultAction is already defined for this phase",
             .missing_default_disruptive_action => "SecDefaultAction must specify a disruptive action",
+            .invalid_rule_selector => "rule ID selector must contain valid unsigned IDs or inclusive ranges",
+            .partial_chain_selection => "rule update cannot select a non-head chain member",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -307,6 +324,12 @@ pub const Rule = struct {
     actions_count: u32,
     transformations_start: u32,
     transformations_count: u32,
+    removed_by: ?DirectiveId,
+};
+
+pub const RuleRemoval = struct {
+    directive: DirectiveId,
+    chain_head: RuleId,
 };
 
 const Component = struct {
@@ -330,6 +353,7 @@ const Component = struct {
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
+    rule_removals: []const RuleRemoval,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -370,6 +394,7 @@ pub const Plan = struct {
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
+    rule_removals: []const RuleRemoval,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -520,6 +545,13 @@ const Failure = struct {
     secondary: ?seclang.source.Span = null,
 };
 
+const IdRuleRemoval = struct {
+    directive: DirectiveId,
+    source: seclang.source.Span,
+    intervals_start: u32,
+    intervals_count: u32,
+};
+
 const Compiler = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -539,6 +571,9 @@ const Compiler = struct {
     prefilter_count: usize = 0,
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
+    id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
+    id_rule_removals: std.ArrayList(IdRuleRemoval) = .empty,
+    rule_removals: std.ArrayList(RuleRemoval) = .empty,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
     active_defaults: [5]?DefaultId = .{ null, null, null, null, null },
@@ -566,6 +601,9 @@ const Compiler = struct {
         self.macro_tokens.deinit(self.allocator);
         self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
+        self.id_intervals.deinit(self.allocator);
+        self.id_rule_removals.deinit(self.allocator);
+        self.rule_removals.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
     }
@@ -631,6 +669,8 @@ const Compiler = struct {
                 if (self.generic_directives.items.len == self.limits.max_generic_directives)
                     return error.TooManyGenericDirectives;
                 try self.generic_directives.append(self.allocator, directive_id);
+                if (std.ascii.eqlIgnoreCase(directive.name, "SecRuleRemoveById"))
+                    try self.addIdRuleRemoval(directive_id, directive);
             },
             else => {},
         }
@@ -643,6 +683,39 @@ const Compiler = struct {
             .actions_start = action_range.start,
             .actions_count = action_range.count,
             .rule = rule_id,
+        });
+    }
+
+    fn addIdRuleRemoval(self: *Compiler, directive_id: DirectiveId, directive: seclang.parser.Directive) CompileError!void {
+        if (self.id_rule_removals.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
+        if (self.id_intervals.items.len == self.limits.max_id_intervals) return error.TooManyIdIntervals;
+        var fragments: std.ArrayList([]const u8) = .empty;
+        defer fragments.deinit(self.allocator);
+        try fragments.ensureTotalCapacity(self.allocator, directive.arguments.len);
+        for (directive.arguments) |argument| fragments.appendAssumeCapacity(argument.content());
+        var selector_failure: ?rule_config.IdSelectorFailure = null;
+        var selector = rule_config.IdSelector.parse(self.allocator, fragments.items, .{
+            .max_fragments = self.limits.max_arguments,
+            .max_input_bytes = self.limits.max_string_bytes,
+            .max_intervals = self.limits.max_id_intervals -| self.id_intervals.items.len,
+        }, &selector_failure) catch |cause| switch (cause) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooManyIdIntervals => return error.TooManyIdIntervals,
+            // The structural compiler intentionally preserves schema-invalid
+            // generic directives so the directive validator can publish its
+            // stable WAF-DIRECTIVE diagnostic before a Waf is built.
+            else => return,
+        };
+        defer selector.deinit();
+        if (selector.intervals.len > self.limits.max_id_intervals -| self.id_intervals.items.len)
+            return error.TooManyIdIntervals;
+        const start = try typedIndex(self.id_intervals.items.len);
+        try self.id_intervals.appendSlice(self.allocator, selector.intervals);
+        try self.id_rule_removals.append(self.allocator, .{
+            .directive = directive_id,
+            .source = directive.physical,
+            .intervals_start = start,
+            .intervals_count = try typedIndex(selector.intervals.len),
         });
     }
 
@@ -712,6 +785,7 @@ const Compiler = struct {
             .actions_count = action_range.count,
             .transformations_start = transformation_range.start,
             .transformations_count = transformation_range.count,
+            .removed_by = null,
         });
         if (pending) |previous_id| {
             const previous = &self.rules.items[@backingInt(previous_id)];
@@ -917,7 +991,39 @@ const Compiler = struct {
         }
     }
 
+    fn applyIdRuleRemovals(self: *Compiler) CompileError!void {
+        for (self.id_rule_removals.items) |removal| {
+            const intervals = self.id_intervals.items[removal.intervals_start..][0..removal.intervals_count];
+            for (self.rules.items, 0..) |rule, rule_index| {
+                const external_id = rule.external_id orelse continue;
+                if (!matchesIntervals(intervals, external_id)) continue;
+                if (rule.chain_position != 0)
+                    return self.fail(error.PartialChainSelection, removal.source, rule.source);
+                const head: RuleId = @fromBackingInt(@as(u32, @intCast(rule_index)));
+                if (self.rules.items[rule_index].removed_by != null) continue;
+                if (self.rule_removals.items.len == self.limits.max_rule_updates) return error.TooManyRuleUpdates;
+                try self.rule_removals.append(self.allocator, .{ .directive = removal.directive, .chain_head = head });
+                var member: ?RuleId = head;
+                while (member) |id| {
+                    const selected = &self.rules.items[@backingInt(id)];
+                    selected.removed_by = removal.directive;
+                    member = selected.chain_next;
+                }
+            }
+        }
+        for (&self.phase_rules) |*phase| {
+            var write: usize = 0;
+            for (phase.items) |rule_id| {
+                if (self.rules.items[@backingInt(rule_id)].removed_by != null) continue;
+                phase.items[write] = rule_id;
+                write += 1;
+            }
+            phase.shrinkRetainingCapacity(write);
+        }
+    }
+
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
+        try self.applyIdRuleRemovals();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
         plan.* = undefined;
@@ -943,6 +1049,7 @@ const Compiler = struct {
         const macro_programs = try duplicateCounted(MacroProgram, arena_allocator, self.macro_programs.items, &owned_bytes, self.limits);
         const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
+        const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
             destination.* = try duplicateCounted(RuleId, arena_allocator, items.items, &owned_bytes, self.limits);
@@ -968,6 +1075,7 @@ const Compiler = struct {
             .macro_programs = macro_programs,
             .macro_tokens = macro_tokens,
             .defaults = defaults,
+            .rule_removals = rule_removals,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
         };
@@ -998,6 +1106,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.macro_programs = component.macro_programs;
     plan.macro_tokens = component.macro_tokens;
     plan.defaults = component.defaults;
+    plan.rule_removals = component.rule_removals;
     plan.phase_rules = component.phase_rules;
     plan.owned_bytes = component.owned_bytes;
 }
@@ -1022,7 +1131,8 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !std.mem.eql(DirectiveId, first.generic_directives, second.generic_directives) or
         !slicesEqual(MacroProgram, first.macro_programs, second.macro_programs) or
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
-        !slicesEqual(DefaultSnapshot, first.defaults, second.defaults))
+        !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
+        !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals))
     {
         return false;
     }
@@ -1100,6 +1210,7 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashU32(&hasher, rule.actions_count);
         hashU32(&hasher, rule.transformations_start);
         hashU32(&hasher, rule.transformations_count);
+        hashOptionalId(&hasher, rule.removed_by);
     }
 
     hashU32(&hasher, @intCast(plan.defaults.len));
@@ -1111,6 +1222,11 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     for (plan.phase_rules) |rules| {
         hashU32(&hasher, @intCast(rules.len));
         for (rules) |rule| hashU32(&hasher, @backingInt(rule));
+    }
+    hashU32(&hasher, @intCast(plan.rule_removals.len));
+    for (plan.rule_removals) |removal| {
+        hashU32(&hasher, @backingInt(removal.directive));
+        hashU32(&hasher, @backingInt(removal.chain_head));
     }
     hashU32(&hasher, @intCast(plan.markers.len));
     for (plan.markers) |marker| {
@@ -1194,6 +1310,23 @@ fn explicitRuleId(actions: []const seclang.syntax.Action) CompileError!?u64 {
     return null;
 }
 
+fn matchesIntervals(intervals: []const rule_config.IdInterval, value: u64) bool {
+    var low: usize = 0;
+    var high = intervals.len;
+    while (low < high) {
+        const middle = low + (high - low) / 2;
+        const interval = intervals[middle];
+        if (value < interval.first) {
+            high = middle;
+        } else if (value > interval.last) {
+            low = middle + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn explicitPhase(actions: []const seclang.syntax.Action) CompileError!?u8 {
     for (actions) |action| {
         if (!std.ascii.eqlIgnoreCase(action.name, "phase")) continue;
@@ -1248,6 +1381,8 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidDefaultAction => .invalid_default_action,
         error.DuplicateDefaultPhase => .duplicate_default_phase,
         error.MissingDefaultDisruptiveAction => .missing_default_disruptive_action,
+        error.InvalidRuleSelector => .invalid_rule_selector,
+        error.PartialChainSelection => .partial_chain_selection,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -1559,6 +1694,71 @@ test "default action compatibility failures have precise diagnostics" {
     }
 }
 
+test "remove by id filters phase indexes and retains immutable evidence" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:2,chain"
+        \\SecRule TX @rx id:2
+        \\SecRule ARGS @rx id:3
+        \\SecRule ARGS @rx id:10
+        \\SecRuleRemoveById "3,10-20"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "remove-id.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), compiled.phaseRules(2).len);
+    try std.testing.expectEqual(@as(RuleId, @fromBackingInt(0)), compiled.phaseRules(2)[0]);
+    try std.testing.expectEqual(@as(?DirectiveId, null), compiled.rules[0].removed_by);
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(4)), compiled.rules[2].removed_by);
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(4)), compiled.rules[3].removed_by);
+    try std.testing.expectEqualSlices(RuleRemoval, &.{
+        .{ .directive = @fromBackingInt(4), .chain_head = @fromBackingInt(2) },
+        .{ .directive = @fromBackingInt(4), .chain_head = @fromBackingInt(3) },
+    }, compiled.rule_removals);
+}
+
+test "removing a chain head removes every member" {
+    const input =
+        \\SecRule ARGS @rx "id:1,chain"
+        \\SecRule TX @rx id:2
+        \\SecRuleRemoveById 1
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "remove-chain.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.phaseRules(2).len);
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(2)), compiled.rules[0].removed_by);
+    try std.testing.expectEqual(@as(?DirectiveId, @fromBackingInt(2)), compiled.rules[1].removed_by);
+    try std.testing.expectEqual(@as(usize, 1), compiled.rule_removals.len);
+}
+
+test "remove by id rejects partial chain selection with related rule span" {
+    const input =
+        \\SecRule ARGS @rx "id:1,chain"
+        \\SecRule TX @rx id:2
+        \\SecRuleRemoveById 2
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "partial-chain.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer outcome.deinit();
+    switch (outcome) {
+        .plan => return error.TestExpectedDiagnostic,
+        .diagnostic => |value| {
+            try std.testing.expectEqual(DiagnosticCode.partial_chain_selection, value.code);
+            try std.testing.expectEqualStrings("WAF-PLAN-0113", value.code.id());
+            try std.testing.expectEqual(parsed.document.directives.items[2].physical, value.primary);
+            try std.testing.expectEqual(parsed.document.directives.items[1].physical, value.secondary.?);
+        },
+    }
+}
+
 test "structural compiler rejects duplicate ids invalid phases and malformed chains" {
     const cases = [_]struct { input: []const u8, failure: CompileError }{
         .{ .input = "SecRule ARGS @rx id:1\nSecRule TX @rx id:1", .failure = error.DuplicateRuleId },
@@ -1742,6 +1942,8 @@ test "phase chain marker and generic resource limits fail distinctly" {
         .{ .input = "SecRule ARGS @rx chain\nSecRule TX @rx chain\nSecRule REQUEST_HEADERS @rx", .limits = .{ .max_graph_edges = 1 }, .failure = error.TooManyGraphEdges },
         .{ .input = "SecMarker one\nSecMarker two", .limits = .{ .max_markers = 1 }, .failure = error.TooManyMarkers },
         .{ .input = "SecOne value\nSecTwo value", .limits = .{ .max_generic_directives = 1 }, .failure = error.TooManyGenericDirectives },
+        .{ .input = "SecRuleRemoveById 1\nSecRuleRemoveById 2", .limits = .{ .max_rule_updates = 1 }, .failure = error.TooManyRuleUpdates },
+        .{ .input = "SecRuleRemoveById \"1 3\"", .limits = .{ .max_id_intervals = 1 }, .failure = error.TooManyIdIntervals },
     };
     for (cases) |case| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bounded.conf", case.input, .{}, .{});
