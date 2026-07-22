@@ -1,6 +1,8 @@
 //! Core WAF ownership and transaction lifecycle contracts.
 
 const std = @import("std");
+const collections = @import("collections.zig");
+const macros = @import("macros.zig");
 const variables = @import("variables.zig");
 
 pub const Mode = enum {
@@ -14,6 +16,8 @@ pub const Feature = enum(u6) {
     detection_only,
     native_sqli,
     scalar_variables,
+    collection_variables,
+    runtime_macros,
     atomic_hot_reload,
 };
 
@@ -51,6 +55,7 @@ pub const Limits = struct {
     max_response_body_bytes: usize = 16 * 1024 * 1024,
     max_scalar_value_bytes: usize = 32 * 1024,
     max_scalar_storage_bytes: usize = 256 * 1024,
+    collection_limits: collections.Limits = .{},
 
     fn validate(self: Limits) ConfigError!void {
         if (self.max_request_target_bytes == 0 or
@@ -63,6 +68,7 @@ pub const Limits = struct {
         {
             return error.InvalidLimit;
         }
+        self.collection_limits.validate() catch return error.InvalidLimit;
     }
 };
 
@@ -181,6 +187,7 @@ pub const Waf = struct {
         return .{
             .waf = self,
             .scalar_variables = variables.Store.init(self.allocator),
+            .collection_variables = collections.Store.init(self.allocator, self.config.limits.collection_limits),
             .started_real_nanoseconds = started.unix_nanoseconds,
             .started_awake_nanoseconds = started.awake_nanoseconds,
             .sequence = @constCast(&self.transaction_sequence).fetchAdd(1, .monotonic),
@@ -314,7 +321,8 @@ pub const TransactionError = error{
     InterventionAlreadyRecorded,
     TransactionTerminated,
     ClockBeforeUnixEpoch,
-} || variables.StoreError;
+    MacroOutputTooLarge,
+} || variables.StoreError || collections.StoreError;
 
 const Lifecycle = enum {
     created,
@@ -346,6 +354,7 @@ pub const Transaction = struct {
     response_body_bytes: usize = 0,
     pending_intervention: ?Intervention = null,
     scalar_variables: variables.Store,
+    collection_variables: collections.Store,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -406,6 +415,20 @@ pub const Transaction = struct {
     pub fn addRequestHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
         try self.require(.uri);
         const added = try self.validateHeader(name, value, self.request_header_count, self.request_header_bytes);
+        const name_source: collections.Source = .{
+            .origin = .request_header,
+            .offset = self.request_header_bytes,
+            .length = name.len,
+        };
+        const value_source: collections.Source = .{
+            .origin = .request_header,
+            .offset = self.request_header_bytes + name.len + 2,
+            .length = value.len,
+        };
+        try self.collection_variables.addPair(
+            .{ .collection = .request_headers, .key = name, .value = value, .source = value_source },
+            .{ .collection = .request_headers_names, .key = name, .value = name, .source = name_source },
+        );
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
             if (startsWithIgnoreCase(value, "multipart/form-data")) {
                 try self.setScalar(.reqbody_processor, "MULTIPART", .request_header, .request_headers);
@@ -459,6 +482,20 @@ pub const Transaction = struct {
     pub fn addResponseHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body });
         const added = try self.validateHeader(name, value, self.response_header_count, self.response_header_bytes);
+        const name_source: collections.Source = .{
+            .origin = .response_header,
+            .offset = self.response_header_bytes,
+            .length = name.len,
+        };
+        const value_source: collections.Source = .{
+            .origin = .response_header,
+            .offset = self.response_header_bytes + name.len + 2,
+            .length = value.len,
+        };
+        try self.collection_variables.addPair(
+            .{ .collection = .response_headers, .key = name, .value = value, .source = value_source },
+            .{ .collection = .response_headers_names, .key = name, .value = name, .source = name_source },
+        );
         if (std.ascii.eqlIgnoreCase(name, "content-type")) {
             try self.setScalar(.response_content_type, value, .response_header, .response_headers);
         }
@@ -578,6 +615,47 @@ pub const Transaction = struct {
         return self.scalar_variables.getBySecLangName(name, availability);
     }
 
+    pub fn collection(self: *const Transaction, name: collections.Name, selector: collections.Selector) TransactionError!?collections.Iterator {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const availability = self.currentAvailability() orelse return null;
+        if (@backingInt(availability) < @backingInt(name.minimumAvailability())) return null;
+        return self.collection_variables.select(name, selector);
+    }
+
+    pub fn collectionFirst(self: *const Transaction, name: collections.Name, key: []const u8) TransactionError!?collections.View {
+        var iterator = (try self.collection(name, .{ .key = key })) orelse return null;
+        return iterator.next();
+    }
+
+    pub fn addCollectionValue(
+        self: *Transaction,
+        name: collections.Name,
+        key: []const u8,
+        value: []const u8,
+        source: collections.Source,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.collection_variables.add(name, key, value, source);
+    }
+
+    pub fn expandMacro(
+        self: *Transaction,
+        compiled: *const macros.Compiled,
+        allocator: std.mem.Allocator,
+        missing_policy: macros.MissingPolicy,
+    ) TransactionError![]u8 {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.updateDuration();
+        return compiled.expand(allocator, .{
+            .context = self,
+            .scalarFn = resolveMacroScalar,
+            .collectionFn = resolveMacroCollection,
+        }, missing_policy) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.MacroOutputTooLarge => return error.MacroOutputTooLarge,
+        };
+    }
+
     pub fn setIdentity(self: *Transaction, remote_user: []const u8, user_id: []const u8) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.setScalar(.remote_user, remote_user, .connector, .request_headers);
@@ -625,6 +703,10 @@ pub const Transaction = struct {
 
     pub fn recordMatch(self: *Transaction, name: []const u8, value: []const u8, severity: u8) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.collection_variables.addPair(
+            .{ .collection = .matched_vars, .key = name, .value = value, .source = .{ .origin = .rule, .offset = 0, .length = value.len } },
+            .{ .collection = .matched_vars_names, .key = name, .value = name, .source = .{ .origin = .rule, .offset = 0, .length = name.len } },
+        );
         try self.setScalar(.matched_var_name, name, .rule, .request_headers);
         try self.setScalar(.matched_var, value, .rule, .request_headers);
         if (severity < self.highest_severity) {
@@ -636,6 +718,7 @@ pub const Transaction = struct {
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
         self.scalar_variables.deinit();
+        self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
         _ = @constCast(&self.waf.active_transactions).fetchSub(1, .release);
     }
@@ -820,6 +903,20 @@ fn hostWithoutPort(value: []const u8) []const u8 {
     const first_colon = std.mem.indexOfScalar(u8, value, ':') orelse return value;
     if (std.mem.indexOfScalarPos(u8, value, first_colon + 1, ':') != null) return value;
     return value[0..first_colon];
+}
+
+fn resolveMacroScalar(context: *anyopaque, name: variables.Name) ?[]const u8 {
+    const transaction: *Transaction = @ptrCast(@alignCast(context));
+    const availability = transaction.currentAvailability() orelse return null;
+    return (transaction.scalar_variables.get(name, availability) orelse return null).value;
+}
+
+fn resolveMacroCollection(context: *anyopaque, name: collections.Name, key: ?[]const u8) ?[]const u8 {
+    const transaction: *Transaction = @ptrCast(@alignCast(context));
+    const availability = transaction.currentAvailability() orelse return null;
+    if (@backingInt(availability) < @backingInt(name.minimumAvailability())) return null;
+    var iterator = transaction.collection_variables.select(name, if (key) |selected_key| .{ .key = selected_key } else .all);
+    return (iterator.next() orelse return null).value;
 }
 
 const ReloadWorker = struct {
@@ -1087,6 +1184,55 @@ test "derives header, identity, match, body error, and response scalars" {
     try std.testing.expectEqualStrings("7", (try tx.scalar(.response_content_length)).?.value);
     try std.testing.expectEqualStrings("1", (try tx.scalar(.res_body_error)).?.value);
     try std.testing.expectEqualStrings("0", (try tx.scalar(.outbound_data_error)).?.value);
+}
+
+test "publishes repeated header collections with phase gates and origins" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    var first_value = [_]u8{ 'o', 'n', 'e' };
+    try tx.addRequestHeader("X-Test", &first_value);
+    first_value[0] = 'x';
+    try tx.addRequestHeader("x-test", "two");
+    var headers = (try tx.collection(.request_headers, .{ .key = "X-TEST" })).?;
+    const first = headers.next().?;
+    try std.testing.expectEqualStrings("one", first.value);
+    try std.testing.expectEqual(variables.Origin.request_header, first.source.origin);
+    try std.testing.expectEqualStrings("two", headers.next().?.value);
+    try std.testing.expect(headers.next() == null);
+    try std.testing.expect((try tx.collection(.response_headers, .all)) == null);
+
+    var names = (try tx.collection(.request_headers_names, .all)).?;
+    try std.testing.expectEqualStrings("X-Test", names.next().?.value);
+    try std.testing.expectEqualStrings("x-test", names.next().?.value);
+
+    try tx.processRequestHeaders();
+    try tx.addResponseHeader("Content-Type", "text/plain");
+    try std.testing.expect((try tx.collection(.response_headers, .all)) == null);
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    try std.testing.expectEqualStrings("text/plain", (try tx.collectionFirst(.response_headers, "content-type")).?.value);
+}
+
+test "transaction macros resolve current scalar and collection state" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/orders", "GET", "HTTP/1.1");
+    try tx.addCollectionValue(.tx, "tenant", "north", .{ .origin = .rule, .offset = 0, .length = 5 });
+    var compiled = try macros.Compiled.compile(std.testing.allocator, "%{REQUEST_METHOD} %{TX.tenant} %{RESPONSE_STATUS}", .{});
+    defer compiled.deinit();
+    const expanded = try tx.expandMacro(&compiled, std.testing.allocator, .empty);
+    defer std.testing.allocator.free(expanded);
+    try std.testing.expectEqualStrings("GET north ", expanded);
 }
 
 test "compiled feature discovery is explicit" {

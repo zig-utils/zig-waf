@@ -110,6 +110,28 @@ pub const Name = enum {
             else => .sensitive,
         };
     }
+
+    pub fn minimumAvailability(self: Name) variables.Availability {
+        return switch (self) {
+            .args_post,
+            .args_post_names,
+            .files,
+            .files_names,
+            .files_sizes,
+            .files_tmp_content,
+            .files_tmp_names,
+            .json,
+            .multipart_filename,
+            .multipart_name,
+            .multipart_part_headers,
+            .request_xml,
+            .xml,
+            => .request_body,
+            .response_headers, .response_headers_names => .response_headers,
+            .response_args, .response_xml => .response_body,
+            else => .request_headers,
+        };
+    }
 };
 
 pub const KeyPolicy = enum { sensitive, ascii_insensitive };
@@ -119,6 +141,12 @@ pub const Limits = struct {
     max_key_bytes: usize = 4096,
     max_value_bytes: usize = 32 * 1024,
     max_total_bytes: usize = 2 * 1024 * 1024,
+
+    pub fn validate(self: Limits) error{InvalidCollectionLimit}!void {
+        if (self.max_entries == 0 or self.max_key_bytes == 0 or self.max_value_bytes == 0 or self.max_total_bytes < self.max_value_bytes) {
+            return error.InvalidCollectionLimit;
+        }
+    }
 };
 
 pub const Source = struct {
@@ -128,6 +156,13 @@ pub const Source = struct {
 };
 
 pub const View = struct {
+    collection: Name,
+    key: []const u8,
+    value: []const u8,
+    source: Source,
+};
+
+pub const Value = struct {
     collection: Name,
     key: []const u8,
     value: []const u8,
@@ -165,13 +200,13 @@ pub const StoreError = std.mem.Allocator.Error || error{
 };
 
 pub const Store = struct {
-    allocator: std.mem.Allocator,
+    arena: std.heap.ArenaAllocator,
     limits: Limits,
     entries: std.ArrayList(Entry) = .empty,
     total_bytes: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) Store {
-        return .{ .allocator = allocator, .limits = limits };
+        return .{ .arena = .init(allocator), .limits = limits };
     }
 
     pub fn add(
@@ -188,16 +223,31 @@ pub const Store = struct {
         const added = key.len + value.len;
         if (added > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
 
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-        try self.entries.append(self.allocator, .{
+        const arena_allocator = self.arena.allocator();
+        const owned_key = try arena_allocator.dupe(u8, key);
+        const owned_value = try arena_allocator.dupe(u8, value);
+        try self.entries.append(arena_allocator, .{
             .collection = collection,
             .key = owned_key,
             .value = owned_value,
             .source = source,
         });
+        self.total_bytes += added;
+    }
+
+    /// Atomically append two related values, such as a header value and its
+    /// corresponding `*_NAMES` entry.
+    pub fn addPair(self: *Store, first_value: Value, second_value: Value) StoreError!void {
+        try self.validateValue(first_value, 2);
+        try self.validateValue(second_value, 2);
+        const added = first_value.key.len + first_value.value.len + second_value.key.len + second_value.value.len;
+        if (added > self.limits.max_total_bytes -| self.total_bytes) return error.CollectionStorageLimitExceeded;
+
+        const first_entry = try self.ownEntry(first_value);
+        const second_entry = try self.ownEntry(second_value);
+        try self.entries.ensureUnusedCapacity(self.arena.allocator(), 2);
+        self.entries.appendAssumeCapacity(first_entry);
+        self.entries.appendAssumeCapacity(second_entry);
         self.total_bytes += added;
     }
 
@@ -218,12 +268,28 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
-        for (self.entries.items) |entry| {
-            self.allocator.free(entry.key);
-            self.allocator.free(entry.value);
-        }
-        self.entries.deinit(self.allocator);
+        self.entries.deinit(self.arena.allocator());
+        self.arena.deinit();
         self.* = undefined;
+    }
+
+    fn validateValue(self: *const Store, value: Value, needed_entries: usize) StoreError!void {
+        if (needed_entries > self.limits.max_entries -| self.entries.items.len) return error.TooManyCollectionEntries;
+        if (value.key.len > self.limits.max_key_bytes) return error.CollectionKeyTooLarge;
+        if (value.value.len > self.limits.max_value_bytes) return error.CollectionValueTooLarge;
+        if (value.source.offset > std.math.maxInt(usize) - value.source.length) return error.InvalidSourceRange;
+    }
+
+    fn ownEntry(self: *Store, value: Value) std.mem.Allocator.Error!Entry {
+        const arena_allocator = self.arena.allocator();
+        const key = try arena_allocator.dupe(u8, value.key);
+        const owned_value = try arena_allocator.dupe(u8, value.value);
+        return .{
+            .collection = value.collection,
+            .key = key,
+            .value = owned_value,
+            .source = value.source,
+        };
     }
 };
 
@@ -316,4 +382,15 @@ test "collection limits fail before taking ownership" {
     try std.testing.expectError(error.CollectionValueTooLarge, store.add(.tx, "k", "1234", .{ .origin = .rule, .offset = 0, .length = 0 }));
     try store.add(.tx, "k", "123", .{ .origin = .rule, .offset = 0, .length = 0 });
     try std.testing.expectError(error.TooManyCollectionEntries, store.add(.tx, "x", "1", .{ .origin = .rule, .offset = 0, .length = 0 }));
+}
+
+test "paired insertion is atomic under entry and byte limits" {
+    var store = Store.init(std.testing.allocator, .{ .max_entries = 1 });
+    defer store.deinit();
+    const source: Source = .{ .origin = .request_header, .offset = 0, .length = 1 };
+    try std.testing.expectError(error.TooManyCollectionEntries, store.addPair(
+        .{ .collection = .request_headers, .key = "x", .value = "1", .source = source },
+        .{ .collection = .request_headers_names, .key = "x", .value = "x", .source = source },
+    ));
+    try std.testing.expectEqual(@as(usize, 0), store.count(.request_headers, .all));
 }
