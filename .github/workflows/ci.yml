@@ -91,6 +91,15 @@ jobs:
           -Dparser-corpus=../owasp-crs/rules
           -Dparser-corpus=../modsecurity
           -Dparser-corpus=../coraza
+      - name: Structural plan corpus
+        working-directory: zig-waf
+        run: >-
+          zig build test-plan-corpus
+          -Dplan-corpus=../owasp-crs/crs-setup.conf.example
+          -Dplan-corpus=../owasp-crs/plugins
+          -Dplan-corpus=../owasp-crs/rules
+          -Dplan-corpus=../modsecurity
+          -Dplan-corpus=../coraza
       - name: CRS parser benchmark
         working-directory: zig-waf
         run: >-
