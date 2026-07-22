@@ -98,6 +98,24 @@
       "notes": "The 77-name stable scalar registry, aliases, origins, phase gates, connection/request/response producers, UTC timing, monotonic duration, body diagnostics, identity, matched values, and minimum-severity semantics are executable. Collection-derived aggregates remain WAF-08; full buffered body materialization remains WAF-24/WAF-28."
     },
     {
+      "id": "engine.collection-variables",
+      "area": "engine",
+      "name": "Bounded collections, targets, exclusions, counts, origins, and runtime macros",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/9",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/collections.zig",
+        "src/macros.zig",
+        "src/selectors.zig",
+        "src/engine.zig",
+        "benchmarks/collections.zig"
+      ],
+      "notes": "The 37-namespace registry, bounded owned storage, repeated/map mutations, source offsets, phase gates, exact and zig-regex selectors, exclusions, counts, explicit matcher errors, and configured baseline macro semantics are executable. HTTP/body/XML producers and persistent backends remain in their linked downstream issues."
+    },
+    {
       "id": "operator.detect-sqli",
       "area": "operators",
       "name": "SQL injection detection",

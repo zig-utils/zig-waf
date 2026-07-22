@@ -39,3 +39,5 @@ reclamation rules are recorded in
 
 The scalar compatibility and producer contract is documented in
 [Scalar transaction variables](scalar-variables.md).
+The keyed namespace, target, selector, and macro contract is documented in
+[Collection variables](collections.md).
