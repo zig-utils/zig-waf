@@ -38,6 +38,13 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0-dev.1441+d5181a9c9
+      - name: Install Pantry 0.10.47
+        env:
+          PANTRY_VERSION: 0.10.47
+        run: curl -fsSL https://pantry.dev | bash
+      - name: Install locked LMDB
+        working-directory: zig-waf
+        run: ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
       - name: Reject Git submodules
         working-directory: zig-waf
         run: test ! -f .gitmodules

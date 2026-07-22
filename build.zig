@@ -11,14 +11,25 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const lmdb_translate = b.addTranslateC(.{
+        .root_source_file = b.path("pantry/openldap.org/liblmdb/v0.9.35/include/lmdb.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const lmdb_module = lmdb_translate.createModule();
 
     const waf = b.addModule("waf", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    waf.addIncludePath(b.path("pantry/openldap.org/liblmdb/v0.9.35/include"));
+    waf.addObjectFile(b.path("pantry/openldap.org/liblmdb/v0.9.35/lib/liblmdb.a"));
     waf.addImport("injection", injection_dependency.module("injection"));
     waf.addImport("regex", regex_dependency.module("regex"));
+    waf.addImport("lmdb", lmdb_module);
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),

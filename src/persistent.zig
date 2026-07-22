@@ -345,15 +345,16 @@ pub const Session = struct {
     }
 };
 
-const OwnedRecord = struct {
+/// Owned mutable record used by persistence backend implementations.
+pub const Record = struct {
     arena: std.heap.ArenaAllocator,
     namespace: Namespace,
     collection_key: []const u8,
     revision: u64,
     values: std.ArrayList(Value) = .empty,
 
-    fn init(allocator: std.mem.Allocator, namespace: Namespace, collection_key: []const u8, revision: u64) std.mem.Allocator.Error!OwnedRecord {
-        var result: OwnedRecord = .{
+    pub fn init(allocator: std.mem.Allocator, namespace: Namespace, collection_key: []const u8, revision: u64) std.mem.Allocator.Error!Record {
+        var result: Record = .{
             .arena = .init(allocator),
             .namespace = namespace,
             .collection_key = undefined,
@@ -364,14 +365,14 @@ const OwnedRecord = struct {
         return result;
     }
 
-    fn clone(allocator: std.mem.Allocator, source: *const OwnedRecord) std.mem.Allocator.Error!OwnedRecord {
-        var result = try OwnedRecord.init(allocator, source.namespace, source.collection_key, source.revision);
+    pub fn clone(allocator: std.mem.Allocator, source: *const Record) std.mem.Allocator.Error!Record {
+        var result = try Record.init(allocator, source.namespace, source.collection_key, source.revision);
         errdefer result.deinit();
         for (source.values.items) |value| try result.append(value);
         return result;
     }
 
-    fn append(self: *OwnedRecord, value: Value) std.mem.Allocator.Error!void {
+    pub fn append(self: *Record, value: Value) std.mem.Allocator.Error!void {
         const allocator = self.arena.allocator();
         try self.values.append(allocator, .{
             .name = try allocator.dupe(u8, value.name),
@@ -380,7 +381,7 @@ const OwnedRecord = struct {
         });
     }
 
-    fn deinit(self: *OwnedRecord) void {
+    pub fn deinit(self: *Record) void {
         self.values.deinit(self.arena.allocator());
         self.arena.deinit();
         self.* = undefined;
@@ -393,7 +394,7 @@ const OwnedRecord = struct {
 pub const InMemoryBackend = struct {
     allocator: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
-    records: std.ArrayList(OwnedRecord) = .empty,
+    records: std.ArrayList(Record) = .empty,
 
     pub fn init(allocator: std.mem.Allocator) InMemoryBackend {
         return .{ .allocator = allocator };
@@ -459,9 +460,9 @@ pub const InMemoryBackend = struct {
         if (current_revision == std.math.maxInt(u64)) return error.CapacityExceeded;
 
         var replacement = if (existing_index) |index|
-            try OwnedRecord.clone(self.allocator, &self.records.items[index])
+            try Record.clone(self.allocator, &self.records.items[index])
         else
-            try OwnedRecord.init(self.allocator, request.namespace, request.collection_key, 0);
+            try Record.init(self.allocator, request.namespace, request.collection_key, 0);
         errdefer replacement.deinit();
         try applyMutations(&replacement, request.mutations, request.limits);
         replacement.revision = current_revision + 1;
@@ -508,7 +509,7 @@ pub const InMemoryBackend = struct {
     }
 };
 
-fn applyMutations(record: *OwnedRecord, mutations: []const Mutation, limits: Limits) BackendError!void {
+pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limits) BackendError!void {
     for (mutations) |mutation| switch (mutation) {
         .set => |set| {
             try validateValue(.{ .name = set.name, .value = set.value, .expires_at_ns = set.expires_at_ns }, limits);
