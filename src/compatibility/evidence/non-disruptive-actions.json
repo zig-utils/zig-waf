@@ -1,0 +1,116 @@
+{
+  "schemaVersion": 1,
+  "issue": "WAF-14",
+  "zig": "0.17.0-dev.1441+d5181a9c9",
+  "compilerAbi": 5,
+  "persistentBackendAbi": 3,
+  "baselines": {
+    "modsecurity": {
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d"
+    },
+    "coraza": {
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360"
+    },
+    "crs": {
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c"
+    }
+  },
+  "contracts": {
+    "typedMetadataAndEffects": true,
+    "postActionEventExpansion": true,
+    "transactionLocalEnvironment": true,
+    "checkedSignedArithmetic": true,
+    "captureReplacement": true,
+    "persistentBindings": true,
+    "revisionedExpiryAndDecay": true,
+    "explicitPersistenceFailurePolicy": true,
+    "completeChainAtomicity": true,
+    "boundedOwnedEventIntent": true,
+    "noSynchronousEventIo": true
+  },
+  "fixtures": [
+    {
+      "name": "metadata-local",
+      "file": "src/compatibility/fixtures/non-disruptive-actions/metadata-local.conf",
+      "upstream": [
+        "ModSecurity/test/test-cases/regression/action-msg.json",
+        "ModSecurity/test/test-cases/regression/action-setenv.json",
+        "ModSecurity/test/test-cases/regression/variable-TX.json",
+        "Coraza/internal/actions/logdata_test.go",
+        "Coraza/internal/actions/setvar_test.go",
+        "Coraza/internal/actions/capture_test.go"
+      ]
+    },
+    {
+      "name": "persistent-chain",
+      "file": "src/compatibility/fixtures/non-disruptive-actions/persistent-chain.conf",
+      "upstream": [
+        "ModSecurity/test/test-cases/regression/action-initcol.json",
+        "ModSecurity/test/test-cases/regression/action-expirevar.json",
+        "ModSecurity/test/test-cases/regression/action-setsid.json",
+        "ModSecurity/test/test-cases/regression/action-setuid.json",
+        "ModSecurity/test/test-cases/regression/action-setrsc.json",
+        "ModSecurity/test/test-cases/regression/issue-2423-msg-in-chain.json",
+        "Coraza/internal/actions/initcol_test.go",
+        "Coraza/internal/actions/chain_test.go",
+        "Coraza/testing/engine/setvar.go"
+      ]
+    }
+  ],
+  "qualification": {
+    "fixtureCount": 2,
+    "allocationFailureCoverage": true,
+    "deterministicFuzzIterations": 10000,
+    "deterministicFuzzSeed": 13907095936298285211,
+    "fuzzMaxInputBytes": 8192,
+    "fiveRootCorpusFiles": 58,
+    "fiveRootCorpusDirectives": 925,
+    "fiveRootCorpusRules": 761,
+    "unexplainedMismatches": 0
+  },
+  "releaseFastLocalBenchmark": {
+    "iterationsPerScenario": 5000,
+    "metadata": {
+      "actionsPerSecond": 632564,
+      "p50Nanoseconds": 750,
+      "p95Nanoseconds": 792,
+      "p99Nanoseconds": 959,
+      "allocationsPerApplication": 32,
+      "allocatedBytesPerApplication": 2613
+    },
+    "txScoring": {
+      "actionsPerSecond": 437050,
+      "p50Nanoseconds": 1333,
+      "p95Nanoseconds": 1666,
+      "p99Nanoseconds": 2417,
+      "allocationsPerApplication": 46,
+      "allocatedBytesPerApplication": 4820
+    },
+    "capture": {
+      "actionsPerSecond": 289050,
+      "p50Nanoseconds": 1334,
+      "p95Nanoseconds": 3000,
+      "p99Nanoseconds": 7208,
+      "allocationsPerApplication": 48,
+      "allocatedBytesPerApplication": 6259
+    },
+    "persistentStaging": {
+      "actionsPerSecond": 392636,
+      "p50Nanoseconds": 1375,
+      "p95Nanoseconds": 1875,
+      "p99Nanoseconds": 3167,
+      "allocationsPerApplication": 47,
+      "allocatedBytesPerApplication": 5608
+    }
+  },
+  "commands": {
+    "unit": "zig build test --summary all",
+    "corpus": "zig build test-plan-corpus -Dplan-corpus=<repeatable-path>",
+    "fuzz": "zig build fuzz-actions -Daction-fuzz-iterations=10000",
+    "benchmark": "zig build bench-actions -Doptimize=ReleaseFast"
+  }
+}
+

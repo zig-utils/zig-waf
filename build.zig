@@ -195,6 +195,23 @@ pub fn build(b: *std.Build) void {
     const directive_fuzz_step = b.step("fuzz-directives", "Run deterministic typed directive fuzz cases");
     directive_fuzz_step.dependOn(&run_directive_fuzz.step);
 
+    const action_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/action_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    action_fuzz_module.addImport("waf", waf);
+    const action_fuzz = b.addExecutable(.{
+        .name = "action-fuzz",
+        .root_module = action_fuzz_module,
+    });
+    const run_action_fuzz = b.addRunArtifact(action_fuzz);
+    const action_fuzz_iterations = b.option(usize, "action-fuzz-iterations", "Deterministic action runtime fuzz case count") orelse 10_000;
+    const action_fuzz_seed = b.option(u64, "action-fuzz-seed", "Deterministic action runtime fuzz seed") orelse 13_907_095_936_298_285_211;
+    run_action_fuzz.addArgs(&.{ b.fmt("{d}", .{action_fuzz_iterations}), b.fmt("{d}", .{action_fuzz_seed}) });
+    const action_fuzz_step = b.step("fuzz-actions", "Run deterministic non-disruptive action fuzz cases");
+    action_fuzz_step.dependOn(&run_action_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,
@@ -264,6 +281,20 @@ pub fn build(b: *std.Build) void {
     const run_persistence_benchmark = b.addRunArtifact(persistence_benchmark);
     const persistence_benchmark_step = b.step("bench-persistence", "Benchmark disabled and initialized persistent collection paths");
     persistence_benchmark_step.dependOn(&run_persistence_benchmark.step);
+
+    const action_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/actions.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    action_benchmark_module.addImport("waf", waf);
+    const action_benchmark = b.addExecutable(.{
+        .name = "action-benchmark",
+        .root_module = action_benchmark_module,
+    });
+    const run_action_benchmark = b.addRunArtifact(action_benchmark);
+    const action_benchmark_step = b.step("bench-actions", "Benchmark bounded non-disruptive action application");
+    action_benchmark_step.dependOn(&run_action_benchmark.step);
 
     const parser_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/parser.zig"),

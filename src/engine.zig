@@ -831,6 +831,13 @@ pub const Transaction = struct {
     /// Apply a fully matched chain as one ordered, atomic effect batch. The
     /// first entry must be the chain head and every compiled `chain_next`
     /// member must appear exactly once in order.
+    pub fn applyLocalMatchedChain(
+        self: *Transaction,
+        matches: []const MatchedRule,
+    ) TransactionError!LocalEffectOutcome {
+        return self.applyMatchedRules(matches, false);
+    }
+
     pub fn applyMatchedChain(
         self: *Transaction,
         matches: []const MatchedRule,
@@ -3112,6 +3119,49 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
     try std.testing.expect((try tx.collectionFirst(.env, "SHOULD_NOT_COMMIT")) == null);
     try std.testing.expectEqualStrings("0", tx.scalar_variables.get(.duration, .request_headers).?.value);
     try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+}
+
+test "matched-rule application preserves visible state across every allocation failure" {
+    const input =
+        \\SecRule ARGS @rx "id:77,msg:'score=%{TX.score}',tag:'allocation-%{TX.score}',capture,setvar:'tx.score=+1',setenv:'SCORE=%{TX.score}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "action-allocation.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator, retained_plan: *const compiled_plan.Plan) !void {
+            var builder = Builder.init(allocator);
+            builder.setRetainedPlan(retained_plan);
+            const waf = try builder.build();
+            defer waf.deinit() catch unreachable;
+            var tx = waf.newTransaction();
+            defer tx.deinit();
+            try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+            try tx.processUri("/", "POST", "HTTP/1.1");
+            try tx.processRequestHeaders();
+            const source: collections.Source = .{ .origin = .request_body, .offset = 0, .length = 5 };
+            try tx.setCollectionValue(.tx, "score", "4", source);
+            const captures = [_]?CaptureRange{.{ .start = 0, .end = 5 }};
+            const outcome = tx.applyLocalMatchedRule(@fromBackingInt(0), .{
+                .name = "ARGS:value",
+                .value = "value",
+                .source = source,
+                .captures = &captures,
+            }) catch |err| {
+                if (err == error.OutOfMemory) {
+                    try std.testing.expectEqualStrings("4", (try tx.collectionFirst(.tx, "score")).?.value);
+                    try std.testing.expect((try tx.collectionFirst(.env, "SCORE")) == null);
+                    try std.testing.expect((try tx.collectionFirst(.tx, "0")) == null);
+                    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+                }
+                return err;
+            };
+            try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "score")).?.value);
+            try std.testing.expectEqualStrings("value", tx.matchIntent(outcome.intent).?.matched_value);
+        }
+    }.run, .{plan});
 }
 
 test "matched-rule effects bind mutate expire and flush persistent namespaces" {
