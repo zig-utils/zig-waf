@@ -198,6 +198,7 @@ pub const DiagnosticCode = enum {
     unavailable_capability,
     invalid_argument_count,
     invalid_value,
+    resource_limit,
 
     pub fn id(self: DiagnosticCode) []const u8 {
         return switch (self) {
@@ -205,6 +206,7 @@ pub const DiagnosticCode = enum {
             .unavailable_capability => "WAF-DIRECTIVE-0102",
             .invalid_argument_count => "WAF-DIRECTIVE-0103",
             .invalid_value => "WAF-DIRECTIVE-0104",
+            .resource_limit => "WAF-DIRECTIVE-0105",
         };
     }
 
@@ -214,6 +216,7 @@ pub const DiagnosticCode = enum {
             .unavailable_capability => "directive requires a capability unavailable in this build",
             .invalid_argument_count => "directive argument count does not match its canonical schema",
             .invalid_value => "directive value does not match its canonical schema",
+            .resource_limit => "directive configuration exceeds a bounded resource limit",
         };
     }
 };
@@ -229,6 +232,30 @@ pub const Diagnostic = struct {
 pub const ValidationOutcome = union(enum) {
     valid,
     diagnostic: Diagnostic,
+};
+
+pub const ValidationLimits = struct {
+    max_directives: usize = 1_000_000,
+    max_arguments: usize = 4_000_000,
+    max_value_bytes: usize = 1024 * 1024,
+    max_total_value_bytes: usize = 256 * 1024 * 1024,
+    max_mime_types: usize = 4096,
+    max_remote_rules: usize = 256,
+    max_path_bytes: usize = 4096,
+    max_url_bytes: usize = 16 * 1024,
+    max_key_bytes: usize = 16 * 1024,
+
+    pub fn valid(self: ValidationLimits) bool {
+        return self.max_directives > 0 and
+            self.max_arguments > 0 and
+            self.max_value_bytes > 0 and
+            self.max_total_value_bytes >= self.max_value_bytes and
+            self.max_mime_types > 0 and
+            self.max_remote_rules > 0 and
+            self.max_path_bytes > 0 and
+            self.max_url_bytes > 0 and
+            self.max_key_bytes > 0;
+    }
 };
 
 pub const RuleEngine = enum { on, off, detection_only };
@@ -560,6 +587,23 @@ pub fn get(id: Id) *const Entry {
 /// Validate the complete immutable plan before it can be published by a WAF.
 /// Values remain borrowed from the plan; diagnostics never interpolate input.
 pub fn validatePlan(compiled: *const plan_mod.Plan, capabilities: CapabilitySet) ValidationOutcome {
+    return validatePlanWithLimits(compiled, capabilities, .{});
+}
+
+pub fn validatePlanWithLimits(
+    compiled: *const plan_mod.Plan,
+    capabilities: CapabilitySet,
+    limits: ValidationLimits,
+) ValidationOutcome {
+    const first_span = if (compiled.directives.len == 0)
+        seclang.source.Span{ .source = @fromBackingInt(0), .start = 0, .end = 0 }
+    else
+        compiled.directives[0].source;
+    if (!limits.valid() or compiled.directives.len > limits.max_directives or compiled.arguments.len > limits.max_arguments)
+        return diagnostic(.resource_limit, first_span, null, false);
+    var total_value_bytes: usize = 0;
+    var mime_types: usize = 0;
+    var remote_rules: usize = 0;
     for (compiled.directives) |directive| {
         switch (directive.kind) {
             .include, .include_optional => continue,
@@ -583,6 +627,30 @@ pub fn validatePlan(compiled: *const plan_mod.Plan, capabilities: CapabilitySet)
         if (!validValues(compiled, entry, arguments)) {
             const primary = if (arguments.len == 0) directive.source else arguments[0].source;
             return diagnostic(.invalid_value, primary, entry.id, entry.sensitive);
+        }
+        if (entry.id == .sec_response_body_mime_type) {
+            if (arguments.len > limits.max_mime_types -| mime_types)
+                return diagnostic(.resource_limit, directive.source, entry.id, false);
+            mime_types += arguments.len;
+        }
+        if (entry.id == .sec_remote_rules) {
+            if (remote_rules == limits.max_remote_rules)
+                return diagnostic(.resource_limit, directive.source, entry.id, true);
+            remote_rules += 1;
+        }
+        for (arguments, 0..) |argument, argument_index| {
+            const raw = compiled.string(argument.raw) orelse
+                return diagnostic(.invalid_value, argument.source, entry.id, entry.sensitive);
+            const value = argumentContent(raw, argument.quote);
+            if (value.len > limits.max_value_bytes or value.len > limits.max_total_value_bytes -| total_value_bytes)
+                return diagnostic(.resource_limit, argument.source, entry.id, entry.sensitive);
+            total_value_bytes += value.len;
+            if (entry.schema == .path and value.len > limits.max_path_bytes)
+                return diagnostic(.resource_limit, argument.source, entry.id, false);
+            if (entry.schema == .remote_rules and argument_index == 0 and value.len > limits.max_key_bytes)
+                return diagnostic(.resource_limit, argument.source, entry.id, true);
+            if (entry.schema == .remote_rules and argument_index == 1 and value.len > limits.max_url_bytes)
+                return diagnostic(.resource_limit, argument.source, entry.id, true);
         }
     }
     return .valid;
@@ -958,6 +1026,33 @@ test "strict enum arity debug and file mode validation rejects malformed input" 
             .diagnostic => {},
         }
     }
+}
+
+test "validation limits bound aggregate values MIME lists remote rules paths URLs and keys" {
+    const input =
+        \\SecResponseBodyMimeType text/plain text/html application/json
+        \\SecRemoteRules key https://rules.example.test/bundle
+        \\SecDataDir relative-data
+    ;
+    const compiled = try compileTestPlan(input);
+    defer compiled.deinit();
+    const cases = [_]ValidationLimits{
+        .{ .max_directives = 2 },
+        .{ .max_arguments = 5 },
+        .{ .max_value_bytes = 8, .max_total_value_bytes = 8 },
+        .{ .max_total_value_bytes = 20 },
+        .{ .max_mime_types = 2 },
+        .{ .max_remote_rules = 0 },
+        .{ .max_path_bytes = 4 },
+        .{ .max_url_bytes = 8 },
+        .{ .max_key_bytes = 2 },
+    };
+    for (cases) |limits| {
+        const failure = validatePlanWithLimits(compiled, .full(), limits).diagnostic;
+        try std.testing.expectEqual(DiagnosticCode.resource_limit, failure.code);
+        try std.testing.expectEqualStrings("WAF-DIRECTIVE-0105", failure.code.id());
+    }
+    try std.testing.expectEqual(ValidationOutcome.valid, validatePlanWithLimits(compiled, .full(), .{}));
 }
 
 test "typed configuration preserves order and exposes normalized effective values" {
