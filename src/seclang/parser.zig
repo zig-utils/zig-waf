@@ -485,3 +485,18 @@ test "owned byte APIs do not borrow caller buffers" {
     defer diagnosed.deinit();
     try std.testing.expectEqual(diagnostic.Code.missing_rule_operator, diagnosed.outcome.diagnostic.code);
 }
+
+test "owned parsing cleans every injected allocation failure" {
+    const input = "SecRule ARGS|!REQUEST_HEADERS:authorization \"@rx attack\" \"id:1,msg:'blocked',deny\"";
+    var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var baseline = try parseBytes(baseline_allocator.allocator(), "allocation.conf", input, .{}, .{});
+    baseline.deinit();
+    const allocation_count = baseline_allocator.alloc_index;
+    try std.testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..allocation_count) |failure_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = failure_index });
+        try std.testing.expectError(error.OutOfMemory, parseBytes(failing.allocator(), "allocation.conf", input, .{}, .{}));
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
