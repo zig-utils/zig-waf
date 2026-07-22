@@ -51,6 +51,13 @@ source order. It exposes:
 - deduplicated runtime macro programs for operator parameters and action
   values.
 
+`compileTree` performs textual source-graph traversal: every local include or
+accepted remote child is compiled immediately after its owning directive, then
+control returns to the parent. Remote source digests and redacted Warn outcomes
+are copied into the immutable component. This avoids the ordering ambiguity of
+concatenating whole parsed documents and permits defaults, updates, chains, and
+markers to cross source boundaries safely.
+
 Prefilters are rejection-only hints. `prefilterMayMatch` returning `true` still
 requires normal operator execution. Negated operators, dynamic macro-bearing
 parameters, quoted/escaped phrase lists, and non-literal regexes deliberately

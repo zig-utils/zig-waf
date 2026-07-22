@@ -24,9 +24,14 @@ rules. Warning values deliberately contain neither the authentication key nor
 response bytes. Allocation failures always propagate and are never converted
 to warnings.
 
+`seclang.assembly.assembleFile` resolves accepted bytes into a child source at
+the owning `SecRemoteRules` span. `plan.compileTree` walks local and remote
+children at their directive positions, so defaults, chains, updates, and
+markers see true textual order. The immutable plan retains remote source IDs,
+content digests, directive spans, and Warn records. Authentication and hashing
+keys use fixed redaction markers in structural fingerprints.
+
 The deterministic test transport proves the interface and hostile-response
 handling. WAF-42 owns the concrete HTTP implementation over `zig-tls`,
 including DNS resolution, ALPN, certificate validation, nonblocking I/O, and
-redirect connection enforcement. Final WAF-13 source assembly will parse an
-accepted `Source.bytes()` at the `SecRemoteRules` directive position before an
-immutable plan can be published.
+redirect connection enforcement.

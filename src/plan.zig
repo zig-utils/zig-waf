@@ -3,6 +3,7 @@
 const std = @import("std");
 const seclang = @import("seclang/root.zig");
 const rule_config = @import("rule_config.zig");
+const remote_rules = @import("remote_rules.zig");
 const regex = @import("regex");
 
 pub const StringId = enum(u32) { _ };
@@ -160,6 +161,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidTransformation,
     UnterminatedMacro,
     EmptyMacroExpression,
+    InvalidSourceTree,
 };
 
 pub const DiagnosticCode = enum {
@@ -388,6 +390,9 @@ pub const MissingRuleReference = struct {
     interval: rule_config.IdInterval,
 };
 
+pub const RemoteSource = seclang.include.RemoteSource;
+pub const RemoteWarning = seclang.include.RemoteWarning;
+
 const Component = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -412,6 +417,8 @@ const Component = struct {
     defaults: []const DefaultSnapshot,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
+    remote_sources: []const RemoteSource,
+    remote_warnings: []const RemoteWarning,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -455,6 +462,8 @@ pub const Plan = struct {
     defaults: []const DefaultSnapshot,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
+    remote_sources: []const RemoteSource,
+    remote_warnings: []const RemoteWarning,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
 
@@ -578,6 +587,57 @@ pub fn compile(
     limits: Limits,
 ) CompileError!*Plan {
     return compileDetailed(allocator, registry, documents, limits, null);
+}
+
+/// Compile an include/remote source tree in textual directive order. Child
+/// sources are visited immediately after their owning include/remote
+/// directive, rather than after the remainder of the parent document.
+pub fn compileTree(
+    allocator: std.mem.Allocator,
+    tree: *const seclang.include.Tree,
+    limits: Limits,
+) CompileError!*Plan {
+    try limits.validate();
+    if (tree.documents.items.len > limits.max_documents) return error.TooManyDocuments;
+    if (tree.registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
+    var compiler = Compiler.init(allocator, limits, null);
+    defer compiler.deinit();
+    var visited: std.AutoHashMapUnmanaged(seclang.source.SourceId, void) = .empty;
+    defer visited.deinit(allocator);
+    var roots: usize = 0;
+    for (tree.documents.items, 0..) |document, document_index| {
+        try validateDocument(&tree.registry, &document);
+        const record = tree.registry.get(document.source_id) orelse return error.InvalidSourceId;
+        if (record.included_from != null) continue;
+        roots += 1;
+        try compileTreeDocument(&compiler, tree, document_index, &visited);
+    }
+    if (roots == 0 or visited.count() != tree.documents.items.len) return error.InvalidSourceTree;
+    if (compiler.pending_chain) |pending|
+        return compiler.fail(error.DanglingChain, compiler.rules.items[@backingInt(pending)].source, null);
+    try compiler.remote_sources.appendSlice(allocator, tree.remote_sources.items);
+    try compiler.remote_warnings.appendSlice(allocator, tree.remote_warnings.items);
+    return compiler.finish(&tree.registry);
+}
+
+fn compileTreeDocument(
+    compiler: *Compiler,
+    tree: *const seclang.include.Tree,
+    document_index: usize,
+    visited: *std.AutoHashMapUnmanaged(seclang.source.SourceId, void),
+) CompileError!void {
+    const document = tree.documents.items[document_index];
+    if (visited.contains(document.source_id)) return;
+    try visited.put(compiler.allocator, document.source_id, {});
+    for (document.directives.items) |directive| {
+        try compiler.addDirective(directive);
+        for (tree.documents.items, 0..) |child, child_index| {
+            const record = tree.registry.get(child.source_id) orelse return error.InvalidSourceId;
+            const origin = record.included_from orelse continue;
+            if (origin.parent != document.source_id or !std.meta.eql(origin.directive, directive.physical)) continue;
+            try compileTreeDocument(compiler, tree, child_index, visited);
+        }
+    }
 }
 
 /// Compile transactionally, then reuse the prior immutable payload only when
@@ -709,6 +769,8 @@ const Compiler = struct {
     rule_action_updates: std.ArrayList(RuleActionUpdate) = .empty,
     rule_removals: std.ArrayList(RuleRemoval) = .empty,
     missing_rule_references: std.ArrayList(MissingRuleReference) = .empty,
+    remote_sources: std.ArrayList(RemoteSource) = .empty,
+    remote_warnings: std.ArrayList(RemoteWarning) = .empty,
     target_expansion: usize = 0,
     action_expansion: usize = 0,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
@@ -746,6 +808,8 @@ const Compiler = struct {
         self.rule_action_updates.deinit(self.allocator);
         self.rule_removals.deinit(self.allocator);
         self.missing_rule_references.deinit(self.allocator);
+        self.remote_sources.deinit(self.allocator);
+        self.remote_warnings.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
     }
@@ -1553,6 +1617,8 @@ const Compiler = struct {
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
         const missing_rule_references = try duplicateCounted(MissingRuleReference, arena_allocator, self.missing_rule_references.items, &owned_bytes, self.limits);
+        const remote_sources = try duplicateCounted(RemoteSource, arena_allocator, self.remote_sources.items, &owned_bytes, self.limits);
+        const remote_warnings = try duplicateCounted(RemoteWarning, arena_allocator, self.remote_warnings.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
             destination.* = try duplicateCounted(RuleId, arena_allocator, items.items, &owned_bytes, self.limits);
@@ -1581,6 +1647,8 @@ const Compiler = struct {
             .defaults = defaults,
             .rule_removals = rule_removals,
             .missing_rule_references = missing_rule_references,
+            .remote_sources = remote_sources,
+            .remote_warnings = remote_warnings,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
         };
@@ -1614,6 +1682,8 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.defaults = component.defaults;
     plan.rule_removals = component.rule_removals;
     plan.missing_rule_references = component.missing_rule_references;
+    plan.remote_sources = component.remote_sources;
+    plan.remote_warnings = component.remote_warnings;
     plan.phase_rules = component.phase_rules;
     plan.owned_bytes = component.owned_bytes;
 }
@@ -1641,7 +1711,9 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
         !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals) or
-        !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references))
+        !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references) or
+        !slicesEqual(RemoteSource, first.remote_sources, second.remote_sources) or
+        !slicesEqual(RemoteWarning, first.remote_warnings, second.remote_warnings))
     {
         return false;
     }
@@ -1671,9 +1743,17 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashOptionalId(&hasher, directive.rule);
     }
     hashU32(&hasher, @intCast(plan.arguments.len));
-    for (plan.arguments) |argument| {
-        hashString(&hasher, plan.string(argument.raw).?);
-        hashU8(&hasher, @intCast(@backingInt(argument.quote)));
+    for (plan.directives) |directive| {
+        const name = plan.string(directive.name).?;
+        const arguments = plan.arguments[directive.arguments_start..][0..directive.arguments_count];
+        for (arguments, 0..) |argument, argument_offset| {
+            if (sensitiveDirectiveArgument(name, argument_offset)) {
+                hashString(&hasher, "<redacted>");
+            } else {
+                hashString(&hasher, plan.string(argument.raw).?);
+            }
+            hashU8(&hasher, @intCast(@backingInt(argument.quote)));
+        }
     }
     hashU32(&hasher, @intCast(plan.targets.len));
     for (plan.targets) |target| {
@@ -1744,6 +1824,18 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashU64(&hasher, reference.interval.first);
         hashU64(&hasher, reference.interval.last);
     }
+    hashU32(&hasher, @intCast(plan.remote_sources.len));
+    for (plan.remote_sources) |remote_source| {
+        hashU32(&hasher, @backingInt(remote_source.source_id));
+        hasher.update(&remote_source.content_digest);
+    }
+    hashU32(&hasher, @intCast(plan.remote_warnings.len));
+    for (plan.remote_warnings) |warning| {
+        hashU32(&hasher, @intCast(@backingInt(warning.code)));
+        hashU32(&hasher, @backingInt(warning.directive.source));
+        hashU32(&hasher, warning.directive.start);
+        hashU32(&hasher, warning.directive.end);
+    }
     hashU32(&hasher, @intCast(plan.markers.len));
     for (plan.markers) |marker| {
         hashU32(&hasher, @backingInt(marker.directive));
@@ -1777,6 +1869,11 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     var result: Fingerprint = undefined;
     hasher.final(&result);
     return result;
+}
+
+fn sensitiveDirectiveArgument(name: []const u8, argument_offset: usize) bool {
+    if (std.ascii.eqlIgnoreCase(name, "SecRemoteRules")) return argument_offset == 0;
+    return std.ascii.eqlIgnoreCase(name, "SecHttpBlKey") or std.ascii.eqlIgnoreCase(name, "SecHashKey");
 }
 
 fn hashString(hasher: *std.crypto.hash.Blake3, value: []const u8) void {
@@ -2150,6 +2247,91 @@ test "compiled plan owns compact strings rules and source locations" {
     const location = try compiled.sourceLocation(compiled.directives[1].source.source, compiled.directives[1].source.start);
     try std.testing.expectEqual(@as(u32, 2), location.line);
     try std.testing.expectEqual(@as(usize, 1), compiled.phaseRules(2).len);
+}
+
+test "source tree compilation inserts children at directive positions" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.conf",
+        .data = "SecAction \"id:1,pass\"\nInclude child.conf\nSecAction \"id:3,pass\"",
+    });
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "child.conf",
+        .data = "SecAction \"id:2,pass\"",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPathFile(std.testing.io, "main.conf", &path_buffer);
+    var tree = try seclang.include.parseFile(std.testing.allocator, std.testing.io, path_buffer[0..path_length], .{});
+    defer tree.deinit();
+    const compiled = try compileTree(std.testing.allocator, &tree, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), compiled.directives.len);
+    const expected = [_][]const u8{ "SecAction", "Include", "SecAction", "SecAction" };
+    for (compiled.directives, expected) |directive, name|
+        try std.testing.expectEqualStrings(name, compiled.string(directive.name).?);
+    const expected_ids = [_][]const u8{ "id:1,pass", "id:2,pass", "id:3,pass" };
+    for ([_]usize{ 0, 2, 3 }, expected_ids) |directive_index, actions|
+        try std.testing.expectEqualStrings(actions, unquote(compiled.string(compiled.arguments[compiled.directives[directive_index].arguments_start].raw).?));
+}
+
+const PlanRemoteFetcher = struct {
+    fn fetch(_: *anyopaque, allocator: std.mem.Allocator, request: remote_rules.Request) remote_rules.FetchError!remote_rules.Response {
+        if (!request.destination_policy.authorize(request.url, "203.0.113.30")) return error.PolicyRejected;
+        const addresses = try allocator.alloc([]u8, 1);
+        errdefer allocator.free(addresses);
+        addresses[0] = try allocator.dupe(u8, "203.0.113.30");
+        errdefer allocator.free(addresses[0]);
+        const final_url = try allocator.dupe(u8, request.url);
+        errdefer allocator.free(final_url);
+        const body = try allocator.dupe(u8, "SecAction \"id:2,pass\"");
+        return .{
+            .allocator = allocator,
+            .status = 200,
+            .final_url = final_url,
+            .body = body,
+            .redirects = 0,
+            .connected_addresses = addresses,
+        };
+    }
+
+    fn authorize(_: *anyopaque, _: []const u8, _: ?[]const u8) bool {
+        return true;
+    }
+};
+
+test "remote source assembly compiles inline and retains immutable evidence" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    try temporary.dir.writeFile(std.testing.io, .{
+        .sub_path = "main.conf",
+        .data = "SecAction \"id:1,pass\"\nSecRemoteRules key https://rules.example.test/bundle\nSecAction \"id:3,pass\"",
+    });
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const path_length = try temporary.dir.realPathFile(std.testing.io, "main.conf", &path_buffer);
+    var fetcher_byte: u8 = 0;
+    var policy_byte: u8 = 0;
+    var tree = try seclang.assembly.assembleFile(
+        std.testing.allocator,
+        std.testing.io,
+        path_buffer[0..path_length],
+        .{},
+        .{ .context = &fetcher_byte, .fetchFn = PlanRemoteFetcher.fetch },
+        .{ .context = &policy_byte, .authorizeFn = PlanRemoteFetcher.authorize },
+        .{},
+    );
+    defer tree.deinit();
+    const compiled = try compileTree(std.testing.allocator, &tree, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), compiled.directives.len);
+    const expected = [_][]const u8{ "SecAction", "SecRemoteRules", "SecAction", "SecAction" };
+    for (compiled.directives, expected) |directive, name|
+        try std.testing.expectEqualStrings(name, compiled.string(directive.name).?);
+    try std.testing.expectEqual(@as(usize, 1), compiled.remote_sources.len);
+    try std.testing.expectEqual(@as(usize, 0), compiled.remote_warnings.len);
+    try std.testing.expectEqual(tree.remote_sources.items[0].content_digest, compiled.remote_sources[0].content_digest);
 }
 
 test "compiled plan interns repeated strings and enforces limits" {
@@ -2770,6 +2952,30 @@ test "fingerprints are deterministic semantic identities independent of paths" {
     try std.testing.expectEqualSlices(u8, &first_plan.fingerprint, &second_plan.fingerprint);
     try std.testing.expect(!std.mem.eql(u8, &first_plan.fingerprint, &changed_plan.fingerprint));
     try std.testing.expect(!std.mem.allEqual(u8, &first_plan.fingerprint, 0));
+}
+
+test "structural fingerprints redact authentication and hashing secrets" {
+    const first_input =
+        \\SecRemoteRules first-secret https://rules.example.test/bundle
+        \\SecHttpBlKey blocklist-secret-a
+        \\SecHashKey hash-secret-a KeyOnly
+    ;
+    const second_input =
+        \\SecRemoteRules second-secret https://rules.example.test/bundle
+        \\SecHttpBlKey blocklist-secret-b
+        \\SecHashKey hash-secret-b KeyOnly
+    ;
+    var first_parsed = try seclang.parser.parseBytes(std.testing.allocator, "first-secret.conf", first_input, .{}, .{});
+    defer first_parsed.deinit();
+    var second_parsed = try seclang.parser.parseBytes(std.testing.allocator, "second-secret.conf", second_input, .{}, .{});
+    defer second_parsed.deinit();
+    var first_documents = [_]seclang.parser.Document{first_parsed.document};
+    var second_documents = [_]seclang.parser.Document{second_parsed.document};
+    const first = try compile(std.testing.allocator, &first_parsed.registry, &first_documents, .{});
+    defer first.deinit();
+    const second = try compile(std.testing.allocator, &second_parsed.registry, &second_documents, .{});
+    defer second.deinit();
+    try std.testing.expectEqualSlices(u8, &first.fingerprint, &second.fingerprint);
 }
 
 test "equivalent generations share immutable payloads in either destruction order" {

@@ -44,13 +44,28 @@ pub const Tree = struct {
     allocator: std.mem.Allocator,
     registry: source.Registry,
     documents: std.ArrayList(parser.Document) = .empty,
+    remote_sources: std.ArrayList(RemoteSource) = .empty,
+    remote_warnings: std.ArrayList(RemoteWarning) = .empty,
 
     pub fn deinit(self: *Tree) void {
         for (self.documents.items) |*document| document.deinit();
         self.documents.deinit(self.allocator);
+        self.remote_sources.deinit(self.allocator);
+        self.remote_warnings.deinit(self.allocator);
         self.registry.deinit();
         self.* = undefined;
     }
+};
+
+pub const RemoteSource = struct {
+    source_id: source.SourceId,
+    directive: source.Span,
+    content_digest: [32]u8,
+};
+
+pub const RemoteWarning = struct {
+    directive: source.Span,
+    code: @import("../remote_rules.zig").WarningCode,
 };
 
 pub fn parseTree(
