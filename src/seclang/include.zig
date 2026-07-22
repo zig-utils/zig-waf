@@ -85,6 +85,18 @@ pub fn parseTree(
     return tree;
 }
 
+pub fn parseFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    options: Options,
+) !Tree {
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
+    defer allocator.free(canonical);
+    const parent = std.fs.path.dirname(canonical) orelse return error.IncludeNotFound;
+    return parseTree(allocator, io, parent, std.fs.path.basename(canonical), options);
+}
+
 const Context = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -413,4 +425,17 @@ test "glob matcher handles bounded wildcards classes and separators" {
     try std.testing.expect(globMatches("/root/rules/rule-9[0-9]?.conf", "/root/rules/rule-942.conf"));
     try std.testing.expect(!globMatches("/root/rules/*.conf", "/root/rules/nested/a.conf"));
     try std.testing.expectError(error.InvalidIncludePattern, validateGlob("rules/[abc.conf"));
+}
+
+test "file convenience API resolves includes relative to the entry" {
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "config/nested");
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "config/main.conf", .data = "Include nested/rule.conf" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "config/nested/rule.conf", .data = "SecAction pass" });
+    var entry_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const entry_length = try temporary.dir.realPathFile(std.testing.io, "config/main.conf", &entry_buffer);
+    var tree = try parseFile(std.testing.allocator, std.testing.io, entry_buffer[0..entry_length], .{});
+    defer tree.deinit();
+    try std.testing.expectEqual(@as(usize, 2), tree.documents.items.len);
 }

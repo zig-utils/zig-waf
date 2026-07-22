@@ -100,6 +100,28 @@ pub const Outcome = union(enum) {
     }
 };
 
+pub const OwnedDocument = struct {
+    registry: source.Registry,
+    document: Document,
+
+    pub fn deinit(self: *OwnedDocument) void {
+        self.document.deinit();
+        self.registry.deinit();
+        self.* = undefined;
+    }
+};
+
+pub const OwnedOutcome = struct {
+    registry: source.Registry,
+    outcome: Outcome,
+
+    pub fn deinit(self: *OwnedOutcome) void {
+        self.outcome.deinit();
+        self.registry.deinit();
+        self.* = undefined;
+    }
+};
+
 const Failure = struct {
     cause: anyerror,
     primary: source.Span,
@@ -130,6 +152,36 @@ pub fn parseSource(
     limits: Limits,
 ) ParseError!Document {
     return parseSourceDetailed(allocator, registry, source_id, limits, null);
+}
+
+pub fn parseBytes(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+    source_limits: source.Limits,
+    parser_limits: Limits,
+) (source.RegistryError || ParseError || error{InvalidSourceLimit})!OwnedDocument {
+    var registry = try source.Registry.init(allocator, source_limits);
+    errdefer registry.deinit();
+    const source_id = try registry.add(path, bytes, null);
+    var document = try parseSource(allocator, &registry, source_id, parser_limits);
+    errdefer document.deinit();
+    return .{ .registry = registry, .document = document };
+}
+
+pub fn parseBytesOutcome(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    bytes: []const u8,
+    source_limits: source.Limits,
+    parser_limits: Limits,
+) (source.RegistryError || std.mem.Allocator.Error || error{InvalidSourceLimit})!OwnedOutcome {
+    var registry = try source.Registry.init(allocator, source_limits);
+    errdefer registry.deinit();
+    const source_id = try registry.add(path, bytes, null);
+    var outcome = try parseSourceOutcome(allocator, &registry, source_id, parser_limits);
+    errdefer outcome.deinit();
+    return .{ .registry = registry, .outcome = outcome };
 }
 
 pub fn parseSourceOutcome(
@@ -419,4 +471,17 @@ test "diagnosed parsing reports first middle and final source locations" {
     const final_location = try registry.location(final, final_outcome.diagnostic.primary.start);
     try std.testing.expectEqual(@as(u32, 2), final_location.line);
     try std.testing.expectEqual(@as(u32, 13), final_location.column);
+}
+
+test "owned byte APIs do not borrow caller buffers" {
+    var bytes = [_]u8{ 'S', 'e', 'c', 'A', 'c', 't', 'i', 'o', 'n', ' ', 'p', 'a', 's', 's' };
+    var owned = try parseBytes(std.testing.allocator, "memory.conf", &bytes, .{}, .{});
+    defer owned.deinit();
+    bytes[0] = 'X';
+    try std.testing.expectEqualStrings("SecAction", owned.document.directives.items[0].name);
+    try std.testing.expectEqualStrings("SecAction pass", owned.registry.get(owned.document.source_id).?.bytes);
+
+    var diagnosed = try parseBytesOutcome(std.testing.allocator, "bad.conf", "SecRule ARGS", .{}, .{});
+    defer diagnosed.deinit();
+    try std.testing.expectEqual(diagnostic.Code.missing_rule_operator, diagnosed.outcome.diagnostic.code);
 }
