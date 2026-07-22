@@ -125,6 +125,7 @@ pub const Intervention = struct {
     action: Action,
     status: u16,
     rule_id: ?u32 = null,
+    destination: ?[]const u8 = null,
     enforced: bool,
 
     pub const Action = enum(u8) {
@@ -132,6 +133,7 @@ pub const Intervention = struct {
         redirect,
         drop,
         pause,
+        proxy,
     };
 };
 
@@ -525,6 +527,14 @@ pub const MatchIntent = struct {
     effects_applied: usize,
     captures_written: usize,
     pending_persistent_effects: usize,
+    disruptive: compiled_plan.DisruptiveKind,
+    disruptive_status: u16,
+    disruptive_destination: ?[]const u8,
+    allow_scope: action_config.AllowScope,
+    decision_enforced: bool,
+    skip: u32,
+    skip_after_action: ?u32,
+    multi_match: bool,
 };
 
 pub const LocalEffectOutcome = struct {
@@ -535,6 +545,19 @@ pub const LocalEffectOutcome = struct {
     log: bool,
     audit_log: bool,
     pending_persistent_effects: usize,
+    disruptive: compiled_plan.DisruptiveKind,
+    disruptive_status: u16,
+    allow_scope: action_config.AllowScope,
+    decision_enforced: bool,
+    skip: u32,
+    skip_after_action: ?u32,
+    multi_match: bool,
+};
+
+pub const FlowState = struct {
+    skip: u32 = 0,
+    skip_after_action: ?u32 = null,
+    allow_scope: ?action_config.AllowScope = null,
 };
 
 pub const PersistentFailure = enum {
@@ -687,6 +710,18 @@ fn deinitMatchIntent(allocator: std.mem.Allocator, intent: *MatchIntent) void {
     allocator.free(intent.tags);
     allocator.free(intent.matched_name);
     allocator.free(intent.matched_value);
+    if (intent.disruptive_destination) |value| allocator.free(value);
+}
+
+fn effectiveDisruptiveStatus(decision: compiled_plan.DisruptiveDecision) u16 {
+    return switch (decision.kind) {
+        .redirect => switch (decision.status) {
+            301, 302, 303, 307 => decision.status,
+            else => 302,
+        },
+        .proxy => if (decision.status_explicit) decision.status else 200,
+        else => decision.status,
+    };
 }
 
 /// Isolated per-request mutable state.
@@ -711,6 +746,7 @@ pub const Transaction = struct {
     persistent_failed_open: u8 = 0,
     match_intents: std.ArrayList(MatchIntent) = .empty,
     match_intent_bytes: usize = 0,
+    flow_state: FlowState = .{},
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -869,6 +905,12 @@ pub const Transaction = struct {
         const selected = plan.rules[rule_index];
         const head_index: usize = @backingInt(selected.chain_head);
         const head = plan.rules[head_index];
+        const has_enforced_intervention = self.waf.config.mode == .enabled and switch (head.disruptive.kind) {
+            .deny, .drop, .proxy, .redirect => true,
+            .pass, .allow => false,
+        };
+        if (has_enforced_intervention and self.pending_intervention != null)
+            return error.InterventionAlreadyRecorded;
 
         var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
         defer batch.deinit();
@@ -894,6 +936,13 @@ pub const Transaction = struct {
             .log = false,
             .audit_log = false,
             .pending_persistent_effects = 0,
+            .disruptive = head.disruptive.kind,
+            .disruptive_status = effectiveDisruptiveStatus(head.disruptive),
+            .allow_scope = head.disruptive.allow_scope,
+            .decision_enforced = self.waf.config.mode == .enabled,
+            .skip = head.flow.skip,
+            .skip_after_action = head.flow.skip_after_action,
+            .multi_match = head.flow.multi_match,
         };
         const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
         for (matches) |matched| {
@@ -1099,7 +1148,39 @@ pub const Transaction = struct {
         self.match_intents.appendAssumeCapacity(prepared_intent.value);
         self.match_intent_bytes += prepared_intent.owned_bytes;
         intent_committed = true;
+        const committed_intent = &self.match_intents.items[self.match_intents.items.len - 1];
+        self.commitDecision(head, committed_intent);
         return result;
+    }
+
+    fn commitDecision(self: *Transaction, head: compiled_plan.Rule, intent: *const MatchIntent) void {
+        self.flow_state.skip = if (head.flow.skip_after_action == null) head.flow.skip else 0;
+        self.flow_state.skip_after_action = head.flow.skip_after_action;
+        if (head.disruptive.kind == .allow) {
+            if (self.waf.config.mode == .enabled) {
+                self.flow_state.allow_scope = head.disruptive.allow_scope;
+                self.phase_interrupted = true;
+            }
+            return;
+        }
+        const action: Intervention.Action = switch (head.disruptive.kind) {
+            .deny => .deny,
+            .drop => .drop,
+            .redirect => .redirect,
+            .proxy => .proxy,
+            .pass, .allow => return,
+        };
+        if (self.pending_intervention == null) self.pending_intervention = .{
+            .action = action,
+            .status = intent.disruptive_status,
+            .rule_id = if (head.external_id) |value| if (value <= std.math.maxInt(u32)) @intCast(value) else null else null,
+            .destination = intent.disruptive_destination,
+            .enforced = self.waf.config.mode == .enabled,
+        };
+        if (self.waf.config.mode == .enabled) {
+            self.phase_interrupted = true;
+            self.transaction_terminated = action == .drop;
+        }
     }
 
     pub fn processConnection(
@@ -1620,6 +1701,10 @@ pub const Transaction = struct {
         return self.match_intents.items[index];
     }
 
+    pub fn flowState(self: *const Transaction) FlowState {
+        return self.flow_state;
+    }
+
     pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         return try self.collection_variables.remove(name, selector);
@@ -1885,6 +1970,16 @@ pub const Transaction = struct {
             if (value.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
             owned_bytes += value.len;
         }
+        const disruptive_destination = if (head.disruptive.destination) |text|
+            try self.expandEffectTextStaged(text, batch, scalar_batch, plan)
+        else
+            null;
+        errdefer if (disruptive_destination) |value| self.waf.allocator.free(value);
+        if (disruptive_destination) |value| {
+            if (value.len == 0) return error.InvalidActionValue;
+            if (value.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+            owned_bytes += value.len;
+        }
 
         const tags = try self.waf.allocator.alloc([]const u8, metadata.tags_count);
         var initialized_tags: usize = 0;
@@ -1929,6 +2024,14 @@ pub const Transaction = struct {
                 .effects_applied = outcome.effects_applied,
                 .captures_written = outcome.captures_written,
                 .pending_persistent_effects = outcome.pending_persistent_effects,
+                .disruptive = outcome.disruptive,
+                .disruptive_status = outcome.disruptive_status,
+                .disruptive_destination = disruptive_destination,
+                .allow_scope = outcome.allow_scope,
+                .decision_enforced = outcome.decision_enforced,
+                .skip = outcome.skip,
+                .skip_after_action = outcome.skip_after_action,
+                .multi_match = outcome.multi_match,
             },
         };
     }
@@ -3212,6 +3315,75 @@ test "matched-rule effects bind mutate expire and flush persistent namespaces" {
     var ip_at_expiry = try memory.backend().load(std.testing.allocator, .ip, "192.0.2.20", 65 * std.time.ns_per_s, .{});
     defer ip_at_expiry.deinit();
     try std.testing.expectEqual(@as(usize, 0), ip_at_expiry.values.items.len);
+}
+
+test "matched decisions commit owned intervention and flow evidence atomically" {
+    const input =
+        \\SecRule ARGS @rx "id:10,setvar:'tx.path=blocked',redirect:'https://example.test/%{TX.path}',status:418"
+        \\SecRule ARGS @rx "id:11,allow:request,skip:2"
+        \\SecRule ARGS @rx "id:12,setvar:'tx.second=1',drop"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "runtime-decisions.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    };
+
+    var redirect_tx = waf.newTransaction();
+    defer redirect_tx.deinit();
+    try redirect_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try redirect_tx.processUri("/", "GET", "HTTP/1.1");
+    try redirect_tx.processRequestHeaders();
+    const redirect_outcome = try redirect_tx.applyMatchedRule(@fromBackingInt(0), context);
+    try std.testing.expectEqual(compiled_plan.DisruptiveKind.redirect, redirect_outcome.disruptive);
+    try std.testing.expectEqual(@as(u16, 302), redirect_outcome.disruptive_status);
+    const intervention = (try redirect_tx.intervention()).?;
+    try std.testing.expectEqual(Intervention.Action.redirect, intervention.action);
+    try std.testing.expectEqualStrings("https://example.test/blocked", intervention.destination.?);
+    try std.testing.expect(intervention.enforced);
+    try std.testing.expect(redirect_tx.isPhaseInterrupted());
+    const intent = redirect_tx.matchIntent(redirect_outcome.intent).?;
+    try std.testing.expectEqualStrings(intervention.destination.?, intent.disruptive_destination.?);
+    try std.testing.expectError(error.InterventionAlreadyRecorded, redirect_tx.applyMatchedRule(@fromBackingInt(2), context));
+    try std.testing.expect((try redirect_tx.collectionFirst(.tx, "second")) == null);
+    try std.testing.expectEqual(@as(usize, 1), redirect_tx.matchIntentCount());
+
+    var allow_tx = waf.newTransaction();
+    defer allow_tx.deinit();
+    try allow_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try allow_tx.processUri("/", "GET", "HTTP/1.1");
+    try allow_tx.processRequestHeaders();
+    _ = try allow_tx.applyMatchedRule(@fromBackingInt(1), context);
+    try std.testing.expectEqual(action_config.AllowScope.request, allow_tx.flowState().allow_scope.?);
+    try std.testing.expectEqual(@as(u32, 2), allow_tx.flowState().skip);
+    try std.testing.expect(allow_tx.isPhaseInterrupted());
+
+    var detection_builder = Builder.init(std.testing.allocator);
+    detection_builder.setRetainedPlan(plan);
+    detection_builder.setMode(.detection_only);
+    const detection_waf = try detection_builder.build();
+    defer detection_waf.deinit() catch unreachable;
+    var detection_tx = detection_waf.newTransaction();
+    defer detection_tx.deinit();
+    try detection_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try detection_tx.processUri("/", "GET", "HTTP/1.1");
+    try detection_tx.processRequestHeaders();
+    _ = try detection_tx.applyMatchedRule(@fromBackingInt(0), context);
+    _ = try detection_tx.applyMatchedRule(@fromBackingInt(2), context);
+    try std.testing.expect(!(try detection_tx.intervention()).?.enforced);
+    try std.testing.expect(!detection_tx.isPhaseInterrupted());
+    try std.testing.expect(!detection_tx.isTerminated());
+    try std.testing.expectEqual(@as(usize, 2), detection_tx.matchIntentCount());
+    try std.testing.expectEqualStrings("1", (try detection_tx.collectionFirst(.tx, "second")).?.value);
 }
 
 test "failed combined effect preflight rolls back persistent session state" {
