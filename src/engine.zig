@@ -3687,7 +3687,7 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
 
 test "matched-rule application preserves visible state across every allocation failure" {
     const input =
-        \\SecRule ARGS @rx "id:77,msg:'score=%{TX.score}',tag:'allocation-%{TX.score}',tag:'allocation-target',capture,setvar:'tx.score=+1',setenv:'SCORE=%{TX.score}',ctl:ruleRemoveById=77,ctl:ruleRemoveTargetByTag=allocation-target;ARGS:secret,ctl:ruleRemoveTargetById=77;ARGS:/^sec/"
+        \\SecRule ARGS @rx "id:77,msg:'score=%{TX.score}',tag:'allocation-%{TX.score}',tag:'allocation-target',capture,setvar:'tx.score=+1',setenv:'SCORE=%{TX.score}',ctl:ruleRemoveById=77,ctl:ruleRemoveTargetByTag=allocation-target;ARGS:secret"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "action-allocation.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -3730,6 +3730,77 @@ test "matched-rule application preserves visible state across every allocation f
             try std.testing.expect(try tx.targetExcluded(@fromBackingInt(0), "ARGS:secret"));
         }
     }.run, .{plan});
+}
+
+test "regex target staging releases every induced allocation failure" {
+    const input =
+        \\SecRule ARGS @rx "id:77,setvar:'tx.score=+1',ctl:ruleRemoveTargetById=77;ARGS:/^sec/"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "regex-target-allocation.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+
+    var application_failures: usize = 0;
+    var consecutive_complete_runs: usize = 0;
+    var fail_index: usize = 0;
+    while (fail_index < 256 and consecutive_complete_runs < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var apply_attempted = false;
+        var apply_completed = false;
+        const result = struct {
+            fn run(
+                allocator: std.mem.Allocator,
+                retained_plan: *const compiled_plan.Plan,
+                attempted: *bool,
+                completed: *bool,
+            ) !void {
+                var builder = Builder.init(allocator);
+                builder.setRetainedPlan(retained_plan);
+                const waf = try builder.build();
+                defer waf.deinit() catch unreachable;
+                var tx = waf.newTransaction();
+                defer tx.deinit();
+                try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+                try tx.processUri("/", "POST", "HTTP/1.1");
+                try tx.processRequestHeaders();
+                const source: collections.Source = .{ .origin = .request_body, .offset = 0, .length = 5 };
+                try tx.setCollectionValue(.tx, "score", "4", source);
+                attempted.* = true;
+                _ = tx.applyLocalMatchedRule(@fromBackingInt(0), .{
+                    .name = "ARGS:value",
+                    .value = "value",
+                    .source = source,
+                }) catch |err| {
+                    if (err == error.OutOfMemory) {
+                        try std.testing.expectEqualStrings("4", (try tx.collectionFirst(.tx, "score")).?.value);
+                        try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+                        try std.testing.expectEqual(@as(usize, 0), tx.regex_target_exclusions.items.len);
+                    }
+                    return err;
+                };
+                completed.* = true;
+                try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "score")).?.value);
+                try std.testing.expectEqual(@as(usize, 1), tx.regex_target_exclusions.items.len);
+            }
+        }.run(failing.allocator(), plan, &apply_attempted, &apply_completed);
+
+        if (result) |_| {
+            if (failing.has_induced_failure) return error.SwallowedOutOfMemoryError;
+            consecutive_complete_runs += 1;
+        } else |err| switch (err) {
+            error.OutOfMemory => {
+                try std.testing.expect(failing.has_induced_failure);
+                consecutive_complete_runs = 0;
+                if (apply_attempted and !apply_completed) application_failures += 1;
+            },
+            else => return err,
+        }
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+    try std.testing.expect(application_failures != 0);
+    try std.testing.expect(consecutive_complete_runs == 8);
 }
 
 test "matched-rule effects bind mutate expire and flush persistent namespaces" {
