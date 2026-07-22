@@ -2,7 +2,9 @@
 
 const std = @import("std");
 
-pub const inline_value_capacity = 256;
+/// Common scalar values stay allocation-free without multiplying a large
+/// buffer by every entry in the stable registry.
+pub const inline_value_capacity = 64;
 
 pub const Name = enum {
     args_combined_size,
@@ -463,7 +465,7 @@ test "scalar store bounds individual and aggregate values" {
 
 test "stable scalar union round trips without duplicate SecLang names" {
     const names = std.meta.tags(Name);
-    try std.testing.expectEqual(@as(usize, 81), names.len);
+    try std.testing.expectEqual(@as(usize, 77), names.len);
     for (names, 0..) |name, index| {
         try std.testing.expectEqual(name, Name.parse(name.secLangName()).?);
         const lowercase = try std.ascii.allocLowerString(std.testing.allocator, name.secLangName());

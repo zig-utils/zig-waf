@@ -99,4 +99,18 @@ pub fn build(b: *std.Build) void {
     const run_lifecycle_benchmark = b.addRunArtifact(lifecycle_benchmark);
     const lifecycle_benchmark_step = b.step("bench-lifecycle", "Benchmark the complete connector lifecycle");
     lifecycle_benchmark_step.dependOn(&run_lifecycle_benchmark.step);
+
+    const scalar_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/scalars.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scalar_benchmark_module.addImport("waf", waf);
+    const scalar_benchmark = b.addExecutable(.{
+        .name = "scalar-benchmark",
+        .root_module = scalar_benchmark_module,
+    });
+    const run_scalar_benchmark = b.addRunArtifact(scalar_benchmark);
+    const scalar_benchmark_step = b.step("bench-scalars", "Benchmark populated scalar transaction state");
+    scalar_benchmark_step.dependOn(&run_scalar_benchmark.step);
 }
