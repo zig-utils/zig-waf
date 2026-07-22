@@ -126,6 +126,11 @@ jobs:
         run: >-
           zig build bench-plan -Doptimize=ReleaseFast
           -Dplan-benchmark=../owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
+      - name: CRS directive validation benchmark
+        working-directory: zig-waf
+        run: >-
+          zig build bench-directives -Doptimize=ReleaseFast
+          -Ddirective-benchmark=../owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
       - name: Deterministic parser fuzzing
         working-directory: zig-waf
         run: zig build fuzz-parser -Dparser-fuzz-iterations=10000

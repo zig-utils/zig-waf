@@ -280,4 +280,20 @@ pub fn build(b: *std.Build) void {
         run_plan_benchmark.addArg(benchmark_path);
     const plan_benchmark_step = b.step("bench-plan", "Benchmark structural plan compilation, traversal, reuse, and publication");
     plan_benchmark_step.dependOn(&run_plan_benchmark.step);
+
+    const directive_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/directives.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    directive_benchmark_module.addImport("waf", waf);
+    const directive_benchmark = b.addExecutable(.{
+        .name = "directive-benchmark",
+        .root_module = directive_benchmark_module,
+    });
+    const run_directive_benchmark = b.addRunArtifact(directive_benchmark);
+    if (b.option([]const u8, "directive-benchmark", "Optional SecLang file for the directive benchmark")) |benchmark_path|
+        run_directive_benchmark.addArg(benchmark_path);
+    const directive_benchmark_step = b.step("bench-directives", "Benchmark validation and typed configuration throughput");
+    directive_benchmark_step.dependOn(&run_directive_benchmark.step);
 }
