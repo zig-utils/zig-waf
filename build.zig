@@ -128,6 +128,23 @@ pub fn build(b: *std.Build) void {
     const parser_fuzz_step = b.step("fuzz-parser", "Run deterministic SecLang parser fuzz cases");
     parser_fuzz_step.dependOn(&run_parser_fuzz.step);
 
+    const plan_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/plan_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    plan_fuzz_module.addImport("waf", waf);
+    const plan_fuzz = b.addExecutable(.{
+        .name = "plan-fuzz",
+        .root_module = plan_fuzz_module,
+    });
+    const run_plan_fuzz = b.addRunArtifact(plan_fuzz);
+    const plan_fuzz_iterations = b.option(usize, "plan-fuzz-iterations", "Deterministic plan fuzz case count") orelse 10_000;
+    const plan_fuzz_seed = b.option(u64, "plan-fuzz-seed", "Deterministic plan fuzz seed") orelse 11_936_128_518_282_651_045;
+    run_plan_fuzz.addArgs(&.{ b.fmt("{d}", .{plan_fuzz_iterations}), b.fmt("{d}", .{plan_fuzz_seed}) });
+    const plan_fuzz_step = b.step("fuzz-plan", "Run deterministic structural plan fuzz cases");
+    plan_fuzz_step.dependOn(&run_plan_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,
