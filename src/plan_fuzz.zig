@@ -1,6 +1,7 @@
 //! Reusable deterministic and coverage-guided structural-plan fuzz oracle.
 
 const std = @import("std");
+const directives = @import("directives.zig");
 const plan = @import("plan.zig");
 const seclang = @import("seclang/root.zig");
 
@@ -22,7 +23,27 @@ pub fn fuzzOne(allocator: std.mem.Allocator, input: []const u8) !void {
                     if (value.secondary) |secondary| try parsed.registry.validateSpan(secondary);
                     if (value.code.id().len == 0 or value.message.len == 0) return error.InvalidPlanFuzzDiagnostic;
                 },
-                .plan => |compiled| try validate(compiled, document.directives.items.len),
+                .plan => |compiled| {
+                    try validate(compiled, document.directives.items.len);
+                    switch (directives.Configuration.init(compiled, .full())) {
+                        .configuration => |configuration| {
+                            if (std.mem.allEqual(u8, &configuration.fingerprint, 0))
+                                return error.InvalidDirectiveFuzzFingerprint;
+                            for (directives.registry) |entry| {
+                                var occurrences = configuration.occurrences(entry.id);
+                                while (occurrences.next()) |occurrence| {
+                                    var values = occurrence.values();
+                                    while (values.next()) |value| try parsed.registry.validateSpan(value.source);
+                                }
+                            }
+                        },
+                        .diagnostic => |value| {
+                            try parsed.registry.validateSpan(value.primary);
+                            if (value.code.id().len == 0 or value.message.len == 0)
+                                return error.InvalidDirectiveFuzzDiagnostic;
+                        },
+                    }
+                },
             }
         },
     }

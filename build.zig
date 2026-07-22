@@ -172,6 +172,13 @@ pub fn build(b: *std.Build) void {
     const plan_fuzz_step = b.step("fuzz-plan", "Run deterministic structural plan fuzz cases");
     plan_fuzz_step.dependOn(&run_plan_fuzz.step);
 
+    const run_directive_fuzz = b.addRunArtifact(plan_fuzz);
+    const directive_fuzz_iterations = b.option(usize, "directive-fuzz-iterations", "Deterministic directive fuzz case count") orelse 10_000;
+    const directive_fuzz_seed = b.option(u64, "directive-fuzz-seed", "Deterministic directive fuzz seed") orelse 15_781_766_438_473_941_791;
+    run_directive_fuzz.addArgs(&.{ b.fmt("{d}", .{directive_fuzz_iterations}), b.fmt("{d}", .{directive_fuzz_seed}) });
+    const directive_fuzz_step = b.step("fuzz-directives", "Run deterministic typed directive fuzz cases");
+    directive_fuzz_step.dependOn(&run_directive_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,

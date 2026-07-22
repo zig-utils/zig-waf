@@ -2,6 +2,13 @@ const std = @import("std");
 const waf = @import("waf");
 
 const structured_seed =
+    "SecRuleEngine DetectionOnly\n" ++
+    "SecRequestBodyAccess On\n" ++
+    "SecRequestBodyLimit 1048576\n" ++
+    "SecResponseBodyMimeTypesClear\n" ++
+    "SecResponseBodyMimeType application/json text/plain\n" ++
+    "SecAuditEngine RelevantOnly\n" ++
+    "SecAuditLogParts ABIJDEFHZ\n" ++
     "SecDefaultAction \"phase:2,pass,t:lowercase\"\n" ++
     "SecRule ARGS|REQUEST_HEADERS:host \"@contains attack\" \"id:42,msg:'%{REQUEST_URI}',deny,chain\"\n" ++
     "SecRule TX:score \"@pm one two\" \"capture,setvar:tx.hit=1\"\n";
