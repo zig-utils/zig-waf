@@ -1579,6 +1579,46 @@ test "prefilter limits fail explicitly" {
     try std.testing.expectError(error.PrefilterBytesLimitExceeded, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_prefilter_bytes = 3 }));
 }
 
+test "literal prefilters never reject reference matches under mutation" {
+    const input =
+        \\SecRule ARGS "@streq alpha" id:1
+        \\SecRule ARGS "@beginsWith beta" id:2
+        \\SecRule ARGS "@endsWith gamma" id:3
+        \\SecRule ARGS "@contains delta" id:4
+        \\SecRule ARGS "@pm one two three" id:5
+        \\SecRule ARGS "plain" id:6
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "prefilter-differential.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+    var prng = std.Random.DefaultPrng.init(0x70_72_65_66_69_6c_74_72);
+    const random = prng.random();
+    const alphabet = "abcdefghijklmnopqrstuvwxyz ";
+    var candidate: [96]u8 = undefined;
+    for (0..10_000) |_| {
+        const length = random.uintLessThan(usize, candidate.len + 1);
+        for (candidate[0..length]) |*byte| byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+        const value = candidate[0..length];
+        for (compiled.rules, 0..) |rule, index| {
+            const prefilter = rule.operator.prefilter.?;
+            const parameter = compiled.string(rule.operator.parameter).?;
+            const reference_match = switch (index) {
+                0 => std.mem.eql(u8, value, parameter),
+                1 => std.mem.startsWith(u8, value, parameter),
+                2 => std.mem.endsWith(u8, value, parameter),
+                3, 5 => std.mem.indexOf(u8, value, parameter) != null,
+                4 => std.mem.indexOf(u8, value, "one") != null or
+                    std.mem.indexOf(u8, value, "two") != null or
+                    std.mem.indexOf(u8, value, "three") != null,
+                else => unreachable,
+            };
+            if (reference_match) try std.testing.expect(compiled.prefilterMayMatch(prefilter, value));
+        }
+    }
+}
+
 test "plan indexes markers generic directives and structural action families" {
     const input =
         \\SecMarker CHECKPOINT
