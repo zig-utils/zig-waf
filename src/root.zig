@@ -9,6 +9,7 @@ pub const operators = @import("operators.zig");
 pub const persistent = @import("persistent.zig");
 pub const persistent_lmdb = @import("persistent_lmdb.zig");
 pub const selectors = @import("selectors.zig");
+pub const seclang = @import("seclang/root.zig");
 pub const variables = @import("variables.zig");
 
 pub const Waf = engine.Waf;
@@ -32,5 +33,6 @@ test {
     _ = persistent;
     _ = persistent_lmdb;
     _ = selectors;
+    _ = seclang;
     _ = variables;
 }
