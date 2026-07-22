@@ -7,7 +7,7 @@ const c = @import("lmdb");
 const format_magic = "ZWPC";
 const format_version: u16 = 1;
 const fixed_header_bytes = format_magic.len + @sizeOf(u16) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u32) + @sizeOf(u32);
-const value_header_bytes = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(i64);
+const value_header_bytes = @sizeOf(u32) + @sizeOf(u32) + @sizeOf(i64) + @sizeOf(u8);
 
 pub const Options = struct {
     map_size: usize = 256 * 1024 * 1024,
@@ -103,7 +103,7 @@ pub const LmdbBackend = struct {
         var snapshot = persistent.Snapshot.init(allocator, record.revision);
         errdefer snapshot.deinit();
         for (record.values.items) |value| {
-            if (!value.expired(now_ns)) try snapshot.append(value);
+            if (!value.expired(now_ns) and value.has_value) try snapshot.append(value);
         }
         return snapshot;
     }
@@ -224,6 +224,7 @@ fn encodeRecord(allocator: std.mem.Allocator, record: *const persistent.Record, 
         appendInt(u32, output, &offset, @intCast(value.name.len));
         appendInt(u32, output, &offset, @intCast(value.value.len));
         appendInt(i64, output, &offset, value.expires_at_ns orelse -1);
+        appendInt(u8, output, &offset, @intFromBool(value.has_value));
         appendBytes(output, &offset, value.name);
         appendBytes(output, &offset, value.value);
     }
@@ -255,12 +256,13 @@ fn decodeRecord(allocator: std.mem.Allocator, input: []const u8, limits: persist
         const name_length = readInt(u32, input, &offset) catch return error.CorruptData;
         const value_length = readInt(u32, input, &offset) catch return error.CorruptData;
         const expiry = readInt(i64, input, &offset) catch return error.CorruptData;
-        if (name_length == 0 or name_length > limits.max_variable_name_bytes or value_length > limits.max_variable_value_bytes or expiry < -1) return error.CorruptData;
+        const has_value = readInt(u8, input, &offset) catch return error.CorruptData;
+        if (name_length == 0 or name_length > limits.max_variable_name_bytes or value_length > limits.max_variable_value_bytes or expiry < -1 or has_value > 1) return error.CorruptData;
         logical_bytes = std.math.add(usize, logical_bytes, @as(usize, name_length) + value_length) catch return error.CorruptData;
         if (logical_bytes > limits.max_record_bytes) return error.CorruptData;
         const name = readBytes(input, &offset, name_length) catch return error.CorruptData;
         const value = readBytes(input, &offset, value_length) catch return error.CorruptData;
-        try record.append(.{ .name = name, .value = value, .expires_at_ns = if (expiry == -1) null else expiry });
+        try record.append(.{ .name = name, .value = value, .has_value = has_value == 1, .expires_at_ns = if (expiry == -1) null else expiry });
     }
     if (offset != input.len) return error.CorruptData;
     return record;
@@ -420,4 +422,52 @@ test "LMDB conflict retries preserve contended increments" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.values.items.len);
     try std.testing.expectEqualStrings("200", snapshot.values.items[0].value);
+}
+
+test "LMDB rejects corrupt records without partial decoding" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path}, 0);
+    defer std.testing.allocator.free(path);
+    var lmdb = try LmdbBackend.init(std.testing.allocator, path, .{});
+    defer lmdb.deinit();
+
+    const key_bytes = try encodeKey(std.testing.allocator, .session, "broken", .{});
+    defer std.testing.allocator.free(key_bytes);
+    var key = toValue(key_bytes);
+    var corrupt = toValue("not-a-zig-waf-record");
+    var transaction: ?*c.MDB_txn = null;
+    try check(c.mdb_txn_begin(lmdb.environment, null, 0, &transaction));
+    try check(c.mdb_put(transaction.?, lmdb.database, &key, &corrupt, 0));
+    const result = c.mdb_txn_commit(transaction.?);
+    transaction = null;
+    try check(result);
+    try std.testing.expectError(error.CorruptData, lmdb.backend().load(std.testing.allocator, .session, "broken", 0, .{}));
+}
+
+test "LMDB map-full commit leaves the prior revision readable" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path}, 0);
+    defer std.testing.allocator.free(path);
+    const limits: persistent.Limits = .{
+        .max_variable_value_bytes = 2 * 1024 * 1024,
+        .max_record_bytes = 3 * 1024 * 1024,
+    };
+    var lmdb = try LmdbBackend.init(std.testing.allocator, path, .{ .map_size = 1024 * 1024, .limits = limits });
+    defer lmdb.deinit();
+    const large = try std.testing.allocator.alloc(u8, 2 * 1024 * 1024);
+    defer std.testing.allocator.free(large);
+    @memset(large, 'x');
+    try std.testing.expectError(error.CapacityExceeded, lmdb.backend().commit(.{
+        .namespace = .resource,
+        .collection_key = "/large",
+        .expected_revision = 0,
+        .mutations = &.{.{ .set = .{ .name = "blob", .value = large } }},
+        .limits = limits,
+    }));
+    var snapshot = try lmdb.backend().load(std.testing.allocator, .resource, "/large", 0, limits);
+    defer snapshot.deinit();
+    try std.testing.expectEqual(@as(u64, 0), snapshot.revision);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.values.items.len);
 }

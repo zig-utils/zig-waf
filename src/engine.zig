@@ -768,6 +768,23 @@ pub const Transaction = struct {
         try self.collection_variables.set(name, key, value, source);
     }
 
+    pub fn addTransactionCollectionValue(self: *Transaction, name: []const u8, delta: i64) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const current = if (self.collection_variables.first(.tx, name)) |value|
+            persistent.parseNumericOrZero(value.value)
+        else
+            0;
+        const next = std.math.add(i64, current, delta) catch return error.CapacityExceeded;
+        var value_buffer: [24]u8 = undefined;
+        const value = std.fmt.bufPrint(&value_buffer, "{d}", .{next}) catch unreachable;
+        try self.collection_variables.set(
+            .tx,
+            name,
+            value,
+            .{ .origin = .rule, .offset = 0, .length = value.len },
+        );
+    }
+
     pub fn initializePersistentCollection(
         self: *Transaction,
         namespace: persistent.Namespace,
@@ -1676,6 +1693,26 @@ test "persistent backend failure policy is explicit and observable" {
     try closed_tx.processUri("/", "GET", "HTTP/1.1");
     try std.testing.expectError(error.Unavailable, closed_tx.initializePersistentCollection(.ip, "192.0.2.20"));
     try std.testing.expectEqual(PersistentFailure.unavailable, closed_tx.lastPersistentFailure().?);
+}
+
+test "TX numeric mutation follows setvar prefix and overflow semantics" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
+    try tx.setCollectionValue(.tx, "score", "  -2tail", source);
+    try tx.addTransactionCollectionValue("SCORE", 5);
+    try std.testing.expectEqualStrings("3", (try tx.collectionFirst(.tx, "score")).?.value);
+    try tx.setCollectionValue(.tx, "bad", "not-numeric", source);
+    try tx.addTransactionCollectionValue("bad", 4);
+    try std.testing.expectEqualStrings("4", (try tx.collectionFirst(.tx, "bad")).?.value);
+    try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", source);
+    try std.testing.expectError(error.CapacityExceeded, tx.addTransactionCollectionValue("maximum", 1));
+    try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
 }
 
 test "compiled feature discovery is explicit" {

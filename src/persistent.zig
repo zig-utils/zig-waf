@@ -75,6 +75,7 @@ pub const BackendError = std.mem.Allocator.Error || error{
 pub const Value = struct {
     name: []const u8,
     value: []const u8,
+    has_value: bool = true,
     expires_at_ns: ?i64 = null,
 
     pub fn expired(self: Value, now_ns: i64) bool {
@@ -97,6 +98,7 @@ pub const Snapshot = struct {
         try self.values.append(allocator, .{
             .name = try allocator.dupe(u8, value.name),
             .value = try allocator.dupe(u8, value.value),
+            .has_value = value.has_value,
             .expires_at_ns = value.expires_at_ns,
         });
     }
@@ -112,6 +114,7 @@ pub const SetMutation = struct {
     name: []const u8,
     value: []const u8,
     expires_at_ns: ?i64 = null,
+    preserve_existing_expiry: bool = true,
 };
 
 pub const Mutation = union(enum) {
@@ -240,6 +243,7 @@ pub const Session = struct {
             .name = try allocator.dupe(u8, name),
             .value = try allocator.dupe(u8, value),
             .expires_at_ns = expires_at_ns,
+            .preserve_existing_expiry = expires_at_ns == null,
         } });
     }
 
@@ -377,6 +381,7 @@ pub const Record = struct {
         try self.values.append(allocator, .{
             .name = try allocator.dupe(u8, value.name),
             .value = try allocator.dupe(u8, value.value),
+            .has_value = value.has_value,
             .expires_at_ns = value.expires_at_ns,
         });
     }
@@ -436,7 +441,7 @@ pub const InMemoryBackend = struct {
         errdefer result.deinit();
         var bytes: usize = 0;
         for (record.values.items) |value| {
-            if (value.expired(now_ns)) continue;
+            if (value.expired(now_ns) or !value.has_value) continue;
             try validateValue(value, limits);
             bytes = checkedRecordBytes(bytes, value, limits) catch return error.CorruptData;
             if (result.values.items.len == limits.max_variables_per_record) return error.CorruptData;
@@ -515,10 +520,15 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
             try validateValue(.{ .name = set.name, .value = set.value, .expires_at_ns = set.expires_at_ns }, limits);
             if (findValue(record.values.items, set.name)) |index| {
                 const allocator = record.arena.allocator();
+                const expires_at_ns = if (set.preserve_existing_expiry)
+                    record.values.items[index].expires_at_ns
+                else
+                    set.expires_at_ns;
                 record.values.items[index] = .{
                     .name = try allocator.dupe(u8, set.name),
                     .value = try allocator.dupe(u8, set.value),
-                    .expires_at_ns = set.expires_at_ns,
+                    .has_value = true,
+                    .expires_at_ns = expires_at_ns,
                 };
             } else {
                 if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
@@ -545,6 +555,7 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
                 record.values.items[value_index] = .{
                     .name = try allocator.dupe(u8, add.name),
                     .value = try allocator.dupe(u8, value),
+                    .has_value = true,
                     .expires_at_ns = record.values.items[value_index].expires_at_ns,
                 };
             } else {
@@ -554,7 +565,12 @@ pub fn applyMutations(record: *Record, mutations: []const Mutation, limits: Limi
         },
         .expire => |expire| {
             if (expire.name.len == 0 or expire.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
-            if (findValue(record.values.items, expire.name)) |index| record.values.items[index].expires_at_ns = expire.expires_at_ns;
+            if (findValue(record.values.items, expire.name)) |index| {
+                record.values.items[index].expires_at_ns = expire.expires_at_ns;
+            } else {
+                if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
+                try record.append(.{ .name = expire.name, .value = "", .has_value = false, .expires_at_ns = expire.expires_at_ns });
+            }
         },
     };
 
@@ -621,7 +637,7 @@ fn lock(mutex: *std.atomic.Mutex) void {
 test "persistent namespace registry maps to collection names" {
     inline for (std.meta.tags(Namespace)) |namespace| {
         try std.testing.expectEqual(namespace, Namespace.parse(@tagName(namespace)).?);
-        try std.testing.expectEqual(@tagName(namespace), @tagName(namespace.collectionName()));
+        try std.testing.expectEqualStrings(@tagName(namespace), @tagName(namespace.collectionName()));
     }
 }
 
@@ -729,4 +745,35 @@ test "session creation and unused state perform no backend work" {
     try std.testing.expect(!session.hasDirtyCollections());
     try std.testing.expectEqual(@as(usize, 0), try session.flush(0));
     try std.testing.expectEqual(@as(usize, 0), memory.records.items.len);
+}
+
+test "set preserves expiry and expiry-only state stays hidden" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const backend = memory.backend();
+    const limits: Limits = .{};
+    try std.testing.expectEqual(@as(u64, 1), try backend.commit(.{
+        .namespace = .user,
+        .collection_key = "alice",
+        .expected_revision = 0,
+        .mutations = &.{.{ .expire = .{ .name = "score", .expires_at_ns = 10 } }},
+        .limits = limits,
+    }));
+    var expiry_only = try backend.load(std.testing.allocator, .user, "alice", 0, limits);
+    defer expiry_only.deinit();
+    try std.testing.expectEqual(@as(usize, 0), expiry_only.values.items.len);
+
+    try std.testing.expectEqual(@as(u64, 2), try backend.commit(.{
+        .namespace = .user,
+        .collection_key = "alice",
+        .expected_revision = 1,
+        .mutations = &.{.{ .set = .{ .name = "score", .value = "1" } }},
+        .limits = limits,
+    }));
+    var before_expiry = try backend.load(std.testing.allocator, .user, "alice", 9, limits);
+    defer before_expiry.deinit();
+    try std.testing.expectEqualStrings("1", before_expiry.values.items[0].value);
+    var at_expiry = try backend.load(std.testing.allocator, .user, "alice", 10, limits);
+    defer at_expiry.deinit();
+    try std.testing.expectEqual(@as(usize, 0), at_expiry.values.items.len);
 }
