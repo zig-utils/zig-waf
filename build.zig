@@ -173,4 +173,20 @@ pub fn build(b: *std.Build) void {
     const run_persistence_benchmark = b.addRunArtifact(persistence_benchmark);
     const persistence_benchmark_step = b.step("bench-persistence", "Benchmark disabled and initialized persistent collection paths");
     persistence_benchmark_step.dependOn(&run_persistence_benchmark.step);
+
+    const parser_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/parser.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_benchmark_module.addImport("waf", waf);
+    const parser_benchmark = b.addExecutable(.{
+        .name = "parser-benchmark",
+        .root_module = parser_benchmark_module,
+    });
+    const run_parser_benchmark = b.addRunArtifact(parser_benchmark);
+    if (b.option([]const u8, "parser-benchmark", "Optional SecLang file for the parser benchmark")) |benchmark_path|
+        run_parser_benchmark.addArg(benchmark_path);
+    const parser_benchmark_step = b.step("bench-parser", "Benchmark SecLang parsing throughput and ownership");
+    parser_benchmark_step.dependOn(&run_parser_benchmark.step);
 }
