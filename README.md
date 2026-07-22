@@ -16,6 +16,7 @@ Zig 0.17-dev, PostgreSQL 18, and libpq are installed and locked through Pantry:
 pantry install
 zig build test
 zig build check
+zig build bench-scalars -Doptimize=ReleaseFast
 ```
 
 Production fleet mode requires PostgreSQL. SQLite will only support isolated
@@ -41,4 +42,3 @@ The complete implementation graph is tracked by the
 
 MIT. Imported compatibility fixtures retain their upstream licenses and
 notices.
-

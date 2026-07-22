@@ -86,7 +86,7 @@
       "id": "engine.scalar-variables",
       "area": "engine",
       "name": "Bounded scalar transaction variables with phase availability and origins",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/8",
       "modsecurity": true,
       "coraza": true,
@@ -95,7 +95,7 @@
         "src/variables.zig",
         "src/engine.zig"
       ],
-      "notes": "Connection, request-target, body-length, response, identity, match, and severity scalar foundations are implemented; the remaining stable scalar union and differential fixtures remain."
+      "notes": "The 77-name stable scalar registry, aliases, origins, phase gates, connection/request/response producers, UTC timing, monotonic duration, body diagnostics, identity, matched values, and minimum-severity semantics are executable. Collection-derived aggregates remain WAF-08; full buffered body materialization remains WAF-24/WAF-28."
     },
     {
       "id": "operator.detect-sqli",

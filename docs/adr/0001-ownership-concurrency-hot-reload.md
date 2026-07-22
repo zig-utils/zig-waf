@@ -23,7 +23,7 @@ Connectors also need precise byte-lifetime and error contracts.
   inputs will be copied into immutable generation-owned storage; a published
   generation never borrows caller rule buffers.
 - Connection, request-target, identity, and match scalar values are copied into
-  transaction-owned bounded storage. Values up to 256 bytes use inline storage;
+  transaction-owned bounded storage. Values up to 64 bytes use inline storage;
   larger values use the generation allocator and are freed by `Transaction.deinit`.
 - Header and body slices passed by connectors are borrowed only for the duration
   of the call unless the API explicitly documents a copy. Streaming body calls
@@ -34,7 +34,9 @@ Connectors also need precise byte-lifetime and error contracts.
 
 ### Mutability and concurrency
 
-- A published `Waf` is immutable except for its atomic live-transaction count.
+- A published `Waf` is immutable except for atomic live-transaction and
+  unique-sequence counters. A configured clock callback is borrowed, immutable,
+  nonblocking, and required to be thread-safe.
 - A `Waf` may be shared by any number of worker threads.
 - A `Transaction` is isolated to one request and must be used by one thread at a
   time. Moving it between threads is allowed only with external synchronization

@@ -3,9 +3,8 @@
 The core API separates immutable, shareable policy from isolated request state:
 
 - `Waf.Builder` validates configuration before allocating a published `Waf`.
-- A `Waf` has a stable address and may be shared by worker threads. Its only
-  mutable field is an atomic live-transaction count used to prevent premature
-  destruction.
+- A `Waf` has a stable address and may be shared by worker threads. Its mutable
+  state is limited to atomic live-transaction and unique-sequence counters.
 - Each `Transaction` belongs to one request and one worker at a time. It is not
   shared between threads.
 - Connector calls have strict lifecycle ordering. Invalid transitions fail
@@ -14,6 +13,12 @@ The core API separates immutable, shareable policy from isolated request state:
   Body writes count inspected bytes but do not imply in-memory buffering.
 - Detection-only mode retains interventions and marks them non-enforcing so
   audit and diagnostics do not diverge from enabled mode.
+- Scalar values have explicit origins and minimum phase availability. Common
+  values use a 64-byte allocation-free fast path; larger values are copied into
+  bounded transaction-owned storage.
+- Timing combines a wall clock captured at transaction creation with a
+  monotonic clock for `DURATION`. Applications may provide their Zig 0.17
+  `std.Io` backend or a nonblocking, thread-safe clock callback.
 
 Connection setup precedes SecLang evaluation and therefore has no public phase
 number. The stable five rule phases are request headers (1), request body (2),
@@ -31,3 +36,6 @@ until its live transaction count reaches zero.
 The normative ownership, allocator, error, feature-discovery, connector, and
 reclamation rules are recorded in
 [ADR 0001](adr/0001-ownership-concurrency-hot-reload.md).
+
+The scalar compatibility and producer contract is documented in
+[Scalar transaction variables](scalar-variables.md).
