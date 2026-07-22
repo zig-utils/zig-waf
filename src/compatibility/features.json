@@ -158,6 +158,24 @@
       "notes": "Opaque ownership, sized structs, lifecycle, feature discovery, and errors are implemented; callbacks and ABI matrix remain."
     },
     {
+      "id": "engine.immutable-structural-plans",
+      "area": "engine",
+      "name": "Immutable cache-efficient structural execution plans",
+      "status": "verified",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/12",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/plan.zig",
+        "src/plan_fuzz.zig",
+        "benchmarks/plan.zig",
+        "docs/structural-plans.md",
+        "src/compatibility/evidence/structural-plan.json"
+      ],
+      "notes": "Owned typed IR, phase indexes, defaults, chains, action families, conservative prefilters, immutable macro programs, stable diagnostics, deterministic fingerprints, atomic component sharing, WAF generation pinning, corpus compilation, fuzzing, and ReleaseFast metrics are verified. WAF-12 owns complete directive-specific semantic validation."
+    },
+    {
       "id": "fleet.postgresql-18",
       "area": "fleet",
       "name": "Pantry-managed PostgreSQL 18 and native libpq 18",

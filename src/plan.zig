@@ -10,6 +10,7 @@ pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
 pub const compiler_abi_version: u32 = 2;
 pub const Fingerprint = [32]u8;
+pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
 pub const Limits = struct {
     max_documents: usize = 4096,
@@ -1808,4 +1809,14 @@ test "macro program and token limits fail distinctly" {
     var documents = [_]seclang.parser.Document{parsed.document};
     try std.testing.expectError(error.TooManyMacroPrograms, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_programs = 1 }));
     try std.testing.expectError(error.TooManyMacroTokens, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_tokens = 1 }));
+}
+
+test "structural plan evidence is valid and pinned to compiler ABI" {
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, evidence_json, .{});
+    defer parsed.deinit();
+    const object = parsed.value.object;
+    try std.testing.expectEqualStrings("WAF-11", object.get("issue").?.string);
+    try std.testing.expectEqual(@as(i64, compiler_abi_version), object.get("compilerAbi").?.integer);
+    try std.testing.expectEqual(@as(i64, 58), object.get("corpus").?.object.get("files").?.integer);
+    try std.testing.expectEqual(@as(i64, 0), object.get("corpus").?.object.get("unexplainedExclusions").?.integer);
 }
