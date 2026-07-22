@@ -117,6 +117,14 @@ pub const SetMutation = struct {
 pub const Mutation = union(enum) {
     set: SetMutation,
     remove: []const u8,
+    add: struct {
+        name: []const u8,
+        delta: i64,
+    },
+    expire: struct {
+        name: []const u8,
+        expires_at_ns: i64,
+    },
 };
 
 pub const CommitRequest = struct {
@@ -173,6 +181,152 @@ pub const Backend = struct {
     pub fn cleanup(self: Backend, now_ns: i64, budget: CleanupBudget) BackendError!CleanupResult {
         if (self.abi_version != backend_abi_version) return error.Unavailable;
         return self.cleanupFn(self.context, now_ns, budget);
+    }
+};
+
+pub const SessionError = BackendError || error{
+    AlreadyInitializedWithDifferentKey,
+    CollectionNotInitialized,
+    TooManyMutations,
+    RetryLimitExceeded,
+};
+
+const Binding = struct {
+    namespace: Namespace,
+    collection_key: []const u8,
+    revision: u64,
+    mutations: std.ArrayList(Mutation) = .empty,
+};
+
+/// Per-request persistence state. Creating a session performs no backend I/O;
+/// only explicit collection initialization and flushing invoke callbacks.
+pub const Session = struct {
+    arena: std.heap.ArenaAllocator,
+    backend: Backend,
+    limits: Limits,
+    bindings: std.ArrayList(Binding) = .empty,
+
+    pub fn init(allocator: std.mem.Allocator, backend: Backend, limits: Limits) error{InvalidPersistentLimit}!Session {
+        try limits.validate();
+        return .{
+            .arena = .init(allocator),
+            .backend = backend,
+            .limits = limits,
+        };
+    }
+
+    /// Returns a loaded snapshot on first initialization and null when the
+    /// same namespace/key pair was already initialized by this transaction.
+    pub fn initialize(self: *Session, namespace: Namespace, collection_key: []const u8, now_ns: i64) SessionError!?Snapshot {
+        if (self.findBinding(namespace)) |binding| {
+            if (!std.mem.eql(u8, binding.collection_key, collection_key)) return error.AlreadyInitializedWithDifferentKey;
+            return null;
+        }
+        var snapshot = try self.backend.load(self.arena.child_allocator, namespace, collection_key, now_ns, self.limits);
+        errdefer snapshot.deinit();
+        const allocator = self.arena.allocator();
+        try self.bindings.append(allocator, .{
+            .namespace = namespace,
+            .collection_key = try allocator.dupe(u8, collection_key),
+            .revision = snapshot.revision,
+        });
+        return snapshot;
+    }
+
+    pub fn set(self: *Session, namespace: Namespace, name: []const u8, value: []const u8, expires_at_ns: ?i64) SessionError!void {
+        try validateValue(.{ .name = name, .value = value, .expires_at_ns = expires_at_ns }, self.limits);
+        const allocator = self.arena.allocator();
+        try self.appendMutation(namespace, .{ .set = .{
+            .name = try allocator.dupe(u8, name),
+            .value = try allocator.dupe(u8, value),
+            .expires_at_ns = expires_at_ns,
+        } });
+    }
+
+    pub fn remove(self: *Session, namespace: Namespace, name: []const u8) SessionError!void {
+        if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
+        try self.appendMutation(namespace, .{ .remove = try self.arena.allocator().dupe(u8, name) });
+    }
+
+    pub fn add(self: *Session, namespace: Namespace, name: []const u8, delta: i64) SessionError!void {
+        if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
+        try self.appendMutation(namespace, .{ .add = .{
+            .name = try self.arena.allocator().dupe(u8, name),
+            .delta = delta,
+        } });
+    }
+
+    pub fn expire(self: *Session, namespace: Namespace, name: []const u8, expires_at_ns: i64) SessionError!void {
+        if (name.len == 0 or name.len > self.limits.max_variable_name_bytes) return error.InvalidMutation;
+        try self.appendMutation(namespace, .{ .expire = .{
+            .name = try self.arena.allocator().dupe(u8, name),
+            .expires_at_ns = expires_at_ns,
+        } });
+    }
+
+    /// Flush dirty bindings independently. A revision conflict reloads only
+    /// the current revision and reapplies the ordered mutation log. Numeric
+    /// additions therefore compose instead of becoming last-writer-wins.
+    pub fn flush(self: *Session, now_ns: i64) SessionError!usize {
+        var committed: usize = 0;
+        for (self.bindings.items) |*binding| {
+            if (binding.mutations.items.len == 0) continue;
+            var attempt: u8 = 0;
+            while (attempt < self.limits.max_retry_attempts) : (attempt += 1) {
+                const next_revision = self.backend.commit(.{
+                    .namespace = binding.namespace,
+                    .collection_key = binding.collection_key,
+                    .expected_revision = binding.revision,
+                    .mutations = binding.mutations.items,
+                    .limits = self.limits,
+                }) catch |err| switch (err) {
+                    error.Conflict => {
+                        var current = try self.backend.load(
+                            self.arena.child_allocator,
+                            binding.namespace,
+                            binding.collection_key,
+                            now_ns,
+                            self.limits,
+                        );
+                        binding.revision = current.revision;
+                        current.deinit();
+                        continue;
+                    },
+                    else => return err,
+                };
+                binding.revision = next_revision;
+                binding.mutations.clearRetainingCapacity();
+                committed += 1;
+                break;
+            } else return error.RetryLimitExceeded;
+        }
+        return committed;
+    }
+
+    pub fn hasDirtyCollections(self: *const Session) bool {
+        for (self.bindings.items) |binding| {
+            if (binding.mutations.items.len != 0) return true;
+        }
+        return false;
+    }
+
+    pub fn deinit(self: *Session) void {
+        self.bindings.deinit(self.arena.allocator());
+        self.arena.deinit();
+        self.* = undefined;
+    }
+
+    fn appendMutation(self: *Session, namespace: Namespace, mutation: Mutation) SessionError!void {
+        const binding = self.findBinding(namespace) orelse return error.CollectionNotInitialized;
+        if (binding.mutations.items.len == self.limits.max_mutations_per_commit) return error.TooManyMutations;
+        try binding.mutations.append(self.arena.allocator(), mutation);
+    }
+
+    fn findBinding(self: *Session, namespace: Namespace) ?*Binding {
+        for (self.bindings.items) |*binding| {
+            if (binding.namespace == namespace) return binding;
+        }
+        return null;
     }
 };
 
@@ -359,6 +513,33 @@ fn applyMutations(record: *OwnedRecord, mutations: []const Mutation, limits: Lim
             if (name.len == 0 or name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
             if (findValue(record.values.items, name)) |index| _ = record.values.swapRemove(index);
         },
+        .add => |add| {
+            if (add.name.len == 0 or add.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
+            const index = findValue(record.values.items, add.name);
+            const current = if (index) |value_index|
+                std.fmt.parseInt(i64, record.values.items[value_index].value, 10) catch 0
+            else
+                0;
+            const next = std.math.add(i64, current, add.delta) catch return error.CapacityExceeded;
+            var text: [24]u8 = undefined;
+            const value = std.fmt.bufPrint(&text, "{d}", .{next}) catch unreachable;
+            if (value.len > limits.max_variable_value_bytes) return error.CapacityExceeded;
+            const allocator = record.arena.allocator();
+            if (index) |value_index| {
+                record.values.items[value_index] = .{
+                    .name = try allocator.dupe(u8, add.name),
+                    .value = try allocator.dupe(u8, value),
+                    .expires_at_ns = record.values.items[value_index].expires_at_ns,
+                };
+            } else {
+                if (record.values.items.len == limits.max_variables_per_record) return error.CapacityExceeded;
+                try record.append(.{ .name = add.name, .value = value });
+            }
+        },
+        .expire => |expire| {
+            if (expire.name.len == 0 or expire.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
+            if (findValue(record.values.items, expire.name)) |index| record.values.items[index].expires_at_ns = expire.expires_at_ns;
+        },
     };
 
     var bytes: usize = 0;
@@ -471,4 +652,39 @@ test "in-memory cleanup is bounded" {
     const cleaned = try backend.cleanup(2, .{ .max_records = 1, .max_variables = 1 });
     try std.testing.expectEqual(@as(usize, 1), cleaned.records_scanned);
     try std.testing.expectEqual(@as(usize, 1), cleaned.variables_removed);
+}
+
+test "sessions reload revisions so concurrent additions compose" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    const backend = memory.backend();
+    const limits: Limits = .{};
+
+    var first = try Session.init(std.testing.allocator, backend, limits);
+    defer first.deinit();
+    var second = try Session.init(std.testing.allocator, backend, limits);
+    defer second.deinit();
+    var first_snapshot = (try first.initialize(.ip, "192.0.2.5", 0)).?;
+    first_snapshot.deinit();
+    var second_snapshot = (try second.initialize(.ip, "192.0.2.5", 0)).?;
+    second_snapshot.deinit();
+    try first.add(.ip, "score", 2);
+    try second.add(.ip, "score", 3);
+    try std.testing.expectEqual(@as(usize, 1), try first.flush(0));
+    try std.testing.expectEqual(@as(usize, 1), try second.flush(0));
+
+    var result = try backend.load(std.testing.allocator, .ip, "192.0.2.5", 0, limits);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.values.items.len);
+    try std.testing.expectEqualStrings("5", result.values.items[0].value);
+}
+
+test "session creation and unused state perform no backend work" {
+    var memory = InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    var session = try Session.init(std.testing.allocator, memory.backend(), .{});
+    defer session.deinit();
+    try std.testing.expect(!session.hasDirtyCollections());
+    try std.testing.expectEqual(@as(usize, 0), try session.flush(0));
+    try std.testing.expectEqual(@as(usize, 0), memory.records.items.len);
 }
