@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zig-utils/zig-tls
-          ref: 183809d61a991d7308a0dcc320f2d6966a3eacd7
+          ref: e18fb0043b7b263a116dbb4cd0159bb5ee745c82
           path: zig-tls
       - uses: actions/checkout@v4
         with:
