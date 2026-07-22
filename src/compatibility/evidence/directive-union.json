@@ -1,0 +1,58 @@
+{
+  "schema": 1,
+  "issue": "WAF-12",
+  "zig": "0.17.0-dev.1441+d5181a9c9",
+  "baselines": {
+    "modsecurity": {
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d",
+      "recognized": 82,
+      "recognized_limited": 29
+    },
+    "coraza": {
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360",
+      "recognized": 68,
+      "recognized_limited": 7
+    },
+    "crs": {
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c"
+    }
+  },
+  "stable_union": 86,
+  "inventory_mismatches": 0,
+  "independent_corpus": {
+    "roots": 5,
+    "files": 58,
+    "bytes": 803184,
+    "directives": 925,
+    "plans": 58,
+    "rules": 761,
+    "unexplained_exclusions": 0
+  },
+  "ordered_crs": {
+    "roots": 2,
+    "files": 30,
+    "bytes": 771763,
+    "directives": 794,
+    "rules": 695,
+    "plan_owned_bytes": 2240978,
+    "fingerprint": "86d51eedfe51c77b85de8ea9b453bc92063208d6b77733ea5f2f1ee64781856b"
+  },
+  "deterministic_fuzz": {
+    "iterations": 10000,
+    "seed": 15781766438473941791,
+    "max_input_bytes": 8192
+  },
+  "release_fast_local_benchmark": {
+    "input": "REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
+    "input_bytes": 98977,
+    "directives": 74,
+    "iterations": 13513,
+    "validations_per_second": 773309,
+    "validated_directives_per_second": 57224888,
+    "configurations_per_second": 9317,
+    "configured_directives_per_second": 689495
+  }
+}

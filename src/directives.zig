@@ -4,6 +4,8 @@ const std = @import("std");
 const plan_mod = @import("plan.zig");
 const seclang = @import("seclang/root.zig");
 
+pub const evidence_json = @embedFile("compatibility/evidence/directive-union.json");
+
 pub const Id = enum(u8) {
     sec_rule,
     sec_action,
@@ -1058,6 +1060,21 @@ test "stable union has one canonical case insensitive entry per id" {
         for (registry[0..index]) |prior| try std.testing.expect(!std.ascii.eqlIgnoreCase(prior.name, entry.name));
     }
     try std.testing.expect(lookup("SecDefinitelyUnknown") == null);
+}
+
+test "directive union evidence is machine readable and matches the registry" {
+    const Evidence = struct {
+        schema: u32,
+        issue: []const u8,
+        stable_union: usize,
+        inventory_mismatches: usize,
+    };
+    const parsed = try std.json.parseFromSlice(Evidence, std.testing.allocator, evidence_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 1), parsed.value.schema);
+    try std.testing.expectEqualStrings("WAF-12", parsed.value.issue);
+    try std.testing.expectEqual(registry.len, parsed.value.stable_union);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.inventory_mismatches);
 }
 
 test "every registry row has an executable positive schema fixture" {
