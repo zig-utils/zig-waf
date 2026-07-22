@@ -13,7 +13,7 @@
     },
     "zig-tls": {
       "repository": "zig-utils/zig-tls",
-      "commit": "6071f794945fb51a4fb38f64f8139304a70ae980",
+      "commit": "183809d61a991d7308a0dcc320f2d6966a3eacd7",
       "localPath": "../zig-tls"
     },
     "stx": {
