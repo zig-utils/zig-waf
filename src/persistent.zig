@@ -703,10 +703,22 @@ const MemoryIncrementWorker = struct {
                 _ = self.failures.fetchAdd(1, .monotonic);
                 return;
             };
-            _ = session.flush(0) catch {
-                _ = self.failures.fetchAdd(1, .monotonic);
-                return;
-            };
+            var exhaustion_retries: u8 = 0;
+            while (true) {
+                _ = session.flush(0) catch |failure| switch (failure) {
+                    error.RetryLimitExceeded => {
+                        exhaustion_retries += 1;
+                        if (exhaustion_retries < 8) continue;
+                        _ = self.failures.fetchAdd(1, .monotonic);
+                        return;
+                    },
+                    else => {
+                        _ = self.failures.fetchAdd(1, .monotonic);
+                        return;
+                    },
+                };
+                break;
+            }
         }
     }
 };
