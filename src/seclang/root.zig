@@ -3,9 +3,11 @@
 pub const source = @import("source.zig");
 pub const lexer = @import("lexer.zig");
 pub const parser = @import("parser.zig");
+pub const syntax = @import("syntax.zig");
 
 test {
     _ = source;
     _ = lexer;
     _ = parser;
+    _ = syntax;
 }
