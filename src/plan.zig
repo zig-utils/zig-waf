@@ -1997,7 +1997,8 @@ const Compiler = struct {
                     },
                     .rule_remove_target_by_tag => _ = action_config.parseTargetControl(control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
-                    .audit_log_parts,
+                    .audit_log_parts => _ = action_config.applyAuditParts(.{}, control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .rule_remove_by_tag,
                     => {},
                 }
@@ -4047,6 +4048,7 @@ test "invalid static runtime controls have a stable diagnostic" {
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveById=20-10\"",
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetById=20-10;ARGS:x\"",
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetByTag=tag-only\"",
+        "SecRule ARGS @rx \"id:1,ctl:auditLogParts=BCZ\"",
     };
     for (cases) |input| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-control.conf", input, .{}, .{});

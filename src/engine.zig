@@ -583,6 +583,7 @@ pub const FlowState = struct {
 pub const ControlState = struct {
     rule_engine: action_config.EngineMode,
     audit_engine: action_config.AuditEngine = .relevant_only,
+    audit_parts: action_config.AuditParts = .{},
     force_request_body_variable: bool = false,
     request_body_access: bool = true,
     request_body_limit: usize,
@@ -1368,7 +1369,8 @@ pub const Transaction = struct {
                         };
                         staged_exclusion_bytes.* += added_bytes;
                     },
-                    .audit_log_parts => return error.UnsupportedRuntimeControl,
+                    .audit_log_parts => staged.audit_parts = action_config.applyAuditParts(staged.audit_parts, expanded) catch
+                        return error.InvalidActionValue,
                 }
                 count += 1;
             }
@@ -3849,7 +3851,7 @@ test "dynamic skipAfter resolves staged macros and resumes after marker" {
 
 test "runtime engine and request-body controls commit with match decisions" {
     const input =
-        \\SecRule ARGS @rx "id:1,phase:1,setvar:'tx.mode=DetectionOnly',ctl:ruleEngine=%{TX.mode},ctl:requestBodyAccess=Off,ctl:requestBodyLimit=4,ctl:requestBodyProcessor=JSON,ctl:auditEngine=On,deny"
+        \\SecRule ARGS @rx "id:1,phase:1,setvar:'tx.mode=DetectionOnly',ctl:ruleEngine=%{TX.mode},ctl:requestBodyAccess=Off,ctl:requestBodyLimit=4,ctl:requestBodyProcessor=JSON,ctl:auditEngine=On,ctl:auditLogParts=ABCFHZ,deny"
         \\SecRule ARGS @rx "id:2,phase:1,ctl:ruleEngine=Off"
         \\SecRule ARGS @rx "id:3,phase:1"
     ;
@@ -3875,13 +3877,14 @@ test "runtime engine and request-body controls commit with match decisions" {
     var cursor = try PhaseCursor.init(&tx, .request_headers);
     try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
     const outcome = try tx.applyMatchedRule(@fromBackingInt(0), context);
-    try std.testing.expectEqual(@as(usize, 5), outcome.controls_applied);
+    try std.testing.expectEqual(@as(usize, 6), outcome.controls_applied);
     try std.testing.expect(!outcome.decision_enforced);
     try std.testing.expect(!(try tx.intervention()).?.enforced);
     try std.testing.expect(!tx.isPhaseInterrupted());
     const state = tx.controlState();
     try std.testing.expectEqual(action_config.EngineMode.detection_only, state.rule_engine);
     try std.testing.expectEqual(action_config.AuditEngine.on, state.audit_engine);
+    try std.testing.expect(state.audit_parts.has('H'));
     try std.testing.expect(!state.request_body_access);
     try std.testing.expectEqual(@as(usize, 4), state.request_body_limit);
     try std.testing.expectEqual(action_config.BodyProcessor.json, state.request_body_processor.?);

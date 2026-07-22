@@ -30,6 +30,15 @@ pub const AuditEngine = enum {
     relevant_only,
 };
 
+pub const AuditParts = struct {
+    bits: u16 = 0,
+
+    pub fn has(self: AuditParts, part: u8) bool {
+        if (part < 'B' or part > 'K') return part == 'A' or part == 'Z';
+        return self.bits & (@as(u16, 1) << @intCast(part - 'B')) != 0;
+    }
+};
+
 pub const ControlKind = enum {
     audit_engine,
     audit_log_parts,
@@ -333,6 +342,29 @@ pub fn parseTargetControl(value: []const u8) ParseError!TargetControl {
     return .{ .selector = value[0..separator], .target = value[separator + 1 ..] };
 }
 
+pub fn applyAuditParts(base: AuditParts, value: []const u8) ParseError!AuditParts {
+    if (value.len == 0) return error.MissingValue;
+    var result = base;
+    var start: usize = 0;
+    var add = true;
+    if (value[0] == '+' or value[0] == '-') {
+        add = value[0] == '+';
+        start = 1;
+        if (start == value.len) return error.MissingValue;
+    } else {
+        if (value.len < 2 or value[0] != 'A' or value[value.len - 1] != 'Z') return error.InvalidOperation;
+        result.bits = 0;
+        start = 1;
+    }
+    const end = if (value[0] == '+' or value[0] == '-') value.len else value.len - 1;
+    for (value[start..end]) |part| {
+        if (part < 'B' or part > 'K') return error.InvalidOperation;
+        const bit = @as(u16, 1) << @intCast(part - 'B');
+        if (add) result.bits |= bit else result.bits &= ~bit;
+    }
+    return result;
+}
+
 fn parseVariable(value: []const u8) ParseError!struct { collection: Collection, key: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return error.InvalidVariable;
     if (dot == 0 or dot + 1 == value.len) return error.InvalidVariable;
@@ -431,4 +463,20 @@ test "runtime control names and body values parse without allocation" {
     try std.testing.expectEqualDeep(TargetControl{ .selector = "942100", .target = "ARGS:password" }, try parseTargetControl("942100;ARGS:password"));
     try std.testing.expectError(error.InvalidOperation, parseTargetControl("942100"));
     try std.testing.expectError(error.InvalidOperation, parseTargetControl(";ARGS"));
+}
+
+test "audit log parts support absolute and incremental stable syntax" {
+    const absolute = try applyAuditParts(.{}, "ABCFHZ");
+    try std.testing.expect(absolute.has('A'));
+    try std.testing.expect(absolute.has('B'));
+    try std.testing.expect(absolute.has('H'));
+    try std.testing.expect(!absolute.has('E'));
+    const added = try applyAuditParts(absolute, "+EJ");
+    try std.testing.expect(added.has('E'));
+    try std.testing.expect(added.has('J'));
+    const removed = try applyAuditParts(added, "-CE");
+    try std.testing.expect(!removed.has('C'));
+    try std.testing.expect(!removed.has('E'));
+    try std.testing.expectError(error.InvalidOperation, applyAuditParts(.{}, "BCZ"));
+    try std.testing.expectError(error.InvalidOperation, applyAuditParts(.{}, "+A"));
 }
