@@ -10,6 +10,7 @@ const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
+const transformations = @import("transformations.zig");
 const variables = @import("variables.zig");
 
 pub const Mode = enum {
@@ -28,6 +29,7 @@ pub const Feature = enum(u6) {
     persistent_collections,
     atomic_hot_reload,
     compiled_execution_plan,
+    transformation_execution,
 };
 
 pub const FeatureSet = struct {
@@ -107,6 +109,9 @@ pub const Config = struct {
     persistent_failure_policy: persistent.FailurePolicy = .fail_closed,
     persistent_required_features: persistent.BackendFeatureSet = persistent.BackendFeatureSet.core(),
     intervention_capabilities: InterventionCapabilities = .{},
+    transformation_limits: transformations.Limits = .{},
+    transformation_profile: transformations.Profile = .modsecurity,
+    transformation_unicode_map: ?transformations.UnicodeMap = null,
 };
 
 pub const InterventionCapabilities = struct {
@@ -212,6 +217,20 @@ pub const Builder = struct {
         self.config.intervention_capabilities = capabilities;
     }
 
+    pub fn setTransformationLimits(self: *Builder, limits: transformations.Limits) void {
+        self.config.transformation_limits = limits;
+    }
+
+    pub fn setTransformationProfile(self: *Builder, profile: transformations.Profile) void {
+        self.config.transformation_profile = profile;
+    }
+
+    /// The immutable Unicode map remains owned by the caller and must outlive
+    /// the WAF and all child transactions.
+    pub fn setTransformationUnicodeMap(self: *Builder, unicode_map: transformations.UnicodeMap) void {
+        self.config.transformation_unicode_map = unicode_map;
+    }
+
     /// Select the directive capabilities compiled into this WAF build. A plan
     /// using an omitted capability is rejected before publication.
     pub fn setDirectiveCapabilities(self: *Builder, capabilities: directives.CapabilitySet) void {
@@ -255,6 +274,7 @@ pub const Builder = struct {
 
     fn validate(self: *const Builder, candidate: ?*const compiled_plan.Plan) ConfigError!void {
         try self.config.limits.validate();
+        self.config.transformation_limits.validate() catch return error.InvalidLimit;
         self.config.persistent_limits.validate() catch return error.InvalidLimit;
         if (self.config.persistent_backend) |backend| {
             if (!backend.features.containsAll(self.config.persistent_required_features)) return error.MissingPersistentBackendFeature;
@@ -324,6 +344,10 @@ pub const Waf = struct {
                 persistent.Session.init(self.allocator, backend, self.config.persistent_limits) catch unreachable
             else
                 null,
+            .transformation_executor = transformations.Executor.initWithOptions(self.allocator, self.config.transformation_limits, .{
+                .profile = self.config.transformation_profile,
+                .unicode_map = self.config.transformation_unicode_map,
+            }) catch unreachable,
             .control_state = .{
                 .rule_engine = if (self.config.mode == .enabled) .on else .detection_only,
                 .request_body_limit = self.config.limits.max_request_body_bytes,
@@ -486,7 +510,7 @@ pub const TransactionError = error{
     ControlTooLate,
     UnsupportedRuntimeControl,
     UnsupportedIntervention,
-} || variables.StoreError || collections.StoreError || collections.SelectorError || persistent.SessionError;
+} || variables.StoreError || collections.StoreError || collections.SelectorError || persistent.SessionError || transformations.ApplyError;
 
 const Lifecycle = enum {
     created,
@@ -517,6 +541,20 @@ pub const MatchContext = struct {
     value: []const u8,
     source: collections.Source,
     captures: []const ?CaptureRange = &.{},
+};
+
+/// Borrowed transformed value and staged multi-match checkpoints. Executor
+/// storage remains valid until the transaction runs another transformation
+/// pipeline or is deinitialized. Source metadata continues to describe the
+/// original collection value rather than fabricated transformed offsets.
+pub const TransformedValue = struct {
+    name: []const u8,
+    value: []const u8,
+    source: collections.Source,
+    changed: bool,
+    checkpoints: []const transformations.Checkpoint,
+    steps_executed: u32,
+    cumulative_bytes: usize,
 };
 
 pub const MatchedRule = struct {
@@ -833,6 +871,7 @@ pub const Transaction = struct {
     scalar_variables: variables.Store,
     collection_variables: collections.Store,
     persistent_session: ?persistent.Session,
+    transformation_executor: transformations.Executor,
     last_persistent_failure: ?PersistentFailure = null,
     persistent_failed_open: u8 = 0,
     match_intents: std.ArrayList(MatchIntent) = .empty,
@@ -854,6 +893,38 @@ pub const Transaction = struct {
 
     pub fn compiledPlan(self: *const Transaction) ?*const compiled_plan.Plan {
         return self.waf.compiledPlan();
+    }
+
+    /// Execute the selected rule member's immutable transformation pipeline.
+    /// No match, capture, action, or intervention state is changed here; a
+    /// failure therefore exposes no partial operator-visible state.
+    pub fn transformRuleValue(self: *Transaction, rule_id: compiled_plan.RuleId, context: MatchContext) TransactionError!TransformedValue {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.validateMatchContext(context);
+        const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
+        const rule_index: usize = @backingInt(rule_id);
+        if (rule_index >= plan.rules.len) return error.InvalidRuleReference;
+        const selected = plan.rules[rule_index];
+        const start: usize = selected.transformations_start;
+        const count: usize = selected.transformations_count;
+        if (start > plan.transformations.len or count > plan.transformations.len - start)
+            return error.InvalidRuleReference;
+        const head_index: usize = @backingInt(selected.chain_head);
+        if (head_index >= plan.rules.len) return error.InvalidRuleReference;
+        const result = try self.transformation_executor.applyPipeline(
+            plan.transformations[start..][0..count],
+            context.value,
+            plan.rules[head_index].flow.multi_match,
+        );
+        return .{
+            .name = context.name,
+            .value = result.bytes,
+            .source = context.source,
+            .changed = result.changed,
+            .checkpoints = result.checkpoints,
+            .steps_executed = result.steps_executed,
+            .cumulative_bytes = result.cumulative_bytes,
+        };
     }
 
     /// Atomically replace the transaction-local RULE projection with typed
@@ -2583,6 +2654,7 @@ pub const Transaction = struct {
         deinitTargetExclusions(self.waf.allocator, &self.target_exclusions);
         deinitRegexTargetExclusions(self.waf.allocator, &self.regex_target_exclusions);
         self.rule_exclusion_bytes = 0;
+        self.transformation_executor.deinit();
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
@@ -3965,6 +4037,59 @@ test "proxy decisions require an explicitly advertised connector capability" {
     try std.testing.expectEqual(Intervention.Action.proxy, intervention.action);
     try std.testing.expectEqualStrings("https://upstream.test//proxy", intervention.destination.?);
     try std.testing.expectEqualStrings("1", (try enabled_tx.collectionFirst(.tx, "proxy")).?.value);
+}
+
+test "transaction executes typed member pipelines without publishing match state" {
+    const input =
+        \\SecRule ARGS @rx "id:31,multiMatch,t:urlDecode,t:lowercase,chain"
+        \\SecRule ARGS @rx "t:none,t:uppercase"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "transform-pipeline.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    const source: collections.Source = .{ .origin = .request_body, .offset = 41, .length = 3 };
+    const head = try tx.transformRuleValue(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "%41",
+        .source = source,
+    });
+    try std.testing.expectEqualStrings("a", head.value);
+    try std.testing.expectEqualStrings("ARGS:value", head.name);
+    try std.testing.expectEqual(source, head.source);
+    try std.testing.expectEqual(@as(u32, 2), head.steps_executed);
+    try std.testing.expectEqual(@as(usize, 3), head.checkpoints.len);
+    try std.testing.expectEqualStrings("%41", head.checkpoints[0].bytes);
+    try std.testing.expectEqualStrings("A", head.checkpoints[1].bytes);
+    try std.testing.expectEqualStrings("a", head.checkpoints[2].bytes);
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+    try std.testing.expect((try tx.intervention()) == null);
+
+    const member = try tx.transformRuleValue(@fromBackingInt(1), .{
+        .name = "ARGS:value",
+        .value = "abc",
+        .source = source,
+    });
+    try std.testing.expectEqualStrings("ABC", member.value);
+    try std.testing.expectEqual(@as(u32, 1), member.steps_executed);
+    try std.testing.expectEqual(@as(usize, 2), member.checkpoints.len);
+    try std.testing.expectEqualStrings("abc", member.checkpoints[0].bytes);
+    try std.testing.expectEqualStrings("ABC", member.checkpoints[1].bytes);
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+}
+
+test "builder rejects invalid transformation limits before publication" {
+    var builder = Builder.init(std.testing.allocator);
+    builder.setTransformationLimits(.{ .max_input_bytes = 0 });
+    try std.testing.expectError(error.InvalidLimit, builder.build());
 }
 
 test "phase cursor applies skip and phase-scoped allow without allocation" {

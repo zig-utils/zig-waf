@@ -291,7 +291,7 @@ pub const Executor = struct {
         };
     }
 
-    pub fn applyPipeline(self: *Executor, pipeline: []const Kind, input: []const u8, multi_match: bool) ApplyError!PipelineResult {
+    pub fn applyPipeline(self: *Executor, pipeline: anytype, input: []const u8, multi_match: bool) ApplyError!PipelineResult {
         if (input.len > self.limits.max_input_bytes) return error.InputTooLarge;
         if (pipeline.len > self.limits.max_pipeline_steps) return error.TooManyPipelineSteps;
         self.checkpoint_bytes.clearRetainingCapacity();
@@ -309,7 +309,8 @@ pub const Executor = struct {
 
         var current = Result{ .bytes = input, .changed = false, .storage = .borrowed };
         var pipeline_changed = false;
-        for (pipeline, 0..) |kind, step| {
+        for (pipeline, 0..) |configured, step| {
+            const kind = pipelineKind(configured);
             const previous_storage = current.storage;
             var next = try self.applyStep(kind, current.bytes);
             if (next.storage == .borrowed) next.storage = previous_storage;
@@ -1188,6 +1189,13 @@ pub const Executor = struct {
     }
 };
 
+fn pipelineKind(configured: anytype) Kind {
+    const T = @TypeOf(configured);
+    if (T == Kind) return configured;
+    if (@hasField(T, "kind") and @TypeOf(configured.kind) == Kind) return configured.kind;
+    @compileError("pipeline entries must be transformation Kind values or structs with a Kind field");
+}
+
 fn trimResult(input: []const u8, left: bool, right: bool) Result {
     var start: usize = 0;
     var end = input.len;
@@ -1953,10 +1961,10 @@ test "ordered pipelines retain storage and stage multi-match checkpoints" {
     try std.testing.expectEqualStrings("a", result.checkpoints[3].bytes);
     try std.testing.expectEqual(@as(?u32, 2), result.checkpoints[3].after_step);
 
-    const unchanged = try executor.applyPipeline(&.{.lowercase}, "ordinary", true);
+    const unchanged = try executor.applyPipeline(&[_]Kind{.lowercase}, "ordinary", true);
     try std.testing.expect(!unchanged.changed);
     try std.testing.expectEqual(@as(usize, 1), unchanged.checkpoints.len);
-    const upstream_changed = try executor.applyPipeline(&.{.length}, "1", true);
+    const upstream_changed = try executor.applyPipeline(&[_]Kind{.length}, "1", true);
     try std.testing.expect(upstream_changed.changed);
     try std.testing.expectEqual(@as(usize, 2), upstream_changed.checkpoints.len);
     try std.testing.expectEqualStrings("1", upstream_changed.checkpoints[0].bytes);
@@ -1970,15 +1978,15 @@ test "pipeline failures publish no partial checkpoint storage" {
         .max_pipeline_steps = 1,
     });
     defer steps.deinit();
-    try std.testing.expectError(error.TooManyPipelineSteps, steps.applyPipeline(&.{ .lowercase, .uppercase }, "x", true));
+    try std.testing.expectError(error.TooManyPipelineSteps, steps.applyPipeline(&[_]Kind{ .lowercase, .uppercase }, "x", true));
 
     var cumulative = try Executor.init(std.testing.allocator, .{
         .max_output_bytes = 8,
         .max_cumulative_output_bytes = 8,
     });
     defer cumulative.deinit();
-    try std.testing.expectError(error.CumulativeOutputTooLarge, cumulative.applyPipeline(&.{ .lowercase, .uppercase }, "ABCD", true));
-    const recovered = try cumulative.applyPipeline(&.{}, "x", true);
+    try std.testing.expectError(error.CumulativeOutputTooLarge, cumulative.applyPipeline(&[_]Kind{ .lowercase, .uppercase }, "ABCD", true));
+    const recovered = try cumulative.applyPipeline(&[_]Kind{}, "x", true);
     try std.testing.expectEqual(@as(usize, 1), recovered.checkpoints.len);
     try std.testing.expectEqualStrings("x", recovered.checkpoints[0].bytes);
 }
@@ -2004,7 +2012,7 @@ test "executor scratch ownership is exhaustive-allocation-failure safe" {
             try std.testing.expectEqualStrings(" mixed whitespace ", (try executor.apply(.compress_whitespace, "\t mixed\n\nwhitespace \r")).bytes);
             try std.testing.expectEqualStrings("MIXED", (try executor.apply(.uppercase, "mixed")).bytes);
             try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xc3 }, (try executor.apply(.parity_even_7bit, "AC")).bytes);
-            const pipeline = try executor.applyPipeline(&.{ .url_decode, .lowercase, .trim }, " %41+ ", true);
+            const pipeline = try executor.applyPipeline(&[_]Kind{ .url_decode, .lowercase, .trim }, " %41+ ", true);
             try std.testing.expectEqualStrings("a", pipeline.bytes);
             try std.testing.expectEqual(@as(usize, 4), pipeline.checkpoints.len);
         }
