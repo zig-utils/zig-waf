@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "issue": "WAF-11",
   "zig": "0.17.0-dev.1441+d5181a9c9",
-  "compilerAbi": 6,
+  "compilerAbi": 7,
   "structuralOnly": true,
   "baselines": [
     {

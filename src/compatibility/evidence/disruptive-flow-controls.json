@@ -1,6 +1,6 @@
 {
   "issue": "WAF-15",
-  "compilerAbi": 6,
+  "compilerAbi": 7,
   "baselines": {
     "modsecurity": {
       "version": "3.0.16",

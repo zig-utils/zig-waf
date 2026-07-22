@@ -8,6 +8,7 @@ const variables = @import("variables.zig");
 const rule_config = @import("rule_config.zig");
 const remote_rules = @import("remote_rules.zig");
 const regex = @import("regex");
+const transformation_registry = @import("transformations.zig");
 
 pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
@@ -15,7 +16,7 @@ pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
 pub const MarkerId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 6;
+pub const compiler_abi_version: u32 = 7;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
@@ -381,7 +382,7 @@ pub const MacroProgram = struct {
 };
 
 pub const Transformation = struct {
-    name: StringId,
+    kind: transformation_registry.Kind,
 };
 
 pub const DefaultSnapshot = struct {
@@ -1356,20 +1357,25 @@ const Compiler = struct {
         if (parsed_actions.len > self.limits.max_actions -| self.actions.items.len) return error.TooManyActions;
         const start = try typedIndex(self.actions.items.len);
         for (parsed_actions) |action| {
-            const value_id = if (action.value) |value| try self.interner.intern(value) else null;
+            const class = classifyAction(action.name);
+            const value_id = if (action.value) |value| blk: {
+                if (class != .transformation) break :blk try self.interner.intern(value);
+                const resolution = transformation_registry.resolve(unquote(value)) orelse return error.InvalidTransformation;
+                break :blk try self.interner.intern(resolution.canonicalName());
+            } else null;
             try self.actions.append(self.allocator, .{
                 .raw = try self.interner.intern(action.raw),
                 .name = try self.interner.intern(action.name),
                 .value = value_id,
-                .class = classifyAction(action.name),
-                .macro = if (action.value) |value| try self.addMacro(unquote(value)) else null,
+                .class = class,
+                .macro = if (class == .transformation) null else if (action.value) |value| try self.addMacro(unquote(value)) else null,
             });
         }
         return .{ .start = start, .count = try typedIndex(parsed_actions.len) };
     }
 
     fn addTransformations(self: *Compiler, default_id: ?DefaultId, explicit: ActionRange) CompileError!ActionRange {
-        var pipeline: std.ArrayList(StringId) = .empty;
+        var pipeline: std.ArrayList(transformation_registry.Kind) = .empty;
         defer pipeline.deinit(self.allocator);
         if (default_id) |id| {
             const snapshot = self.defaults.items[@backingInt(id)];
@@ -1379,7 +1385,7 @@ const Compiler = struct {
         if (pipeline.items.len > self.limits.max_transformations -| self.transformations.items.len)
             return error.TooManyTransformations;
         const start = try typedIndex(self.transformations.items.len);
-        for (pipeline.items) |name| try self.transformations.append(self.allocator, .{ .name = name });
+        for (pipeline.items) |kind| try self.transformations.append(self.allocator, .{ .kind = kind });
         return .{ .start = start, .count = try typedIndex(pipeline.items.len) };
     }
 
@@ -1501,17 +1507,17 @@ const Compiler = struct {
         try self.macro_tokens.append(self.allocator, token);
     }
 
-    fn applyTransformations(self: *Compiler, pipeline: *std.ArrayList(StringId), range: ActionRange) CompileError!void {
+    fn applyTransformations(self: *Compiler, pipeline: *std.ArrayList(transformation_registry.Kind), range: ActionRange) CompileError!void {
         const actions = self.actions.items[range.start..][0..range.count];
         for (actions) |action| {
             const name = self.interner.values.items[@backingInt(action.name)];
             if (!std.ascii.eqlIgnoreCase(name, "t")) continue;
             const raw_value = if (action.value) |value| self.interner.values.items[@backingInt(value)] else return error.InvalidTransformation;
             const value = unquote(raw_value);
-            if (std.ascii.eqlIgnoreCase(value, "none")) {
-                pipeline.clearRetainingCapacity();
-            } else {
-                try pipeline.append(self.allocator, try self.interner.intern(value));
+            const resolution = transformation_registry.resolve(value) orelse return error.InvalidTransformation;
+            switch (resolution) {
+                .reset => pipeline.clearRetainingCapacity(),
+                .builtin => |kind| try pipeline.append(self.allocator, kind),
             }
         }
     }
@@ -2352,7 +2358,7 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashOptionalId(&hasher, action.macro);
     }
     hashU32(&hasher, @intCast(plan.transformations.len));
-    for (plan.transformations) |transformation| hashString(&hasher, plan.string(transformation.name).?);
+    for (plan.transformations) |transformation| hashU8(&hasher, @backingInt(transformation.kind));
     hashU32(&hasher, @intCast(plan.prefilter_literals.len));
     for (plan.prefilter_literals) |literal| hashString(&hasher, plan.string(literal).?);
 
@@ -3051,7 +3057,7 @@ test "phase defaults chains ids and transformation resets compile structurally" 
     try std.testing.expectEqual(@as(usize, 1), compiled.phaseRules(3).len);
     try std.testing.expectEqual(@as(usize, 1), compiled.rules[0].transformations_count);
     const first_transformation = compiled.transformations[compiled.rules[0].transformations_start];
-    try std.testing.expectEqualStrings("urlDecodeUni", compiled.string(first_transformation.name).?);
+    try std.testing.expectEqual(transformation_registry.Kind.url_decode_uni, first_transformation.kind);
     try std.testing.expectEqual(@as(usize, 2), compiled.rules[1].transformations_count);
 }
 
@@ -3074,8 +3080,8 @@ test "default actions are phase scoped immutable snapshots" {
     try std.testing.expectEqual(@as(?DefaultId, @fromBackingInt(1)), compiled.rules[1].default);
     try std.testing.expectEqual(@as(?DefaultId, null), compiled.rules[2].default);
     try std.testing.expectEqual(@as(u8, 2), compiled.rules[1].phase);
-    try std.testing.expectEqualStrings("lowercase", compiled.string(compiled.transformations[compiled.rules[0].transformations_start].name).?);
-    try std.testing.expectEqualStrings("trim", compiled.string(compiled.transformations[compiled.rules[1].transformations_start].name).?);
+    try std.testing.expectEqual(transformation_registry.Kind.lowercase, compiled.transformations[compiled.rules[0].transformations_start].kind);
+    try std.testing.expectEqual(transformation_registry.Kind.trim, compiled.transformations[compiled.rules[1].transformations_start].kind);
 }
 
 test "default action compatibility failures have precise diagnostics" {
@@ -3268,7 +3274,7 @@ test "action updates replace singleton families append repeatables and rebuild t
     try std.testing.expectEqual(@as(usize, 0), countActions(compiled, actions, "auditlog"));
     try std.testing.expectEqual(@as(usize, 1), countActions(compiled, actions, "noauditlog"));
     try std.testing.expectEqual(@as(usize, 1), first.transformations_count);
-    try std.testing.expectEqualStrings("trim", compiled.string(compiled.transformations[first.transformations_start].name).?);
+    try std.testing.expectEqual(transformation_registry.Kind.trim, compiled.transformations[first.transformations_start].kind);
     const second_actions = compiled.actions[compiled.rules[1].actions_start..][0..compiled.rules[1].actions_count];
     try std.testing.expectEqual(@as(usize, 0), countActions(compiled, second_actions, "deny"));
     try std.testing.expectEqual(@as(usize, 1), countActions(compiled, second_actions, "pass"));
@@ -3446,6 +3452,7 @@ test "compile outcome identifies chain and transformation failures" {
         .{ .input = "SecRule ARGS @rx chain\nSecAction pass", .code = .dangling_chain, .related = true },
         .{ .input = "SecRule ARGS @rx \"phase:1,chain\"\nSecRule TX @rx phase:2", .code = .chain_phase_mismatch, .related = true },
         .{ .input = "SecRule ARGS @rx t", .code = .invalid_transformation, .related = false },
+        .{ .input = "SecRule ARGS @rx \"id:1,t:notAStableTransformation\"", .code = .invalid_transformation, .related = false },
     };
     for (cases) |case| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "semantic.conf", case.input, .{}, .{});
@@ -3461,6 +3468,31 @@ test "compile outcome identifies chain and transformation failures" {
             },
         }
     }
+}
+
+test "transformation aliases publish canonical typed plan data" {
+    const input = "SecRule ARGS @rx \"id:1,t:NoRmAlIzEpAtH,t:NORMALIZEPATHWIN\"";
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "transformation-aliases.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    const rule = compiled.rules[0];
+    const pipeline = compiled.transformations[rule.transformations_start..][0..rule.transformations_count];
+    try std.testing.expectEqualSlices(Transformation, &.{
+        .{ .kind = .normalise_path },
+        .{ .kind = .normalise_path_win },
+    }, pipeline);
+    var canonical_values: usize = 0;
+    for (compiled.actions[rule.actions_start..][0..rule.actions_count]) |action| {
+        if (action.class != .transformation) continue;
+        const expected = if (canonical_values == 0) "normalisePath" else "normalisePathWin";
+        try std.testing.expectEqualStrings(expected, compiled.string(action.value.?).?);
+        try std.testing.expect(action.macro == null);
+        canonical_values += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), canonical_values);
 }
 
 test "compiler emits only conservative literal prefilters" {

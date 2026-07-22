@@ -1,5 +1,6 @@
 const std = @import("std");
 const plan = @import("plan.zig");
+const transformations = @import("transformations.zig");
 const rule_config = @import("rule_config.zig");
 const seclang = @import("seclang/root.zig");
 
@@ -49,8 +50,8 @@ test "pinned default-action differential fixture" {
     try std.testing.expectEqual(@as(u8, 1), fixture.compiled.rules[0].phase);
     try std.testing.expectEqual(@as(u8, 2), fixture.compiled.rules[1].phase);
     try std.testing.expectEqual(@as(?plan.DefaultId, null), fixture.compiled.rules[2].default);
-    try std.testing.expectEqualStrings("lowercase", fixture.compiled.string(fixture.compiled.transformations[fixture.compiled.rules[0].transformations_start].name).?);
-    try std.testing.expectEqualStrings("trim", fixture.compiled.string(fixture.compiled.transformations[fixture.compiled.rules[1].transformations_start].name).?);
+    try std.testing.expectEqual(transformations.Kind.lowercase, fixture.compiled.transformations[fixture.compiled.rules[0].transformations_start].kind);
+    try std.testing.expectEqual(transformations.Kind.trim, fixture.compiled.transformations[fixture.compiled.rules[1].transformations_start].kind);
 }
 
 test "pinned removal target and action differential fixture" {
@@ -64,7 +65,7 @@ test "pinned removal target and action differential fixture" {
     try std.testing.expectEqual(@as(usize, 1), countActions(fixture.compiled, fixture.compiled.rules[0], "pass"));
     try std.testing.expectEqual(@as(usize, 2), countActions(fixture.compiled, fixture.compiled.rules[0], "tag"));
     try std.testing.expectEqual(@as(usize, 1), fixture.compiled.rules[0].transformations_count);
-    try std.testing.expectEqualStrings("trim", fixture.compiled.string(fixture.compiled.transformations[fixture.compiled.rules[0].transformations_start].name).?);
+    try std.testing.expectEqual(transformations.Kind.trim, fixture.compiled.transformations[fixture.compiled.rules[0].transformations_start].kind);
 }
 
 test "pinned skip-after marker differential fixture" {

@@ -1,7 +1,7 @@
 # Disruptive, flow, and runtime control actions
 
 WAF-15 compiles disruptive decisions, flow metadata, and runtime controls into
-immutable plan ABI 6. A matched standalone rule or complete chain stages these
+immutable plan ABI 7. A matched standalone rule or complete chain stages these
 decisions together with WAF-14 metadata, captures, TX/ENV writes, persistent
 mutations, and owned event evidence. Expansion, lifecycle, capability,
 persistence, allocation, or intervention errors publish none of that state.

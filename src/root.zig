@@ -21,6 +21,7 @@ pub const persistent_lmdb = @import("persistent_lmdb.zig");
 pub const selectors = @import("selectors.zig");
 pub const seclang = @import("seclang/root.zig");
 pub const variables = @import("variables.zig");
+pub const transformations = @import("transformations.zig");
 
 pub const Waf = engine.Waf;
 pub const Runtime = engine.Runtime;
