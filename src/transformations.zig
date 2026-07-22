@@ -244,6 +244,7 @@ pub const Executor = struct {
             .url_decode => self.urlDecode(input),
             .url_decode_uni => self.urlDecodeUni(input),
             .url_encode => self.urlEncode(input),
+            .utf8_to_unicode => self.utf8ToUnicode(input),
             .parity_even_7bit => self.parity(input, true),
             .parity_odd_7bit => self.parity(input, false),
             .parity_zero_7bit => self.parityZero(input),
@@ -830,6 +831,65 @@ pub const Executor = struct {
         return finish(generated, input, true);
     }
 
+    fn utf8ToUnicode(self: *Executor, input: []const u8) ApplyError!Result {
+        return switch (self.profile) {
+            .modsecurity => self.utf8ToUnicodeModSecurity(input),
+            .coraza => self.utf8ToUnicodeCoraza(input),
+        };
+    }
+
+    fn utf8ToUnicodeCoraza(self: *Executor, input: []const u8) ApplyError!Result {
+        var output_len: usize = 0;
+        var changed = false;
+        var index: usize = 0;
+        while (index < input.len) {
+            const step = strictUtf8Step(input[index..]);
+            output_len = std.math.add(usize, output_len, if (step.ascii) 1 else unicodeEscapeLen(step.code_point)) catch return error.OutputTooLarge;
+            changed = changed or !step.ascii;
+            index += step.consumed;
+        }
+        if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+
+        const generated = try self.writable(output_len);
+        index = 0;
+        while (index < input.len) {
+            const step = strictUtf8Step(input[index..]);
+            if (step.ascii) {
+                generated.buffer.appendAssumeCapacity(input[index]);
+            } else {
+                appendUnicodeEscape(generated.buffer, step.code_point);
+            }
+            index += step.consumed;
+        }
+        return finish(generated, input, true);
+    }
+
+    fn utf8ToUnicodeModSecurity(self: *Executor, input: []const u8) ApplyError!Result {
+        var output_len: usize = 0;
+        var changed = false;
+        var requires_output = false;
+        var index: usize = 0;
+        while (index < input.len) {
+            const step = modSecurityUtf8Step(input, index);
+            output_len = std.math.add(usize, output_len, step.outputLen()) catch return error.OutputTooLarge;
+            changed = changed or step.changed;
+            requires_output = requires_output or !step.isIdentity(input[index]);
+            index += step.consumed;
+        }
+        if (!requires_output) return .{ .bytes = input, .changed = changed, .storage = .borrowed };
+
+        const generated = try self.writable(output_len);
+        index = 0;
+        while (index < input.len) {
+            const step = modSecurityUtf8Step(input, index);
+            if (step.prefix_copy) generated.buffer.appendAssumeCapacity(input[index]);
+            if (step.code_point) |code_point| appendUnicodeEscape(generated.buffer, code_point);
+            for (0..step.suffix_copies) |_| generated.buffer.appendAssumeCapacity(input[index]);
+            index += step.consumed;
+        }
+        return finish(generated, input, changed);
+    }
+
     fn parity(self: *Executor, input: []const u8, even: bool) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
         const generated = try self.writable(input.len);
@@ -971,6 +1031,121 @@ const html_numeric_replacements = [_]u21{
     0x0090, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022, 0x2013, 0x2014,
     0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x009d, 0x017e, 0x0178,
 };
+
+const StrictUtf8Step = struct {
+    code_point: u21,
+    consumed: usize,
+    ascii: bool,
+};
+
+fn strictUtf8Step(input: []const u8) StrictUtf8Step {
+    if (input[0] < 0x80) return .{ .code_point = input[0], .consumed = 1, .ascii = true };
+    const sequence_len = std.unicode.utf8ByteSequenceLength(input[0]) catch
+        return .{ .code_point = 0xfffd, .consumed = 1, .ascii = false };
+    if (sequence_len > input.len)
+        return .{ .code_point = 0xfffd, .consumed = 1, .ascii = false };
+    const code_point = std.unicode.utf8Decode(input[0..sequence_len]) catch
+        return .{ .code_point = 0xfffd, .consumed = 1, .ascii = false };
+    return .{ .code_point = code_point, .consumed = sequence_len, .ascii = false };
+}
+
+const ModSecurityUtf8Step = struct {
+    code_point: ?u32 = null,
+    consumed: usize = 1,
+    prefix_copy: bool = false,
+    suffix_copies: u2 = 0,
+    changed: bool = false,
+
+    fn outputLen(self: ModSecurityUtf8Step) usize {
+        return @intFromBool(self.prefix_copy) + self.suffix_copies +
+            if (self.code_point) |code_point| unicodeEscapeLen(code_point) else 0;
+    }
+
+    fn isIdentity(self: ModSecurityUtf8Step, input_byte: u8) bool {
+        return self.consumed == 1 and self.code_point == null and
+            @as(usize, @intFromBool(self.prefix_copy)) + self.suffix_copies == 1 and input_byte != 0;
+    }
+};
+
+fn modSecurityUtf8Step(input: []const u8, index: usize) ModSecurityUtf8Step {
+    const byte = input[index];
+    if (byte < 0x80) {
+        if (byte == 0 and index + 1 < input.len) return .{};
+        return .{ .suffix_copies = 1 };
+    }
+
+    var sequence_len: usize = 0;
+    var code_point: u32 = 0;
+    if ((byte & 0xe0) == 0xc0) {
+        sequence_len = 2;
+        if (!hasContinuationBytes(input[index..], sequence_len)) return .{};
+        code_point = (@as(u32, byte & 0x1f) << 6) | (input[index + 1] & 0x3f);
+    } else if ((byte & 0xf0) == 0xe0) {
+        sequence_len = 3;
+        if (!hasContinuationBytes(input[index..], sequence_len)) return .{};
+        code_point = (@as(u32, byte & 0x0f) << 12) |
+            (@as(u32, input[index + 1] & 0x3f) << 6) |
+            (input[index + 2] & 0x3f);
+    } else if ((byte & 0xf8) == 0xf0) {
+        sequence_len = 4;
+        const prefix_copy = byte >= 0xf5;
+        if (!hasContinuationBytes(input[index..], sequence_len)) return .{ .prefix_copy = prefix_copy };
+        code_point = (@as(u32, byte & 0x07) << 18) |
+            (@as(u32, input[index + 1] & 0x3f) << 12) |
+            (@as(u32, input[index + 2] & 0x3f) << 6) |
+            (input[index + 3] & 0x3f);
+        return .{
+            .code_point = code_point,
+            .consumed = sequence_len,
+            .prefix_copy = prefix_copy,
+            .suffix_copies = @intFromBool(code_point >= 0xd800 and code_point <= 0xdfff) +
+                @intFromBool(code_point < 0x10000),
+            .changed = true,
+        };
+    } else {
+        return .{ .suffix_copies = 1 };
+    }
+
+    return .{
+        .code_point = code_point,
+        .consumed = sequence_len,
+        .suffix_copies = @intFromBool((code_point >= 0xd800 and code_point <= 0xdfff) or
+            (sequence_len == 3 and code_point < 0x800) or
+            (sequence_len == 2 and code_point < 0x80)),
+        .changed = true,
+    };
+}
+
+fn hasContinuationBytes(input: []const u8, sequence_len: usize) bool {
+    if (input.len < sequence_len) return false;
+    for (input[1..sequence_len]) |byte| if ((byte & 0xc0) != 0x80) return false;
+    return true;
+}
+
+fn unicodeEscapeLen(code_point: u32) usize {
+    return 2 + @max(4, hexDigits(code_point));
+}
+
+fn hexDigits(value: u32) usize {
+    if (value <= 0xf) return 1;
+    if (value <= 0xff) return 2;
+    if (value <= 0xfff) return 3;
+    if (value <= 0xffff) return 4;
+    if (value <= 0xfffff) return 5;
+    return 6;
+}
+
+fn appendUnicodeEscape(buffer: *std.ArrayList(u8), code_point: u32) void {
+    buffer.appendSliceAssumeCapacity("%u");
+    const digits = hexDigits(code_point);
+    for (0..4 -| digits) |_| buffer.appendAssumeCapacity('0');
+    const alphabet = "0123456789abcdef";
+    var shift: usize = digits * 4;
+    while (shift != 0) {
+        shift -= 4;
+        buffer.appendAssumeCapacity(alphabet[(code_point >> @intCast(shift)) & 0x0f]);
+    }
+}
 
 fn cEscapeByte(byte: u8) ?u8 {
     return switch (byte) {
@@ -1287,6 +1462,41 @@ test "HTML entity decoding preserves Coraza HTML5 and Unicode semantics" {
     try std.testing.expect(!short_numeric.changed);
     const unknown = try executor.apply(.html_entity_decode, "&zzzzzz;");
     try std.testing.expectEqual(Storage.borrowed, unknown.storage);
+}
+
+test "UTF-8 to Unicode profiles preserve valid and hostile byte semantics" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("A%u00e9%u20ac%u1f600", (try modsecurity.apply(.utf8_to_unicode, "Aé€😀")).bytes);
+    try std.testing.expectEqualStrings("A%u00e9%u20ac%u1f600", (try coraza.apply(.utf8_to_unicode, "Aé€😀")).bytes);
+    try std.testing.expectEqualStrings("%u002f\xc0", (try modsecurity.apply(.utf8_to_unicode, "\xc0\xaf")).bytes);
+    try std.testing.expectEqualStrings("%ufffd%ufffd", (try coraza.apply(.utf8_to_unicode, "\xc0\xaf")).bytes);
+    try std.testing.expectEqualStrings("%ud800\xed", (try modsecurity.apply(.utf8_to_unicode, "\xed\xa0\x80")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{ '(', 0xa1 }, (try modsecurity.apply(.utf8_to_unicode, "\xe2(\xa1")).bytes);
+
+    const invalid_identity = try modsecurity.apply(.utf8_to_unicode, "\xff");
+    try std.testing.expectEqual(Storage.borrowed, invalid_identity.storage);
+    try std.testing.expect(!invalid_identity.changed);
+    const invalid_coraza = try coraza.apply(.utf8_to_unicode, "\xff");
+    try std.testing.expectEqualStrings("%ufffd", invalid_coraza.bytes);
+    try std.testing.expect(invalid_coraza.changed);
+    const interior_null = try modsecurity.apply(.utf8_to_unicode, "a\x00b");
+    try std.testing.expectEqualStrings("ab", interior_null.bytes);
+    try std.testing.expect(!interior_null.changed);
+}
+
+test "UTF-8 to Unicode uses exact bounded expansion sizing" {
+    var exact = try Executor.initWithProfile(std.testing.allocator, .{
+        .max_output_bytes = 6,
+        .max_cumulative_output_bytes = 6,
+    }, .coraza);
+    defer exact.deinit();
+    try std.testing.expectEqualStrings("%u00e9", (try exact.apply(.utf8_to_unicode, "é")).bytes);
+    try std.testing.expectEqualStrings("%ufffd", (try exact.apply(.utf8_to_unicode, "\xff")).bytes);
+    try std.testing.expectError(error.OutputTooLarge, exact.apply(.utf8_to_unicode, "éé"));
 }
 
 test "executor validates deterministic input and output limits" {
