@@ -15,6 +15,9 @@ pub const Limits = struct {
     max_targets: usize = 2_000_000,
     max_actions: usize = 4_000_000,
     max_transformations: usize = 4_000_000,
+    max_prefilters: usize = 500_000,
+    max_prefilter_literals: usize = 2_000_000,
+    max_prefilter_bytes: usize = 128 * 1024 * 1024,
     max_defaults: usize = 100_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
@@ -29,6 +32,9 @@ pub const Limits = struct {
             self.max_targets == 0 or
             self.max_actions == 0 or
             self.max_transformations == 0 or
+            self.max_prefilters == 0 or
+            self.max_prefilter_literals == 0 or
+            self.max_prefilter_bytes == 0 or
             self.max_defaults == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
@@ -43,6 +49,8 @@ pub const Limits = struct {
             self.max_targets > std.math.maxInt(u32) or
             self.max_actions > std.math.maxInt(u32) or
             self.max_transformations > std.math.maxInt(u32) or
+            self.max_prefilters > std.math.maxInt(u32) or
+            self.max_prefilter_literals > std.math.maxInt(u32) or
             self.max_defaults > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
@@ -60,6 +68,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyTargets,
     TooManyActions,
     TooManyTransformations,
+    TooManyPrefilters,
+    TooManyPrefilterLiterals,
+    PrefilterBytesLimitExceeded,
     TooManyDefaults,
     TooManyArguments,
     TooManyStrings,
@@ -169,6 +180,15 @@ pub const Operator = struct {
     parameter: StringId,
     negated: bool,
     implicit_regex: bool,
+    prefilter: ?Prefilter,
+};
+
+pub const PrefilterKind = enum { exact, prefix, suffix, contains, phrases_any };
+
+pub const Prefilter = struct {
+    kind: PrefilterKind,
+    literals_start: u32,
+    literals_count: u32,
 };
 
 pub const Action = struct {
@@ -220,6 +240,7 @@ pub const Plan = struct {
     targets: []const Target,
     actions: []const Action,
     transformations: []const Transformation,
+    prefilter_literals: []const StringId,
     defaults: []const DefaultSnapshot,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
@@ -265,6 +286,21 @@ pub const Plan = struct {
     pub fn phaseRules(self: *const Plan, phase: u8) []const RuleId {
         if (phase < 1 or phase > 5) return &.{};
         return self.phase_rules[phase - 1];
+    }
+
+    /// Returns false only when the advisory prefilter proves the operator cannot
+    /// match. Callers must still execute the operator when this returns true.
+    pub fn prefilterMayMatch(self: *const Plan, value: Prefilter, input: []const u8) bool {
+        const ids = self.prefilter_literals[value.literals_start..][0..value.literals_count];
+        return switch (value.kind) {
+            .exact => std.mem.eql(u8, input, self.string(ids[0]).?),
+            .prefix => std.mem.startsWith(u8, input, self.string(ids[0]).?),
+            .suffix => std.mem.endsWith(u8, input, self.string(ids[0]).?),
+            .contains => std.mem.indexOf(u8, input, self.string(ids[0]).?) != null,
+            .phrases_any => for (ids) |id| {
+                if (std.mem.indexOf(u8, input, self.string(id).?) != null) break true;
+            } else false,
+        };
     }
 };
 
@@ -332,6 +368,9 @@ const Compiler = struct {
     targets: std.ArrayList(Target) = .empty,
     actions: std.ArrayList(Action) = .empty,
     transformations: std.ArrayList(Transformation) = .empty,
+    prefilter_literals: std.ArrayList(StringId) = .empty,
+    prefilter_count: usize = 0,
+    prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
@@ -351,6 +390,7 @@ const Compiler = struct {
         self.targets.deinit(self.allocator);
         self.actions.deinit(self.allocator);
         self.transformations.deinit(self.allocator);
+        self.prefilter_literals.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
@@ -452,6 +492,7 @@ const Compiler = struct {
         }
         const transformation_range = self.addTransformations(self.active_default, action_range) catch |cause|
             return self.fail(cause, actionSpan(directive), null);
+        const prefilter = try self.addPrefilter(parsed_operator);
         try self.rules.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
@@ -469,6 +510,7 @@ const Compiler = struct {
                 .parameter = try self.interner.intern(parsed_operator.parameter),
                 .negated = parsed_operator.negated,
                 .implicit_regex = parsed_operator.implicit_regex,
+                .prefilter = prefilter,
             },
             .actions_start = action_range.start,
             .actions_count = action_range.count,
@@ -523,6 +565,55 @@ const Compiler = struct {
         return .{ .start = start, .count = try typedIndex(pipeline.items.len) };
     }
 
+    fn addPrefilter(self: *Compiler, operator: seclang.syntax.Operator) CompileError!?Prefilter {
+        // A missing literal can make a negated operator match, so it cannot be
+        // used as a rejection prefilter.
+        if (operator.negated) return null;
+        const normalized = unquote(operator.parameter);
+        const kind: PrefilterKind = if (std.ascii.eqlIgnoreCase(operator.name, "streq"))
+            .exact
+        else if (std.ascii.eqlIgnoreCase(operator.name, "beginsWith"))
+            .prefix
+        else if (std.ascii.eqlIgnoreCase(operator.name, "endsWith"))
+            .suffix
+        else if (std.ascii.eqlIgnoreCase(operator.name, "contains"))
+            .contains
+        else if (std.ascii.eqlIgnoreCase(operator.name, "pm"))
+            .phrases_any
+        else if (std.ascii.eqlIgnoreCase(operator.name, "rx") and isLiteralRegex(normalized))
+            .contains
+        else
+            return null;
+        const parameter = if (kind == .phrases_any) operator.parameter else normalized;
+        if (parameter.len == 0) return null;
+
+        if (self.prefilter_count == self.limits.max_prefilters) return error.TooManyPrefilters;
+        const start = try typedIndex(self.prefilter_literals.items.len);
+        if (kind == .phrases_any) {
+            if (!safePhraseList(parameter)) return null;
+            var words = std.mem.tokenizeAny(u8, parameter, " \t\r\n");
+            while (words.next()) |word| try self.addPrefilterLiteral(word);
+            if (self.prefilter_literals.items.len == start) return null;
+        } else {
+            try self.addPrefilterLiteral(parameter);
+        }
+        self.prefilter_count += 1;
+        return .{
+            .kind = kind,
+            .literals_start = start,
+            .literals_count = try typedIndex(self.prefilter_literals.items.len - start),
+        };
+    }
+
+    fn addPrefilterLiteral(self: *Compiler, literal: []const u8) CompileError!void {
+        if (self.prefilter_literals.items.len == self.limits.max_prefilter_literals)
+            return error.TooManyPrefilterLiterals;
+        if (literal.len > self.limits.max_prefilter_bytes -| self.prefilter_bytes)
+            return error.PrefilterBytesLimitExceeded;
+        try self.prefilter_literals.append(self.allocator, try self.interner.intern(literal));
+        self.prefilter_bytes += literal.len;
+    }
+
     fn applyTransformations(self: *Compiler, pipeline: *std.ArrayList(StringId), range: ActionRange) CompileError!void {
         const actions = self.actions.items[range.start..][0..range.count];
         for (actions) |action| {
@@ -555,6 +646,7 @@ const Compiler = struct {
         const targets = try duplicateCounted(Target, arena_allocator, self.targets.items, &owned_bytes, self.limits);
         const actions = try duplicateCounted(Action, arena_allocator, self.actions.items, &owned_bytes, self.limits);
         const transformations = try duplicateCounted(Transformation, arena_allocator, self.transformations.items, &owned_bytes, self.limits);
+        const prefilter_literals = try duplicateCounted(StringId, arena_allocator, self.prefilter_literals.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
@@ -574,6 +666,7 @@ const Compiler = struct {
             .targets = targets,
             .actions = actions,
             .transformations = transformations,
+            .prefilter_literals = prefilter_literals,
             .defaults = defaults,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
@@ -646,6 +739,23 @@ fn unquote(input: []const u8) []const u8 {
         return input[1 .. input.len - 1];
     }
     return input;
+}
+
+fn isLiteralRegex(pattern: []const u8) bool {
+    if (pattern.len == 0) return false;
+    for (pattern) |byte| switch (byte) {
+        '\\', '.', '^', '$', '*', '+', '?', '(', ')', '[', ']', '{', '}', '|' => return false,
+        else => {},
+    };
+    return true;
+}
+
+fn safePhraseList(parameter: []const u8) bool {
+    for (parameter) |byte| switch (byte) {
+        '\\', '\'', '"' => return false,
+        else => {},
+    };
+    return true;
 }
 
 fn validateDocument(registry: *const seclang.source.Registry, document: *const seclang.parser.Document) CompileError!void {
@@ -904,4 +1014,50 @@ test "compile outcome identifies chain and transformation failures" {
             },
         }
     }
+}
+
+test "compiler emits only conservative literal prefilters" {
+    const input =
+        \\SecRule ARGS "@streq alpha" id:1
+        \\SecRule ARGS "@beginsWith beta" id:2
+        \\SecRule ARGS "@endsWith gamma" id:3
+        \\SecRule ARGS "@contains delta" id:4
+        \\SecRule ARGS "@pm one two three" id:5
+        \\SecRule ARGS "plain literal" id:6
+        \\SecRule ARGS "^anchored$" id:7
+        \\SecRule ARGS "@pm 'quoted phrase'" id:8
+        \\SecRule ARGS "!@contains negated" id:9
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "prefilters.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    const expected = [_]?PrefilterKind{ .exact, .prefix, .suffix, .contains, .phrases_any, .contains, null, null, null };
+    for (compiled.rules, expected) |rule, kind| {
+        try std.testing.expectEqual(kind, if (rule.operator.prefilter) |value| value.kind else null);
+    }
+    const phrase = compiled.rules[4].operator.prefilter.?;
+    try std.testing.expectEqual(@as(u32, 3), phrase.literals_count);
+    const phrase_ids = compiled.prefilter_literals[phrase.literals_start..][0..phrase.literals_count];
+    try std.testing.expectEqualStrings("one", compiled.string(phrase_ids[0]).?);
+    try std.testing.expectEqualStrings("two", compiled.string(phrase_ids[1]).?);
+    try std.testing.expectEqualStrings("three", compiled.string(phrase_ids[2]).?);
+
+    try std.testing.expect(compiled.prefilterMayMatch(compiled.rules[0].operator.prefilter.?, "alpha"));
+    try std.testing.expect(!compiled.prefilterMayMatch(compiled.rules[0].operator.prefilter.?, "alphabet"));
+    try std.testing.expect(compiled.prefilterMayMatch(compiled.rules[1].operator.prefilter.?, "beta-tail"));
+    try std.testing.expect(compiled.prefilterMayMatch(compiled.rules[2].operator.prefilter.?, "head-gamma"));
+    try std.testing.expect(compiled.prefilterMayMatch(compiled.rules[3].operator.prefilter.?, "has delta here"));
+    try std.testing.expect(compiled.prefilterMayMatch(phrase, "contains two here"));
+    try std.testing.expect(!compiled.prefilterMayMatch(phrase, "absent values"));
+}
+
+test "prefilter limits fail explicitly" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "prefilter-limits.conf", "SecRule ARGS \"@pm one two\" id:1", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(error.TooManyPrefilterLiterals, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_prefilter_literals = 1 }));
+    try std.testing.expectError(error.PrefilterBytesLimitExceeded, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_prefilter_bytes = 3 }));
 }
