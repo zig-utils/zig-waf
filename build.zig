@@ -111,6 +111,13 @@ pub fn build(b: *std.Build) void {
     const plan_corpus_step = b.step("test-plan-corpus", "Compile structural plans beneath corpus roots");
     plan_corpus_step.dependOn(&run_plan_corpus.step);
 
+    const run_directive_corpus = b.addRunArtifact(parser_corpus);
+    run_directive_corpus.addArg("--validate-directives");
+    if (b.option([]const []const u8, "directive-corpus", "SecLang directive corpus file or directory (repeatable)")) |corpus_roots|
+        run_directive_corpus.addArgs(corpus_roots);
+    const directive_corpus_step = b.step("test-directive-corpus", "Validate stable directives beneath corpus roots");
+    directive_corpus_step.dependOn(&run_directive_corpus.step);
+
     const parser_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_fuzz.zig"),
         .target = target,

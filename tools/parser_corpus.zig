@@ -9,18 +9,24 @@ pub fn main(init: std.process.Init) !void {
     var totals: Totals = .{};
     var root_count: usize = 0;
     var compile_plans = false;
+    var validate_directives = false;
     while (arguments.next()) |root| {
         if (std.mem.eql(u8, root, "--compile-plan")) {
             compile_plans = true;
             continue;
         }
+        if (std.mem.eql(u8, root, "--validate-directives")) {
+            compile_plans = true;
+            validate_directives = true;
+            continue;
+        }
         root_count += 1;
-        try parseRoot(init.gpa, init.io, root, compile_plans, &totals);
+        try parseRoot(init.gpa, init.io, root, compile_plans, validate_directives, &totals);
     }
     if (root_count == 0) return error.MissingCorpusRoot;
     std.debug.print(
-        "parser corpus roots={d} files={d} bytes={d} directives={d} plans={d} rules={d} plan_owned_bytes={d}\n",
-        .{ root_count, totals.files, totals.bytes, totals.directives, totals.plans, totals.rules, totals.plan_owned_bytes },
+        "parser corpus roots={d} files={d} bytes={d} directives={d} plans={d} validated={d} rules={d} plan_owned_bytes={d}\n",
+        .{ root_count, totals.files, totals.bytes, totals.directives, totals.plans, totals.validated, totals.rules, totals.plan_owned_bytes },
     );
 }
 
@@ -29,17 +35,25 @@ const Totals = struct {
     bytes: usize = 0,
     directives: usize = 0,
     plans: usize = 0,
+    validated: usize = 0,
     rules: usize = 0,
     plan_owned_bytes: usize = 0,
 };
 
-fn parseRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, compile_plans: bool, totals: *Totals) !void {
+fn parseRoot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root_path: []const u8,
+    compile_plans: bool,
+    validate_directives: bool,
+    totals: *Totals,
+) !void {
     const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, root_path, allocator);
     defer allocator.free(canonical_root);
     const stat = try std.Io.Dir.cwd().statFile(io, canonical_root, .{});
     if (stat.kind == .file) {
         if (!isConfiguration(std.fs.path.basename(canonical_root))) return error.NotConfigurationFile;
-        return parseFile(allocator, io, canonical_root, compile_plans, totals);
+        return parseFile(allocator, io, canonical_root, compile_plans, validate_directives, totals);
     }
     if (stat.kind != .directory) return error.InvalidCorpusRoot;
     var directory = try std.Io.Dir.openDirAbsolute(io, canonical_root, .{ .iterate = true });
@@ -50,11 +64,18 @@ fn parseRoot(allocator: std.mem.Allocator, io: std.Io, root_path: []const u8, co
         if (entry.kind != .file or !isConfiguration(entry.basename)) continue;
         const path = try std.fs.path.join(allocator, &.{ canonical_root, entry.path });
         defer allocator.free(path);
-        try parseFile(allocator, io, path, compile_plans, totals);
+        try parseFile(allocator, io, path, compile_plans, validate_directives, totals);
     }
 }
 
-fn parseFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, compile_plans: bool, totals: *Totals) !void {
+fn parseFile(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    path: []const u8,
+    compile_plans: bool,
+    validate_directives: bool,
+    totals: *Totals,
+) !void {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32 * 1024 * 1024));
     defer allocator.free(bytes);
     var parsed = try waf.seclang.parser.parseBytesOutcome(allocator, path, bytes, .{}, .{});
@@ -74,6 +95,17 @@ fn parseFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, compile
                 totals.plans += 1;
                 totals.rules += compiled.rules.len;
                 totals.plan_owned_bytes += compiled.owned_bytes;
+                if (validate_directives) switch (waf.directives.validatePlan(compiled, .full())) {
+                    .valid => totals.validated += 1,
+                    .diagnostic => |diagnostic| {
+                        const location = try compiled.sourceLocation(diagnostic.primary.source, diagnostic.primary.start);
+                        std.debug.print(
+                            "{s}:{d}:{d}: {s}: {s}\n",
+                            .{ path, location.line, location.column, diagnostic.code.id(), diagnostic.message },
+                        );
+                        return error.DirectiveCorpusValidationFailed;
+                    },
+                };
             }
         },
         .diagnostic => |value| {

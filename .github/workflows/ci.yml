@@ -100,6 +100,15 @@ jobs:
           -Dplan-corpus=../owasp-crs/rules
           -Dplan-corpus=../modsecurity
           -Dplan-corpus=../coraza
+      - name: Stable directive corpus
+        working-directory: zig-waf
+        run: >-
+          zig build test-directive-corpus
+          -Ddirective-corpus=../owasp-crs/crs-setup.conf.example
+          -Ddirective-corpus=../owasp-crs/plugins
+          -Ddirective-corpus=../owasp-crs/rules
+          -Ddirective-corpus=../modsecurity
+          -Ddirective-corpus=../coraza
       - name: CRS parser benchmark
         working-directory: zig-waf
         run: >-
