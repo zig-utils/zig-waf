@@ -40,6 +40,16 @@ jobs:
           repository: coreruleset/coreruleset
           ref: 55b09f5acfd16413e7b31041100711ceb7adc89c
           path: owasp-crs
+      - uses: actions/checkout@v4
+        with:
+          repository: owasp-modsecurity/ModSecurity
+          ref: 7ea9fefbe0ba409d8733b4d682c8c4c059cd028d
+          path: modsecurity
+      - uses: actions/checkout@v4
+        with:
+          repository: corazawaf/coraza
+          ref: 27069d06c896be74b77b9a6c0b539a0cbfaca360
+          path: coraza
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0-dev.1441+d5181a9c9
@@ -61,6 +71,8 @@ jobs:
           test "$(git -C ../zig-tls rev-parse HEAD)" = "$(jq -r '.repositories["zig-tls"].commit' dependencies.lock.json)"
           test "$(git -C ../stx rev-parse HEAD)" = "$(jq -r '.repositories.stx.commit' dependencies.lock.json)"
           test "$(git -C ../owasp-crs rev-parse HEAD)" = "$(jq -r '.repositories["owasp-crs"].commit' dependencies.lock.json)"
+          test "$(git -C ../modsecurity rev-parse HEAD)" = "$(jq -r '.repositories.modsecurity.commit' dependencies.lock.json)"
+          test "$(git -C ../coraza rev-parse HEAD)" = "$(jq -r '.repositories.coraza.commit' dependencies.lock.json)"
       - name: Format
         working-directory: zig-waf
         run: zig fmt --check build.zig src benchmarks tools
@@ -77,6 +89,8 @@ jobs:
           -Dparser-corpus=../owasp-crs/crs-setup.conf.example
           -Dparser-corpus=../owasp-crs/plugins
           -Dparser-corpus=../owasp-crs/rules
+          -Dparser-corpus=../modsecurity
+          -Dparser-corpus=../coraza
       - name: CRS parser benchmark
         working-directory: zig-waf
         run: >-

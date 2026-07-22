@@ -26,6 +26,18 @@
       "version": "4.28.0",
       "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c",
       "localPath": "../owasp-crs"
+    },
+    "modsecurity": {
+      "repository": "owasp-modsecurity/ModSecurity",
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d",
+      "localPath": "../modsecurity"
+    },
+    "coraza": {
+      "repository": "corazawaf/coraza",
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360",
+      "localPath": "../coraza"
     }
   }
 }
