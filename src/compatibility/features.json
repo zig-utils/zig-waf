@@ -198,6 +198,28 @@
       "notes": "Phase-scoped defaults, ID/tag/message removal, ordered target and action overlays, source-ordered marker linking, explicit missing-rule policy, and authenticated bounded remote assembly are immutable compile-time behavior. Pinned upstream-derived fixtures, allocation-failure tests, deterministic fuzzing, corpus gates, and baseline/overlay ReleaseFast measurements are executable."
     },
     {
+      "id": "engine.metadata-nondisruptive-actions",
+      "area": "engine",
+      "name": "Typed metadata, non-disruptive effects, captures, persistence, and owned event intent",
+      "status": "verified",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/15",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/action_config.zig",
+        "src/engine.zig",
+        "src/persistent.zig",
+        "src/action_evidence.zig",
+        "src/action_fuzz.zig",
+        "src/compatibility/fixtures/non-disruptive-actions",
+        "src/compatibility/evidence/non-disruptive-actions.json",
+        "benchmarks/actions.zig",
+        "docs/non-disruptive-actions.md"
+      ],
+      "notes": "Metadata and effect text compile once; standalone rules and complete chains apply through bounded atomic local/persistent staging. Post-action owned intent, capture replacement, transaction-local ENV, checked TX/persistent arithmetic, binding, expiry, deterministic decay, failure policy, differential fixtures, fuzzing, and latency/allocation benchmarks are executable."
+    },
+    {
       "id": "fleet.postgresql-18",
       "area": "fleet",
       "name": "Pantry-managed PostgreSQL 18 and native libpq 18",

@@ -146,6 +146,9 @@ jobs:
       - name: Deterministic directive validation fuzzing
         working-directory: zig-waf
         run: zig build fuzz-directives -Ddirective-fuzz-iterations=10000
+      - name: Deterministic non-disruptive action fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-actions -Daction-fuzz-iterations=10000
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
@@ -161,3 +164,6 @@ jobs:
       - name: Persistence benchmark
         working-directory: zig-waf
         run: zig build bench-persistence -Doptimize=ReleaseFast
+      - name: Non-disruptive action benchmark
+        working-directory: zig-waf
+        run: zig build bench-actions -Doptimize=ReleaseFast
