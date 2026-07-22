@@ -45,6 +45,10 @@ transaction-local `TX`. The persistent action surface consists of
 these same APIs for `initcol`, `setuid`, `setsid`, `setrsc`, `setvar`, and
 `expirevar`.
 
+The action-facing `setSessionCollection`, `setUserCollection`, and
+`setResourceCollection` helpers bind the matching persistent key and publish
+the `SESSIONID`, `USERID`, or scalar `RESOURCE` compatibility value.
+
 ## Concurrency and atomicity
 
 Every stored record has a monotonic revision. A commit supplies its expected

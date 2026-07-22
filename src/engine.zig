@@ -814,6 +814,24 @@ pub const Transaction = struct {
         return .loaded;
     }
 
+    pub fn setSessionCollection(self: *Transaction, session_id: []const u8) TransactionError!PersistentInitialization {
+        const result = try self.initializePersistentCollection(.session, session_id);
+        try self.setScalar(.session_id, session_id, .rule, .request_headers);
+        return result;
+    }
+
+    pub fn setUserCollection(self: *Transaction, user_id: []const u8) TransactionError!PersistentInitialization {
+        const result = try self.initializePersistentCollection(.user, user_id);
+        try self.setScalar(.user_id, user_id, .rule, .request_headers);
+        return result;
+    }
+
+    pub fn setResourceCollection(self: *Transaction, resource_id: []const u8) TransactionError!PersistentInitialization {
+        const result = try self.initializePersistentCollection(.resource, resource_id);
+        try self.setScalar(.resource, resource_id, .rule, .request_headers);
+        return result;
+    }
+
     pub fn setPersistentCollectionValue(
         self: *Transaction,
         namespace: persistent.Namespace,
@@ -1713,6 +1731,25 @@ test "TX numeric mutation follows setvar prefix and overflow semantics" {
     try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", source);
     try std.testing.expectError(error.CapacityExceeded, tx.addTransactionCollectionValue("maximum", 1));
     try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
+}
+
+test "setsid setuid and setrsc bind keys and compatibility scalars" {
+    var memory = persistent.InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setPersistentBackend(memory.backend());
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/account", "GET", "HTTP/1.1");
+    try std.testing.expectEqual(PersistentInitialization.loaded, try tx.setSessionCollection("session-1"));
+    try std.testing.expectEqual(PersistentInitialization.loaded, try tx.setUserCollection("alice"));
+    try std.testing.expectEqual(PersistentInitialization.loaded, try tx.setResourceCollection("/account"));
+    try std.testing.expectEqualStrings("session-1", (try tx.scalar(.session_id)).?.value);
+    try std.testing.expectEqualStrings("alice", (try tx.scalar(.user_id)).?.value);
+    try std.testing.expectEqualStrings("/account", (try tx.scalar(.resource)).?.value);
 }
 
 test "compiled feature discovery is explicit" {

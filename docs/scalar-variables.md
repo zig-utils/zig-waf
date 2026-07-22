@@ -3,7 +3,7 @@
 Issue [WAF-07](https://github.com/zig-utils/zig-waf/issues/8) establishes the
 bounded scalar registry and the transaction producers needed by later rule,
 body, and collection work. `variables.Name` is the executable source of truth:
-all 77 canonical names round-trip case-insensitively and have a minimum phase
+all 78 canonical names round-trip case-insensitively and have a minimum phase
 and default origin. `MULTIPART_SEMICOLON_MISSING` is accepted as the historical
 alias for `MULTIPART_MISSING_SEMICOLON`.
 

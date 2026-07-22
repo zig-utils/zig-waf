@@ -95,7 +95,7 @@
         "src/variables.zig",
         "src/engine.zig"
       ],
-      "notes": "The 77-name stable scalar registry, aliases, origins, phase gates, connection/request/response producers, UTC timing, monotonic duration, body diagnostics, identity, matched values, and minimum-severity semantics are executable. Collection-derived aggregates remain WAF-08; full buffered body materialization remains WAF-24/WAF-28."
+      "notes": "The 78-name stable scalar registry, aliases, origins, phase gates, connection/request/response producers, UTC timing, monotonic duration, body diagnostics, identity, persistent RESOURCE binding, matched values, and minimum-severity semantics are executable. Full buffered body materialization remains WAF-24/WAF-28."
     },
     {
       "id": "engine.collection-variables",

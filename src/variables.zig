@@ -55,6 +55,7 @@ pub const Name = enum {
     request_protocol,
     request_uri,
     request_uri_raw,
+    resource,
     res_body_error,
     res_body_error_msg,
     res_body_processor,
@@ -135,6 +136,7 @@ pub const Name = enum {
             .request_protocol => "REQUEST_PROTOCOL",
             .request_uri => "REQUEST_URI",
             .request_uri_raw => "REQUEST_URI_RAW",
+            .resource => "RESOURCE",
             .res_body_error => "RES_BODY_ERROR",
             .res_body_error_msg => "RES_BODY_ERROR_MSG",
             .res_body_processor => "RES_BODY_PROCESSOR",
@@ -466,7 +468,7 @@ test "scalar store bounds individual and aggregate values" {
 
 test "stable scalar union round trips without duplicate SecLang names" {
     const names = std.meta.tags(Name);
-    try std.testing.expectEqual(@as(usize, 77), names.len);
+    try std.testing.expectEqual(@as(usize, 78), names.len);
     for (names, 0..) |name, index| {
         try std.testing.expectEqual(name, Name.parse(name.secLangName()).?);
         const lowercase = try std.ascii.allocLowerString(std.testing.allocator, name.secLangName());
