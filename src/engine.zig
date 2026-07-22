@@ -66,6 +66,8 @@ pub const Limits = struct {
     max_match_name_bytes: usize = 4096,
     max_match_value_bytes: usize = 1024 * 1024,
     max_captures: usize = 10,
+    max_match_intents: usize = 1024,
+    max_match_intent_bytes: usize = 4 * 1024 * 1024,
     collection_limits: collections.Limits = .{},
 
     fn validate(self: Limits) ConfigError!void {
@@ -79,7 +81,10 @@ pub const Limits = struct {
             self.max_match_name_bytes == 0 or
             self.max_match_value_bytes == 0 or
             self.max_captures == 0 or
-            self.max_captures > 10)
+            self.max_captures > 10 or
+            self.max_match_intents == 0 or
+            self.max_match_intents > std.math.maxInt(u32) or
+            self.max_match_intent_bytes == 0)
         {
             return error.InvalidLimit;
         }
@@ -450,6 +455,8 @@ pub const TransactionError = error{
     TooManyCaptures,
     InvalidEnvironmentName,
     InvalidActionValue,
+    TooManyMatchIntents,
+    MatchIntentStorageLimitExceeded,
     CollectionSizeOverflow,
     PersistentBackendNotConfigured,
     PersistentTimestampOverflow,
@@ -494,7 +501,28 @@ pub const RuleProjection = struct {
     tags_count: u32,
 };
 
+pub const MatchIntentId = enum(u32) { _ };
+
+pub const MatchIntent = struct {
+    rule: compiled_plan.RuleId,
+    chain_head: compiled_plan.RuleId,
+    external_id: ?u64,
+    severity: ?u3,
+    message: ?[]const u8,
+    log_data: ?[]const u8,
+    tags: []const []const u8,
+    matched_name: []const u8,
+    matched_value: []const u8,
+    matched_source: collections.Source,
+    log: bool,
+    audit_log: bool,
+    effects_applied: usize,
+    captures_written: usize,
+    pending_persistent_effects: usize,
+};
+
 pub const LocalEffectOutcome = struct {
+    intent: MatchIntentId,
     projection: RuleProjection,
     effects_applied: usize,
     captures_written: usize,
@@ -635,6 +663,26 @@ const ScalarShadowBatch = struct {
     }
 };
 
+const PreparedMatchIntent = struct {
+    allocator: std.mem.Allocator,
+    value: MatchIntent,
+    owned_bytes: usize,
+
+    fn deinit(self: *PreparedMatchIntent) void {
+        deinitMatchIntent(self.allocator, &self.value);
+        self.* = undefined;
+    }
+};
+
+fn deinitMatchIntent(allocator: std.mem.Allocator, intent: *MatchIntent) void {
+    if (intent.message) |value| allocator.free(value);
+    if (intent.log_data) |value| allocator.free(value);
+    for (intent.tags) |value| allocator.free(value);
+    allocator.free(intent.tags);
+    allocator.free(intent.matched_name);
+    allocator.free(intent.matched_value);
+}
+
 /// Isolated per-request mutable state.
 ///
 /// The initial implementation records only bounded metadata and body byte
@@ -655,6 +703,8 @@ pub const Transaction = struct {
     persistent_session: ?persistent.Session,
     last_persistent_failure: ?PersistentFailure = null,
     persistent_failed_open: u8 = 0,
+    match_intents: std.ArrayList(MatchIntent) = .empty,
+    match_intent_bytes: usize = 0,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -794,6 +844,7 @@ pub const Transaction = struct {
         defer batch.deinit();
         var scalar_batch: ScalarShadowBatch = .{ .allocator = self.waf.allocator };
         defer scalar_batch.deinit();
+        try self.stageDuration(&scalar_batch);
         const persistence_checkpoint = if (include_persistent)
             if (self.persistent_session) |*session| session.checkpoint() else null
         else
@@ -802,7 +853,11 @@ pub const Transaction = struct {
             self.persistent_session.?.rollback(checkpoint_value);
         };
         const projection = try self.stageRuleProjection(&batch, rule_id, selected, head, plan);
+        if (self.match_intents.items.len == self.waf.config.limits.max_match_intents)
+            return error.TooManyMatchIntents;
+        const intent_id: MatchIntentId = @fromBackingInt(@as(u32, @intCast(self.match_intents.items.len)));
         var result: LocalEffectOutcome = .{
+            .intent = intent_id,
             .projection = projection,
             .effects_applied = 0,
             .captures_written = 0,
@@ -969,6 +1024,13 @@ pub const Transaction = struct {
             }
         }
 
+        var prepared_intent = try self.prepareMatchIntent(rule_id, selected, head, context, result, &batch, &scalar_batch, plan);
+        var intent_committed = false;
+        defer if (!intent_committed) prepared_intent.deinit();
+        if (prepared_intent.owned_bytes > self.waf.config.limits.max_match_intent_bytes -| self.match_intent_bytes)
+            return error.MatchIntentStorageLimitExceeded;
+        try self.match_intents.ensureUnusedCapacity(self.waf.allocator, 1);
+
         const keys = try self.waf.allocator.alloc(collections.Key, batch.items.items.len);
         defer self.waf.allocator.free(keys);
         var value_count: usize = 0;
@@ -999,6 +1061,9 @@ pub const Transaction = struct {
         defer prepared_scalars.deinit();
         try self.collection_variables.replaceKeyGroups(keys, values);
         self.scalar_variables.commitPreparedBatch(&prepared_scalars);
+        self.match_intents.appendAssumeCapacity(prepared_intent.value);
+        self.match_intent_bytes += prepared_intent.owned_bytes;
+        intent_committed = true;
         return result;
     }
 
@@ -1510,6 +1575,16 @@ pub const Transaction = struct {
         return self.last_persistent_failure;
     }
 
+    pub fn matchIntentCount(self: *const Transaction) usize {
+        return self.match_intents.items.len;
+    }
+
+    pub fn matchIntent(self: *const Transaction, id: MatchIntentId) ?MatchIntent {
+        const index: usize = @backingInt(id);
+        if (index >= self.match_intents.items.len) return null;
+        return self.match_intents.items[index];
+    }
+
     pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         return try self.collection_variables.remove(name, selector);
@@ -1548,7 +1623,6 @@ pub const Transaction = struct {
         const program = plan.macro_programs[program_index];
         if (program.tokens_start + program.tokens_count > plan.macro_tokens.len)
             return error.InvalidRuleReference;
-        try self.updateDuration();
         var output: std.ArrayList(u8) = .empty;
         errdefer output.deinit(allocator);
         for (plan.macro_tokens[program.tokens_start..][0..program.tokens_count]) |token| {
@@ -1713,9 +1787,104 @@ pub const Transaction = struct {
         return count;
     }
 
+    fn prepareMatchIntent(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        selected: compiled_plan.Rule,
+        head: compiled_plan.Rule,
+        context: MatchContext,
+        outcome: LocalEffectOutcome,
+        batch: *const ShadowBatch,
+        scalar_batch: *const ScalarShadowBatch,
+        plan: *const compiled_plan.Plan,
+    ) TransactionError!PreparedMatchIntent {
+        const metadata = head.metadata;
+        if (metadata.tags_start + metadata.tags_count > plan.metadata_tags.len)
+            return error.InvalidRuleReference;
+        const limit = self.waf.config.limits.max_match_intent_bytes;
+        var owned_bytes: usize = @sizeOf(MatchIntent);
+        const tag_table_bytes = std.math.mul(usize, metadata.tags_count, @sizeOf([]const u8)) catch
+            return error.MatchIntentStorageLimitExceeded;
+        if (tag_table_bytes > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+        owned_bytes += tag_table_bytes;
+
+        const message = if (metadata.message) |text|
+            try self.expandEffectTextStaged(text, batch, scalar_batch, plan)
+        else
+            null;
+        errdefer if (message) |value| self.waf.allocator.free(value);
+        if (message) |value| {
+            if (value.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+            owned_bytes += value.len;
+        }
+        const log_data = if (metadata.log_data) |text|
+            try self.expandEffectTextStaged(text, batch, scalar_batch, plan)
+        else
+            null;
+        errdefer if (log_data) |value| self.waf.allocator.free(value);
+        if (log_data) |value| {
+            if (value.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+            owned_bytes += value.len;
+        }
+
+        const tags = try self.waf.allocator.alloc([]const u8, metadata.tags_count);
+        var initialized_tags: usize = 0;
+        errdefer {
+            for (tags[0..initialized_tags]) |value| self.waf.allocator.free(value);
+            self.waf.allocator.free(tags);
+        }
+        for (plan.metadata_tags[metadata.tags_start..][0..metadata.tags_count], tags) |text, *destination| {
+            const expanded = try self.expandEffectTextStaged(text, batch, scalar_batch, plan);
+            errdefer self.waf.allocator.free(expanded);
+            if (expanded.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+            owned_bytes += expanded.len;
+            destination.* = expanded;
+            initialized_tags += 1;
+        }
+
+        const matched_name = try self.waf.allocator.dupe(u8, context.name);
+        errdefer self.waf.allocator.free(matched_name);
+        if (matched_name.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+        owned_bytes += matched_name.len;
+        const matched_value = try self.waf.allocator.dupe(u8, context.value);
+        errdefer self.waf.allocator.free(matched_value);
+        if (matched_value.len > limit -| owned_bytes) return error.MatchIntentStorageLimitExceeded;
+        owned_bytes += matched_value.len;
+
+        return .{
+            .allocator = self.waf.allocator,
+            .owned_bytes = owned_bytes,
+            .value = .{
+                .rule = rule_id,
+                .chain_head = selected.chain_head,
+                .external_id = head.external_id,
+                .severity = if (metadata.severity) |severity| @backingInt(severity) else null,
+                .message = message,
+                .log_data = log_data,
+                .tags = tags,
+                .matched_name = matched_name,
+                .matched_value = matched_value,
+                .matched_source = context.source,
+                .log = outcome.log,
+                .audit_log = outcome.audit_log,
+                .effects_applied = outcome.effects_applied,
+                .captures_written = outcome.captures_written,
+                .pending_persistent_effects = outcome.pending_persistent_effects,
+            },
+        };
+    }
+
+    fn stageDuration(self: *Transaction, scalar_batch: *ScalarShadowBatch) TransactionError!void {
+        const now = self.waf.now();
+        const elapsed = @max(@as(i96, 0), now.awake_nanoseconds - self.started_awake_nanoseconds);
+        const rendered = try std.fmt.allocPrint(self.waf.allocator, "{d}", .{@divTrunc(elapsed, std.time.ns_per_ms)});
+        errdefer self.waf.allocator.free(rendered);
+        try scalar_batch.putOwned(.duration, rendered, .timing, .request_headers);
+    }
+
     fn expandEffectTextStaged(
         self: *Transaction,
-        text: compiled_plan.EffectText,
+        text: anytype,
         batch: *const ShadowBatch,
         scalar_batch: *const ScalarShadowBatch,
         plan: *const compiled_plan.Plan,
@@ -1862,6 +2031,9 @@ pub const Transaction = struct {
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
         if (self.persistent_session) |*session| session.deinit();
+        for (self.match_intents.items) |*intent| deinitMatchIntent(self.waf.allocator, intent);
+        self.match_intents.deinit(self.waf.allocator);
+        self.match_intent_bytes = 0;
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
@@ -2793,7 +2965,7 @@ test "compiled effect text expands typed scalar keyed and unkeyed macros" {
 test "local matched-rule effects preflight sequential shadow state and commit atomically" {
     const input =
         \\SecDefaultAction "phase:2,log,auditlog,pass"
-        \\SecRule ARGS @rx "id:42,msg:'rule message',severity:CRITICAL,capture,nolog,setvar:'tx.a=1',setvar:'tx.b=+2',setvar:'tx.c=%{TX.a}',setvar:'tx.a=+%{TX.b}',setvar:'!tx.old',setvar:'tx.rule_msg=%{RULE.msg}',setenv:'ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST=%{TX.a}'"
+        \\SecRule ARGS @rx "id:42,msg:'rule %{TX.a}',logdata:'score=%{TX.b}',tag:'first',tag:'score-%{TX.a}',severity:CRITICAL,capture,nolog,setvar:'tx.a=1',setvar:'tx.b=+2',setvar:'tx.c=%{TX.a}',setvar:'tx.a=+%{TX.b}',setvar:'!tx.old',setvar:'tx.rule_msg=%{RULE.msg}',setenv:'ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST=%{TX.a}'"
     ;
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "local-effects.conf", input, .{}, .{});
     defer parsed.deinit();
@@ -2830,14 +3002,28 @@ test "local matched-rule effects preflight sequential shadow state and commit at
     try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "b")).?.value);
     try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.tx, "c")).?.value);
     try std.testing.expect((try tx.collectionFirst(.tx, "old")) == null);
-    try std.testing.expectEqualStrings("rule message", (try tx.collectionFirst(.tx, "rule_msg")).?.value);
+    try std.testing.expectEqualStrings("rule %{TX.a}", (try tx.collectionFirst(.tx, "rule_msg")).?.value);
     try std.testing.expectEqualStrings("6", (try tx.collectionFirst(.env, "ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST")).?.value);
-    try std.testing.expectEqualStrings("rule message", (try tx.collectionFirst(.rule, "msg")).?.value);
+    try std.testing.expectEqualStrings("rule %{TX.a}", (try tx.collectionFirst(.rule, "msg")).?.value);
     try std.testing.expectEqualStrings("value", (try tx.collectionFirst(.tx, "0")).?.value);
     try std.testing.expect((try tx.collectionFirst(.tx, "1")) == null);
     try std.testing.expectEqualStrings("al", (try tx.collectionFirst(.tx, "2")).?.value);
     try std.testing.expect((try tx.collectionFirst(.tx, "9")) == null);
     try std.testing.expect(std.c.getenv("ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST") == null);
+    try std.testing.expectEqual(@as(usize, 1), tx.matchIntentCount());
+    const intent = tx.matchIntent(outcome.intent).?;
+    try std.testing.expectEqual(@as(?u64, 42), intent.external_id);
+    try std.testing.expectEqual(@as(?u3, 2), intent.severity);
+    try std.testing.expectEqualStrings("rule 6", intent.message.?);
+    try std.testing.expectEqualStrings("score=5", intent.log_data.?);
+    try std.testing.expectEqual(@as(usize, 2), intent.tags.len);
+    try std.testing.expectEqualStrings("first", intent.tags[0]);
+    try std.testing.expectEqualStrings("score-6", intent.tags[1]);
+    try std.testing.expectEqualStrings("ARGS:value", intent.matched_name);
+    try std.testing.expectEqualStrings("value", intent.matched_value);
+    try std.testing.expect(!intent.log);
+    try std.testing.expect(intent.audit_log);
+    try std.testing.expectEqual(@as(usize, 11), intent.effects_applied);
 }
 
 test "failed local effect preflight preserves RULE ENV and TX state" {
@@ -2849,8 +3035,10 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
     var documents = [_]seclang.parser.Document{parsed.document};
     const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
     defer plan.deinit();
+    var clock: TestClock = .{ .unix_nanoseconds = 0, .awake_nanoseconds = 0 };
     var builder = Builder.init(std.testing.allocator);
     builder.setRetainedPlan(plan);
+    builder.setClockSource(.{ .context = &clock, .nowFn = TestClock.now });
     const waf = try builder.build();
     defer waf.deinit() catch unreachable;
     var tx = waf.newTransaction();
@@ -2861,6 +3049,7 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
     const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 1 };
     try tx.setCollectionValue(.rule, "msg", "old", source);
     try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", source);
+    clock.awake_nanoseconds = 5 * std.time.ns_per_ms;
     try std.testing.expectError(error.CapacityExceeded, tx.applyLocalMatchedRule(@fromBackingInt(0), .{
         .name = "ARGS:value",
         .value = "value",
@@ -2869,6 +3058,8 @@ test "failed local effect preflight preserves RULE ENV and TX state" {
     try std.testing.expectEqualStrings("old", (try tx.collectionFirst(.rule, "msg")).?.value);
     try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
     try std.testing.expect((try tx.collectionFirst(.env, "SHOULD_NOT_COMMIT")) == null);
+    try std.testing.expectEqualStrings("0", tx.scalar_variables.get(.duration, .request_headers).?.value);
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
 }
 
 test "matched-rule effects bind mutate expire and flush persistent namespaces" {
@@ -2953,6 +3144,50 @@ test "failed combined effect preflight rolls back persistent session state" {
     try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
     try std.testing.expectEqual(@as(usize, 0), try tx.flushPersistentCollections());
     try std.testing.expectEqual(@as(usize, 0), memory.records.items.len);
+}
+
+test "match intent count and byte limits fail before transaction publication" {
+    const input =
+        \\SecRule ARGS @rx "id:10,msg:'bounded',setvar:'tx.flag=1'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "intent-limits.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+
+    var count_builder = Builder.init(std.testing.allocator);
+    count_builder.setRetainedPlan(plan);
+    count_builder.setLimits(.{ .max_match_intents = 1 });
+    const count_waf = try count_builder.build();
+    defer count_waf.deinit() catch unreachable;
+    var count_tx = count_waf.newTransaction();
+    defer count_tx.deinit();
+    try count_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try count_tx.processUri("/", "GET", "HTTP/1.1");
+    try count_tx.processRequestHeaders();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    };
+    _ = try count_tx.applyLocalMatchedRule(@fromBackingInt(0), context);
+    try std.testing.expectError(error.TooManyMatchIntents, count_tx.applyLocalMatchedRule(@fromBackingInt(0), context));
+    try std.testing.expectEqual(@as(usize, 1), count_tx.matchIntentCount());
+
+    var bytes_builder = Builder.init(std.testing.allocator);
+    bytes_builder.setRetainedPlan(plan);
+    bytes_builder.setLimits(.{ .max_match_intent_bytes = 1 });
+    const bytes_waf = try bytes_builder.build();
+    defer bytes_waf.deinit() catch unreachable;
+    var bytes_tx = bytes_waf.newTransaction();
+    defer bytes_tx.deinit();
+    try bytes_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try bytes_tx.processUri("/", "GET", "HTTP/1.1");
+    try bytes_tx.processRequestHeaders();
+    try std.testing.expectError(error.MatchIntentStorageLimitExceeded, bytes_tx.applyLocalMatchedRule(@fromBackingInt(0), context));
+    try std.testing.expectEqual(@as(usize, 0), bytes_tx.matchIntentCount());
+    try std.testing.expect((try bytes_tx.collectionFirst(.tx, "flag")) == null);
 }
 
 test "compiled feature discovery is explicit" {

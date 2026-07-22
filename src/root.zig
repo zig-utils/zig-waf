@@ -33,6 +33,8 @@ pub const MatchContext = engine.MatchContext;
 pub const CaptureRange = engine.CaptureRange;
 pub const RuleProjection = engine.RuleProjection;
 pub const LocalEffectOutcome = engine.LocalEffectOutcome;
+pub const MatchIntentId = engine.MatchIntentId;
+pub const MatchIntent = engine.MatchIntent;
 
 test {
     _ = version;
