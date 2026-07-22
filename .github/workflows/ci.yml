@@ -66,3 +66,6 @@ jobs:
       - name: Scalar benchmark
         working-directory: zig-waf
         run: zig build bench-scalars -Doptimize=ReleaseFast
+      - name: Collection benchmark
+        working-directory: zig-waf
+        run: zig build bench-collections -Doptimize=ReleaseFast

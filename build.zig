@@ -118,4 +118,18 @@ pub fn build(b: *std.Build) void {
     const run_scalar_benchmark = b.addRunArtifact(scalar_benchmark);
     const scalar_benchmark_step = b.step("bench-scalars", "Benchmark populated scalar transaction state");
     scalar_benchmark_step.dependOn(&run_scalar_benchmark.step);
+
+    const collection_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/collections.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    collection_benchmark_module.addImport("waf", waf);
+    const collection_benchmark = b.addExecutable(.{
+        .name = "collection-benchmark",
+        .root_module = collection_benchmark_module,
+    });
+    const run_collection_benchmark = b.addRunArtifact(collection_benchmark);
+    const collection_benchmark_step = b.step("bench-collections", "Benchmark collection targets and runtime macros");
+    collection_benchmark_step.dependOn(&run_collection_benchmark.step);
 }
