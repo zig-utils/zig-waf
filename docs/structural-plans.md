@@ -36,7 +36,8 @@ source order. It exposes:
 
 - five phase indexes containing only chain heads;
 - explicit chain head, next, and position fields for every member;
-- effective phase and `SecDefaultAction` snapshot identity;
+- phase-scoped `SecDefaultAction` snapshot identity, with unphased rules
+  remaining in phase 2;
 - ordered effective transformation pipelines with `t:none` reset behavior;
 - strict unsigned 64-bit external IDs and duplicate-definition diagnostics;
 - target collection, selector, and modifier descriptors;
@@ -81,6 +82,15 @@ Semantic failures use stable codes:
 | `WAF-PLAN-0106` | Transformation without a name |
 | `WAF-PLAN-0107` | Unterminated macro |
 | `WAF-PLAN-0108` | Empty macro expression |
+| `WAF-PLAN-0109` | Action is not permitted in `SecDefaultAction` |
+| `WAF-PLAN-0110` | Duplicate default for a phase; related span is the first definition |
+| `WAF-PLAN-0111` | Default is missing a disruptive action |
+
+Default actions require an explicit phase and a disruptive action. A phase may
+be defined once per compiled configuration context. Metadata and flow actions,
+duplicate phase actions, and `t:none` are rejected before publication. Rules
+inherit only the snapshot for their effective phase; explicit per-rule
+transformations retain the ModSecurity-compatible `t:none` reset behavior.
 
 Allocation and configured capacity failures remain distinct typed errors.
 

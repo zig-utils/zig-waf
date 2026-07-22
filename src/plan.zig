@@ -120,6 +120,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidRuleId,
     DuplicateRuleId,
     InvalidPhase,
+    InvalidDefaultAction,
+    DuplicateDefaultPhase,
+    MissingDefaultDisruptiveAction,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -131,6 +134,9 @@ pub const DiagnosticCode = enum {
     invalid_rule_id,
     duplicate_rule_id,
     invalid_phase,
+    invalid_default_action,
+    duplicate_default_phase,
+    missing_default_disruptive_action,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -147,6 +153,9 @@ pub const DiagnosticCode = enum {
             .invalid_transformation => "WAF-PLAN-0106",
             .unterminated_macro => "WAF-PLAN-0107",
             .empty_macro_expression => "WAF-PLAN-0108",
+            .invalid_default_action => "WAF-PLAN-0109",
+            .duplicate_default_phase => "WAF-PLAN-0110",
+            .missing_default_disruptive_action => "WAF-PLAN-0111",
         };
     }
 
@@ -155,6 +164,9 @@ pub const DiagnosticCode = enum {
             .invalid_rule_id => "rule id must be an unsigned 64-bit integer",
             .duplicate_rule_id => "rule id is already defined",
             .invalid_phase => "phase must name or number one of the five SecLang phases",
+            .invalid_default_action => "action is not permitted in SecDefaultAction",
+            .duplicate_default_phase => "SecDefaultAction is already defined for this phase",
+            .missing_default_disruptive_action => "SecDefaultAction must specify a disruptive action",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -529,7 +541,7 @@ const Compiler = struct {
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     phase_rules: [5]std.ArrayList(RuleId) = .{ .empty, .empty, .empty, .empty, .empty },
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
-    active_default: ?DefaultId = null,
+    active_defaults: [5]?DefaultId = .{ null, null, null, null, null },
     pending_chain: ?RuleId = null,
     pending_chain_members: usize = 0,
     graph_edges: usize = 0,
@@ -593,9 +605,12 @@ const Compiler = struct {
                 action_range = self.addActions(directive.parsed_actions) catch |cause|
                     return self.fail(cause, actionSpan(directive), null);
                 if (self.defaults.items.len == self.limits.max_defaults) return error.TooManyDefaults;
-                const phase = (explicitPhase(directive.parsed_actions) catch
-                    return self.fail(error.InvalidPhase, actionSpan(directive), null)) orelse
-                    return self.fail(error.InvalidPhase, actionSpan(directive), null);
+                const phase = self.validateDefaultActions(directive) catch |cause|
+                    return self.fail(cause, actionSpan(directive), null);
+                if (self.active_defaults[phase - 1]) |first_id| {
+                    const first = self.defaults.items[@backingInt(first_id)];
+                    return self.fail(error.DuplicateDefaultPhase, actionSpan(directive), first.source);
+                }
                 const default_id: DefaultId = @fromBackingInt(try typedIndex(self.defaults.items.len));
                 try self.defaults.append(self.allocator, .{
                     .source = directive.physical,
@@ -603,7 +618,7 @@ const Compiler = struct {
                     .actions_start = action_range.start,
                     .actions_count = action_range.count,
                 });
-                self.active_default = default_id;
+                self.active_defaults[phase - 1] = default_id;
             },
             .sec_marker => {
                 if (self.markers.items.len == self.limits.max_markers) return error.TooManyMarkers;
@@ -652,8 +667,6 @@ const Compiler = struct {
             return self.fail(error.InvalidPhase, actionSpan(directive), null);
         const phase = parsed_phase orelse if (pending) |head_member|
             self.rules.items[@backingInt(head_member)].phase
-        else if (self.active_default) |default_id|
-            self.defaults.items[@backingInt(default_id)].phase
         else
             2;
         if (pending) |head_member| {
@@ -669,7 +682,8 @@ const Compiler = struct {
                 return self.fail(error.DuplicateRuleId, actionSpan(directive), first);
             try self.rule_ids.put(self.allocator, value, directive.physical);
         }
-        const transformation_range = self.addTransformations(self.active_default, action_range) catch |cause|
+        const default_id = self.active_defaults[phase - 1];
+        const transformation_range = self.addTransformations(default_id, action_range) catch |cause|
             return self.fail(cause, actionSpan(directive), null);
         const prefilter = try self.addPrefilter(parsed_operator);
         const operator_macro = self.addMacro(unquote(parsed_operator.parameter)) catch |cause|
@@ -679,7 +693,7 @@ const Compiler = struct {
             .source = directive.physical,
             .external_id = external_id,
             .phase = phase,
-            .default = self.active_default,
+            .default = default_id,
             .chain_head = id,
             .chain_next = null,
             .chain_position = 0,
@@ -716,6 +730,30 @@ const Compiler = struct {
         self.pending_chain = if (hasAction(directive.parsed_actions, "chain")) id else null;
         if (self.pending_chain == null) self.pending_chain_members = 0;
         return id;
+    }
+
+    fn validateDefaultActions(self: *Compiler, directive: seclang.parser.Directive) CompileError!u8 {
+        _ = self;
+        var phase: ?u8 = null;
+        var has_disruptive = false;
+        for (directive.parsed_actions) |action| {
+            if (std.ascii.eqlIgnoreCase(action.name, "phase")) {
+                if (phase != null) return error.InvalidDefaultAction;
+                phase = (explicitPhase(&.{action}) catch return error.InvalidPhase) orelse return error.InvalidPhase;
+                continue;
+            }
+            if (std.ascii.eqlIgnoreCase(action.name, "t") and action.value != null and
+                std.ascii.eqlIgnoreCase(unquote(action.value.?), "none"))
+            {
+                return error.InvalidDefaultAction;
+            }
+            const class = classifyAction(action.name);
+            if (class == .metadata or class == .flow) return error.InvalidDefaultAction;
+            if (equalsAny(action.name, &.{ "allow", "deny", "drop", "pass", "proxy", "redirect" }))
+                has_disruptive = true;
+        }
+        if (!has_disruptive) return error.MissingDefaultDisruptiveAction;
+        return phase orelse error.InvalidPhase;
     }
 
     fn fail(self: *Compiler, cause: CompileError, primary: seclang.source.Span, secondary: ?seclang.source.Span) CompileError {
@@ -1207,6 +1245,9 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidRuleId => .invalid_rule_id,
         error.DuplicateRuleId => .duplicate_rule_id,
         error.InvalidPhase => .invalid_phase,
+        error.InvalidDefaultAction => .invalid_default_action,
+        error.DuplicateDefaultPhase => .duplicate_default_phase,
+        error.MissingDefaultDisruptiveAction => .missing_default_disruptive_action,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -1439,7 +1480,7 @@ test "compiled plan interns repeated strings and enforces limits" {
 test "phase defaults chains ids and transformation resets compile structurally" {
     const input =
         \\SecDefaultAction "phase:1,t:lowercase,pass"
-        \\SecRule ARGS "@rx a" "id:1,t:none,t:urlDecodeUni,chain"
+        \\SecRule ARGS "@rx a" "id:1,phase:1,t:none,t:urlDecodeUni,chain"
         \\SecRule REQUEST_HEADERS:host "@contains b" "t:trim"
         \\SecRule TX:score "@rx c" "id:2,phase:3,deny"
     ;
@@ -1465,6 +1506,57 @@ test "phase defaults chains ids and transformation resets compile structurally" 
     const first_transformation = compiled.transformations[compiled.rules[0].transformations_start];
     try std.testing.expectEqualStrings("urlDecodeUni", compiled.string(first_transformation.name).?);
     try std.testing.expectEqual(@as(usize, 2), compiled.rules[1].transformations_count);
+}
+
+test "default actions are phase scoped immutable snapshots" {
+    const input =
+        \\SecDefaultAction "phase:1,t:lowercase,pass"
+        \\SecDefaultAction "phase:2,t:trim,deny,status:403"
+        \\SecRule ARGS "@rx one" "id:1,phase:1"
+        \\SecRule ARGS "@rx two" "id:2"
+        \\SecRule ARGS "@rx three" "id:3,phase:3,pass"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "phase-defaults.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), compiled.defaults.len);
+    try std.testing.expectEqual(@as(?DefaultId, @fromBackingInt(0)), compiled.rules[0].default);
+    try std.testing.expectEqual(@as(?DefaultId, @fromBackingInt(1)), compiled.rules[1].default);
+    try std.testing.expectEqual(@as(?DefaultId, null), compiled.rules[2].default);
+    try std.testing.expectEqual(@as(u8, 2), compiled.rules[1].phase);
+    try std.testing.expectEqualStrings("lowercase", compiled.string(compiled.transformations[compiled.rules[0].transformations_start].name).?);
+    try std.testing.expectEqualStrings("trim", compiled.string(compiled.transformations[compiled.rules[1].transformations_start].name).?);
+}
+
+test "default action compatibility failures have precise diagnostics" {
+    const cases = [_]struct {
+        input: []const u8,
+        code: DiagnosticCode,
+        related: bool = false,
+    }{
+        .{ .input = "SecDefaultAction pass", .code = .invalid_phase },
+        .{ .input = "SecDefaultAction \"phase:2,log\"", .code = .missing_default_disruptive_action },
+        .{ .input = "SecDefaultAction \"phase:2,t:none,pass\"", .code = .invalid_default_action },
+        .{ .input = "SecDefaultAction \"phase:2,id:1,pass\"", .code = .invalid_default_action },
+        .{ .input = "SecDefaultAction \"phase:2,pass\"\nSecDefaultAction \"phase:2,deny\"", .code = .duplicate_default_phase, .related = true },
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-default.conf", case.input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |value| {
+                try std.testing.expectEqual(case.code, value.code);
+                try std.testing.expectEqual(case.related, value.secondary != null);
+            },
+        }
+    }
 }
 
 test "structural compiler rejects duplicate ids invalid phases and malformed chains" {
