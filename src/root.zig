@@ -43,6 +43,7 @@ pub const PhaseCursor = engine.PhaseCursor;
 pub const ControlState = engine.ControlState;
 pub const RuleExclusion = engine.RuleExclusion;
 pub const TargetExclusion = engine.TargetExclusion;
+pub const InterventionCapabilities = engine.InterventionCapabilities;
 
 test {
     _ = version;

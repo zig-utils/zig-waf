@@ -105,6 +105,12 @@ pub const Config = struct {
     persistent_limits: persistent.Limits = .{},
     persistent_failure_policy: persistent.FailurePolicy = .fail_closed,
     persistent_required_features: persistent.BackendFeatureSet = persistent.BackendFeatureSet.core(),
+    intervention_capabilities: InterventionCapabilities = .{},
+};
+
+pub const InterventionCapabilities = struct {
+    proxy: bool = false,
+    pause: bool = false,
 };
 
 pub const ClockSample = struct {
@@ -199,6 +205,10 @@ pub const Builder = struct {
 
     pub fn setPersistentRequiredFeatures(self: *Builder, required: persistent.BackendFeatureSet) void {
         self.config.persistent_required_features = required;
+    }
+
+    pub fn setInterventionCapabilities(self: *Builder, capabilities: InterventionCapabilities) void {
+        self.config.intervention_capabilities = capabilities;
     }
 
     /// Select the directive capabilities compiled into this WAF build. A plan
@@ -474,6 +484,7 @@ pub const TransactionError = error{
     PersistentTimestampOverflow,
     ControlTooLate,
     UnsupportedRuntimeControl,
+    UnsupportedIntervention,
 } || variables.StoreError || collections.StoreError || collections.SelectorError || persistent.SessionError;
 
 const Lifecycle = enum {
@@ -969,6 +980,8 @@ pub const Transaction = struct {
         const selected = plan.rules[rule_index];
         const head_index: usize = @backingInt(selected.chain_head);
         const head = plan.rules[head_index];
+        if (head.disruptive.kind == .proxy and !self.waf.config.intervention_capabilities.proxy)
+            return error.UnsupportedIntervention;
         var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
         defer batch.deinit();
         var scalar_batch: ScalarShadowBatch = .{ .allocator = self.waf.allocator };
@@ -3760,6 +3773,51 @@ test "matched decisions commit owned intervention and flow evidence atomically" 
     try std.testing.expect(!detection_tx.isTerminated());
     try std.testing.expectEqual(@as(usize, 2), detection_tx.matchIntentCount());
     try std.testing.expectEqualStrings("1", (try detection_tx.collectionFirst(.tx, "second")).?.value);
+}
+
+test "proxy decisions require an explicitly advertised connector capability" {
+    const input =
+        \\SecRule ARGS @rx "id:20,setvar:'tx.proxy=1',proxy:'https://upstream.test/%{REQUEST_URI}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "proxy-capability.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    };
+
+    var disabled_builder = Builder.init(std.testing.allocator);
+    disabled_builder.setRetainedPlan(plan);
+    const disabled_waf = try disabled_builder.build();
+    defer disabled_waf.deinit() catch unreachable;
+    var disabled_tx = disabled_waf.newTransaction();
+    defer disabled_tx.deinit();
+    try disabled_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try disabled_tx.processUri("/proxy", "GET", "HTTP/1.1");
+    try disabled_tx.processRequestHeaders();
+    try std.testing.expectError(error.UnsupportedIntervention, disabled_tx.applyMatchedRule(@fromBackingInt(0), context));
+    try std.testing.expect((try disabled_tx.collectionFirst(.tx, "proxy")) == null);
+    try std.testing.expectEqual(@as(usize, 0), disabled_tx.matchIntentCount());
+
+    var enabled_builder = Builder.init(std.testing.allocator);
+    enabled_builder.setRetainedPlan(plan);
+    enabled_builder.setInterventionCapabilities(.{ .proxy = true });
+    const enabled_waf = try enabled_builder.build();
+    defer enabled_waf.deinit() catch unreachable;
+    var enabled_tx = enabled_waf.newTransaction();
+    defer enabled_tx.deinit();
+    try enabled_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try enabled_tx.processUri("/proxy", "GET", "HTTP/1.1");
+    try enabled_tx.processRequestHeaders();
+    _ = try enabled_tx.applyMatchedRule(@fromBackingInt(0), context);
+    const intervention = (try enabled_tx.intervention()).?;
+    try std.testing.expectEqual(Intervention.Action.proxy, intervention.action);
+    try std.testing.expectEqualStrings("https://upstream.test//proxy", intervention.destination.?);
+    try std.testing.expectEqualStrings("1", (try enabled_tx.collectionFirst(.tx, "proxy")).?.value);
 }
 
 test "phase cursor applies skip and phase-scoped allow without allocation" {
