@@ -231,6 +231,9 @@ pub const Executor = struct {
             .js_decode => self.jsDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
+            .remove_comments => self.removeComments(input),
+            .remove_comments_char => self.removeCommentsChar(input),
+            .replace_comments => self.replaceComments(input),
             .trim => trimResult(input, true, true),
             .trim_left => trimResult(input, true, false),
             .trim_right => trimResult(input, false, true),
@@ -524,6 +527,95 @@ pub const Executor = struct {
             }
         }
         return finish(generated, input, generated.buffer.items.len != input.len);
+    }
+
+    fn removeComments(self: *Executor, input: []const u8) ApplyError!Result {
+        if (findCommentStart(input, true) == null)
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len);
+        var index: usize = 0;
+        var in_comment = false;
+        while (index < input.len) {
+            if (!in_comment) {
+                if (startsAt(input, index, "/*")) {
+                    in_comment = true;
+                    index += 2;
+                } else if (startsAt(input, index, "<!--")) {
+                    in_comment = true;
+                    index += 4;
+                } else if (startsAt(input, index, "--") or input[index] == '#') {
+                    break;
+                } else {
+                    generated.buffer.appendAssumeCapacity(input[index]);
+                    index += 1;
+                }
+            } else if (startsAt(input, index, "*/")) {
+                in_comment = false;
+                index += 2;
+                generated.buffer.appendAssumeCapacity(if (index < input.len) input[index] else 0);
+                index += 1;
+            } else if (startsAt(input, index, "-->")) {
+                in_comment = false;
+                index += 3;
+                generated.buffer.appendAssumeCapacity(if (index < input.len) input[index] else 0);
+                index += 1;
+            } else {
+                index += 1;
+            }
+        }
+        if (in_comment) generated.buffer.appendAssumeCapacity(' ');
+        return finish(generated, input, true);
+    }
+
+    fn removeCommentsChar(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = findCommentMarker(input) orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len - 1);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var index = first;
+        while (index < input.len) {
+            if (startsAt(input, index, "/*") or startsAt(input, index, "*/")) {
+                index += 2;
+            } else if (startsAt(input, index, "<!--")) {
+                index += 4;
+            } else if (startsAt(input, index, "-->")) {
+                index += 3;
+            } else if (startsAt(input, index, "--")) {
+                index += 2;
+            } else if (input[index] == '#') {
+                index += 1;
+            } else {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            }
+        }
+        return finish(generated, input, true);
+    }
+
+    fn replaceComments(self: *Executor, input: []const u8) ApplyError!Result {
+        const first = std.mem.indexOf(u8, input, "/*") orelse
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const generated = try self.writable(input.len - 1);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var index = first;
+        var in_comment = false;
+        while (index < input.len) {
+            if (!in_comment and startsAt(input, index, "/*")) {
+                in_comment = true;
+                index += 2;
+            } else if (in_comment and startsAt(input, index, "*/")) {
+                in_comment = false;
+                index += 2;
+                generated.buffer.appendAssumeCapacity(' ');
+            } else if (in_comment) {
+                index += 1;
+            } else {
+                generated.buffer.appendAssumeCapacity(input[index]);
+                index += 1;
+            }
+        }
+        if (in_comment) generated.buffer.appendAssumeCapacity(' ');
+        return finish(generated, input, true);
     }
 
     fn compressWhitespace(self: *Executor, input: []const u8) ApplyError!Result {
@@ -947,6 +1039,35 @@ fn isNull(byte: u8) bool {
 
 fn startsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
     return input.len >= prefix.len and std.ascii.eqlIgnoreCase(input[0..prefix.len], prefix);
+}
+
+fn startsAt(input: []const u8, index: usize, needle: []const u8) bool {
+    return index + needle.len <= input.len and std.mem.eql(u8, input[index .. index + needle.len], needle);
+}
+
+fn findCommentStart(input: []const u8, line_comments: bool) ?usize {
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        if (startsAt(input, index, "/*") or startsAt(input, index, "<!--") or
+            (line_comments and (startsAt(input, index, "--") or input[index] == '#')))
+        {
+            return index;
+        }
+    }
+    return null;
+}
+
+fn findCommentMarker(input: []const u8) ?usize {
+    var index: usize = 0;
+    while (index < input.len) : (index += 1) {
+        if (startsAt(input, index, "/*") or startsAt(input, index, "*/") or
+            startsAt(input, index, "<!--") or startsAt(input, index, "-->") or
+            startsAt(input, index, "--") or input[index] == '#')
+        {
+            return index;
+        }
+    }
+    return null;
 }
 
 fn parseSaturatingByte(digits: []const u8, base: u8) u8 {
@@ -1497,6 +1618,27 @@ test "UTF-8 to Unicode uses exact bounded expansion sizing" {
     try std.testing.expectEqualStrings("%u00e9", (try exact.apply(.utf8_to_unicode, "é")).bytes);
     try std.testing.expectEqualStrings("%ufffd", (try exact.apply(.utf8_to_unicode, "\xff")).bytes);
     try std.testing.expectError(error.OutputTooLarge, exact.apply(.utf8_to_unicode, "éé"));
+}
+
+test "comment transformations preserve pinned marker state machines" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualStrings("BeforeAfter", (try executor.apply(.remove_comments, "Before/* Test */After")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{0}, (try executor.apply(.remove_comments, "/* Test */")).bytes);
+    try std.testing.expectEqualStrings("Before  ", (try executor.apply(.remove_comments, "Before /* unterminated")).bytes);
+    try std.testing.expectEqualStrings("BeforeAfter", (try executor.apply(.remove_comments, "Before<!-- Test -->After")).bytes);
+    try std.testing.expectEqualStrings("Before", (try executor.apply(.remove_comments, "Before-- line")).bytes);
+    try std.testing.expectEqualStrings("Before", (try executor.apply(.remove_comments, "Before# line")).bytes);
+
+    try std.testing.expectEqualStrings("Before Test After", (try executor.apply(.remove_comments_char, "Before/* Test */After")).bytes);
+    try std.testing.expectEqualStrings("abcdef", (try executor.apply(.remove_comments_char, "a<!--b-->c--d#e/*f*/")).bytes);
+    try std.testing.expectEqualStrings("Before After", (try executor.apply(.replace_comments, "Before/* Test */After")).bytes);
+    try std.testing.expectEqualStrings("Before ", (try executor.apply(.replace_comments, "Before/* unterminated")).bytes);
+
+    const closer_only = try executor.apply(.replace_comments, "Before*/After");
+    try std.testing.expectEqual(Storage.borrowed, closer_only.storage);
+    try std.testing.expect(!closer_only.changed);
 }
 
 test "executor validates deterministic input and output limits" {
