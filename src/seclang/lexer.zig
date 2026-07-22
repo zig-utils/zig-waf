@@ -185,6 +185,8 @@ pub const LogicalLineIterator = struct {
         var segments: std.ArrayList(Segment) = .empty;
         defer segments.deinit(allocator);
         var continuing = false;
+        var active_quote: ?u8 = null;
+        var quote_escape = false;
 
         while (self.offset < self.input.bytes.len) {
             const line_start = self.offset;
@@ -201,9 +203,12 @@ pub const LogicalLineIterator = struct {
             while (trimmed_end > content_start and isHorizontalSpace(self.input.bytes[trimmed_end - 1])) trimmed_end -= 1;
             const has_continuation = trimmed_end > content_start and self.input.bytes[trimmed_end - 1] == '\\';
             var append_end = content_end;
+            var separator_before_continuation = false;
             if (has_continuation) {
                 append_end = trimmed_end - 1;
+                const before_whitespace = append_end;
                 while (append_end > content_start and isHorizontalSpace(self.input.bytes[append_end - 1])) append_end -= 1;
+                separator_before_continuation = append_end != before_whitespace;
             }
 
             if (append_end > content_start) {
@@ -219,6 +224,11 @@ pub const LogicalLineIterator = struct {
                     },
                 });
                 try text.appendSlice(allocator, self.input.bytes[content_start..append_end]);
+                updateQuoteState(self.input.bytes[content_start..append_end], &active_quote, &quote_escape);
+            }
+            if (has_continuation and separator_before_continuation and active_quote == null and text.items.len != 0) {
+                if (text.items.len == self.limits.max_logical_line_bytes) return error.LogicalLineTooLarge;
+                try text.append(allocator, ' ');
             }
             self.offset = next_offset;
             if (!has_continuation) break;
@@ -246,6 +256,24 @@ fn isHorizontalSpace(byte: u8) bool {
     return byte == ' ' or byte == '\t';
 }
 
+fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool) void {
+    for (bytes) |byte| {
+        if (escaped.*) {
+            escaped.* = false;
+            continue;
+        }
+        if (byte == '\\') {
+            escaped.* = true;
+            continue;
+        }
+        if (active_quote.*) |quote| {
+            if (byte == quote) active_quote.* = null;
+        } else if (byte == '\'' or byte == '"') {
+            active_quote.* = byte;
+        }
+    }
+}
+
 test "logical lines normalize CRLF and baseline continuation whitespace" {
     var registry = try source.Registry.init(std.testing.allocator, .{});
     defer registry.deinit();
@@ -257,10 +285,10 @@ test "logical lines normalize CRLF and baseline continuation whitespace" {
     var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
     var first = (try iterator.next(std.testing.allocator)).?;
     defer first.deinit();
-    try std.testing.expectEqualStrings("SecRule ARGS\"@rx attack\"\"id:1,deny\"", first.text);
+    try std.testing.expectEqualStrings("SecRule ARGS \"@rx attack\" \"id:1,deny\"", first.text);
     try std.testing.expectEqual(@as(usize, 3), first.segments.len);
     try std.testing.expectEqual(@as(u32, 0), first.physicalOffset(0).?);
-    try std.testing.expectEqual(@as(u32, 20), first.physicalOffset(12).?);
+    try std.testing.expectEqual(@as(u32, 12), first.physicalOffset(12).?);
     var second = (try iterator.next(std.testing.allocator)).?;
     defer second.deinit();
     try std.testing.expectEqualStrings("SecAction pass", second.text);
