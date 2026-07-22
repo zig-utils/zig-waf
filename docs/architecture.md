@@ -15,6 +15,11 @@ The core API separates immutable, shareable policy from isolated request state:
 - Detection-only mode retains interventions and marks them non-enforcing so
   audit and diagnostics do not diverge from enabled mode.
 
-Compiled rulesets will be immutable execution plans referenced by `Waf`.
-Hot reload will publish a fully validated replacement and allow existing
-transactions to finish against their original plan before reclamation.
+`Runtime` publishes a fully validated replacement generation in one critical
+operation. Existing transactions remain pinned to the retired generation and
+new transactions use the replacement. A retired generation cannot be reclaimed
+until its live transaction count reaches zero.
+
+The normative ownership, allocator, error, feature-discovery, connector, and
+reclamation rules are recorded in
+[ADR 0001](adr/0001-ownership-concurrency-hot-reload.md).

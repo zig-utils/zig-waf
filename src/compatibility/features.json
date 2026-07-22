@@ -33,6 +33,23 @@
       "notes": "Sibling repositories are locked by commit and checked out directly in CI."
     },
     {
+      "id": "engine.ownership-hot-reload",
+      "area": "engine",
+      "name": "Allocator, ownership, concurrency, feature, and atomic hot-reload contracts",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/4",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "docs/adr/0001-ownership-concurrency-hot-reload.md",
+        "src/engine.zig",
+        "benchmarks/ownership.zig",
+        "tests/c_api_smoke.c"
+      ],
+      "notes": "Runtime publication pins in-flight requests to immutable generations; reclamation, errors, feature discovery, and connector responsibilities are explicit and tested."
+    },
+    {
       "id": "api.transaction-lifecycle",
       "area": "engine",
       "name": "Five inspection phases plus logging lifecycle",

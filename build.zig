@@ -71,4 +71,18 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&daemon.step);
     check_step.dependOn(&c_api.step);
     check_step.dependOn(&tests.step);
+
+    const ownership_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/ownership.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ownership_benchmark_module.addImport("waf", waf);
+    const ownership_benchmark = b.addExecutable(.{
+        .name = "ownership-benchmark",
+        .root_module = ownership_benchmark_module,
+    });
+    const run_ownership_benchmark = b.addRunArtifact(ownership_benchmark);
+    const benchmark_step = b.step("bench-ownership", "Benchmark transaction ownership and generation pinning");
+    benchmark_step.dependOn(&run_ownership_benchmark.step);
 }
