@@ -9,6 +9,23 @@ const sample =
     \\SecMarker END
 ;
 
+const sample_overlay =
+    \\SecRuleRemoveById 1002
+    \\SecRuleUpdateTargetById 1001 "!ARGS:benchmark_secret|TX:benchmark"
+    \\SecRuleUpdateActionById 1001 "pass,nolog,t:none,t:trim"
+;
+
+const crs_overlay =
+    \\SecRuleRemoveById 942100
+    \\SecRuleUpdateTargetById 942140 "!ARGS:benchmark_secret|TX:benchmark"
+    \\SecRuleUpdateActionById 942151 "pass,nolog,t:none,t:trim"
+;
+
+const PublicationResult = struct {
+    total_ns: u64,
+    per_reload_ns: u64,
+};
+
 pub fn main(init: std.process.Init) !void {
     var arguments = std.process.Args.Iterator.init(init.minimal.args);
     _ = arguments.next();
@@ -18,12 +35,23 @@ pub fn main(init: std.process.Init) !void {
     else
         try init.gpa.dupe(u8, sample);
     defer init.gpa.free(input);
+    const overlay_source = if (external_path == null) sample_overlay else crs_overlay;
+    const overlay_input = try init.gpa.alloc(u8, input.len + 1 + overlay_source.len);
+    defer init.gpa.free(overlay_input);
+    @memcpy(overlay_input[0..input.len], input);
+    overlay_input[input.len] = '\n';
+    @memcpy(overlay_input[input.len + 1 ..], overlay_source);
 
     var parsed = try waf.seclang.parser.parseBytes(init.gpa, "plan-benchmark.conf", input, .{}, .{});
     defer parsed.deinit();
     var documents = [_]waf.seclang.parser.Document{parsed.document};
     const baseline = try waf.plan.compile(init.gpa, &parsed.registry, &documents, .{});
     defer baseline.deinit();
+    var overlay_parsed = try waf.seclang.parser.parseBytes(init.gpa, "plan-overlay-benchmark.conf", overlay_input, .{}, .{});
+    defer overlay_parsed.deinit();
+    var overlay_documents = [_]waf.seclang.parser.Document{overlay_parsed.document};
+    const overlay = try waf.plan.compile(init.gpa, &overlay_parsed.registry, &overlay_documents, .{});
+    defer overlay.deinit();
 
     const target_bytes = 32 * 1024 * 1024;
     const iterations = @min(@as(usize, 20_000), @max(@as(usize, 10), target_bytes / @max(input.len, 1)));
@@ -33,6 +61,12 @@ pub fn main(init: std.process.Init) !void {
         compiled.deinit();
     }
     const compile_ns: u64 = @intCast(compile_start.durationTo(std.Io.Clock.now(.awake, init.io)).nanoseconds);
+    const overlay_compile_start = std.Io.Clock.now(.awake, init.io);
+    for (0..iterations) |_| {
+        const compiled = try waf.plan.compile(init.gpa, &overlay_parsed.registry, &overlay_documents, .{});
+        compiled.deinit();
+    }
+    const overlay_compile_ns: u64 = @intCast(overlay_compile_start.durationTo(std.Io.Clock.now(.awake, init.io)).nanoseconds);
     const rules_total = baseline.rules.len * iterations;
     const directives_total = baseline.directives.len * iterations;
 
@@ -54,31 +88,17 @@ pub fn main(init: std.process.Init) !void {
     defer reused.deinit();
     if (baseline.sharedReferenceCount() != 2) return error.PlanBenchmarkReuseFailed;
 
-    var initial_builder = waf.Waf.Builder.init(init.gpa);
-    initial_builder.setRetainedPlan(baseline);
-    const runtime = try initial_builder.buildRuntime();
     const publication_iterations: usize = 1000;
-    const generations = try init.gpa.alloc(*waf.Waf, publication_iterations);
-    defer init.gpa.free(generations);
-    const retired_generations = try init.gpa.alloc(waf.RetiredGeneration, publication_iterations);
-    defer init.gpa.free(retired_generations);
-    for (generations) |*generation| {
-        var replacement_builder = waf.Waf.Builder.init(init.gpa);
-        replacement_builder.setRetainedPlan(reused);
-        generation.* = try replacement_builder.build();
-    }
-    const publish_start = std.Io.Clock.now(.awake, init.io);
-    for (generations, retired_generations) |generation, *retired| retired.* = try runtime.reload(generation);
-    const publication_total_ns: u64 = @intCast(publish_start.durationTo(std.Io.Clock.now(.awake, init.io)).nanoseconds);
-    for (retired_generations) |*retired| try retired.tryReclaim();
-    try runtime.deinit();
+    const baseline_publication = try benchmarkPublication(init.gpa, baseline, reused, publication_iterations, init.io);
+    const overlay_publication = try benchmarkPublication(init.gpa, baseline, overlay, publication_iterations, init.io);
 
     const referenced_string_bytes = referencedStringBytes(baseline);
     const dedup_saved_bytes = referenced_string_bytes -| baseline.string_bytes.len;
     std.debug.print(
-        "plan input_bytes={d} iterations={d} directives={d} rules={d} compile_nanoseconds={d} plans_per_second={d} directives_per_second={d} rules_per_second={d} owned_bytes={d} bytes_per_rule={d} unique_strings={d} interned_string_bytes={d} referenced_string_bytes={d} dedup_saved_bytes={d} phase_traversal_nanoseconds={d} phase_traversal_rules_per_second={d} reuse_compile_nanoseconds={d} publication_iterations={d} publication_total_nanoseconds={d} publication_nanoseconds={d} checksum={d}\n",
+        "plan input_bytes={d} overlay_input_bytes={d} iterations={d} directives={d} rules={d} compile_nanoseconds={d} plans_per_second={d} directives_per_second={d} rules_per_second={d} owned_bytes={d} bytes_per_rule={d} overlay_directives={d} overlay_rules={d} overlay_compile_nanoseconds={d} overlay_plans_per_second={d} overlay_owned_bytes={d} overlay_owned_bytes_delta={d} overlay_removals={d} overlay_missing_references={d} unique_strings={d} interned_string_bytes={d} referenced_string_bytes={d} dedup_saved_bytes={d} phase_traversal_nanoseconds={d} phase_traversal_rules_per_second={d} reuse_compile_nanoseconds={d} publication_iterations={d} publication_total_nanoseconds={d} publication_nanoseconds={d} overlay_publication_total_nanoseconds={d} overlay_publication_nanoseconds={d} checksum={d}\n",
         .{
             input.len,
+            overlay_input.len,
             iterations,
             baseline.directives.len,
             baseline.rules.len,
@@ -88,6 +108,14 @@ pub fn main(init: std.process.Init) !void {
             rate(rules_total, compile_ns),
             baseline.owned_bytes,
             if (baseline.rules.len == 0) 0 else baseline.owned_bytes / baseline.rules.len,
+            overlay.directives.len,
+            overlay.rules.len,
+            overlay_compile_ns,
+            rate(iterations, overlay_compile_ns),
+            overlay.owned_bytes,
+            overlay.owned_bytes -| baseline.owned_bytes,
+            overlay.rule_removals.len,
+            overlay.missing_rule_references.len,
             baseline.strings.len,
             baseline.string_bytes.len,
             referenced_string_bytes,
@@ -96,11 +124,40 @@ pub fn main(init: std.process.Init) !void {
             rate(traversed_rules, traversal_ns),
             reuse_ns,
             publication_iterations,
-            publication_total_ns,
-            publication_total_ns / publication_iterations,
+            baseline_publication.total_ns,
+            baseline_publication.per_reload_ns,
+            overlay_publication.total_ns,
+            overlay_publication.per_reload_ns,
             phase_checksum,
         },
     );
+}
+
+fn benchmarkPublication(
+    allocator: std.mem.Allocator,
+    initial: *const waf.plan.Plan,
+    replacement: *const waf.plan.Plan,
+    iterations: usize,
+    io: std.Io,
+) !PublicationResult {
+    var initial_builder = waf.Waf.Builder.init(allocator);
+    initial_builder.setRetainedPlan(initial);
+    const runtime = try initial_builder.buildRuntime();
+    const generations = try allocator.alloc(*waf.Waf, iterations);
+    defer allocator.free(generations);
+    const retired_generations = try allocator.alloc(waf.RetiredGeneration, iterations);
+    defer allocator.free(retired_generations);
+    for (generations) |*generation| {
+        var replacement_builder = waf.Waf.Builder.init(allocator);
+        replacement_builder.setRetainedPlan(replacement);
+        generation.* = try replacement_builder.build();
+    }
+    const start = std.Io.Clock.now(.awake, io);
+    for (generations, retired_generations) |generation, *retired| retired.* = try runtime.reload(generation);
+    const total_ns: u64 = @intCast(start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
+    for (retired_generations) |*retired| try retired.tryReclaim();
+    try runtime.deinit();
+    return .{ .total_ns = total_ns, .per_reload_ns = total_ns / iterations };
 }
 
 fn rate(count: usize, nanoseconds: u64) u128 {
