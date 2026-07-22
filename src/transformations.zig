@@ -138,6 +138,11 @@ pub const Storage = enum {
     executor_b,
 };
 
+pub const Profile = enum {
+    modsecurity,
+    coraza,
+};
+
 pub const Result = struct {
     bytes: []const u8,
     /// Upstream transformation semantics, which can differ from byte equality.
@@ -151,6 +156,7 @@ pub const ApplyError = std.mem.Allocator.Error || error{
     InvalidLimits,
     InputTooLarge,
     OutputTooLarge,
+    InvalidInput,
     UnsupportedTransformation,
 };
 
@@ -165,12 +171,17 @@ pub const Executor = struct {
 
     allocator: std.mem.Allocator,
     limits: Limits,
+    profile: Profile,
     buffers: [2]std.ArrayList(u8) = .{ .empty, .empty },
     next_buffer: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!Executor {
+        return initWithProfile(allocator, limits, .modsecurity);
+    }
+
+    pub fn initWithProfile(allocator: std.mem.Allocator, limits: Limits, profile: Profile) error{InvalidLimits}!Executor {
         try limits.validate();
-        return .{ .allocator = allocator, .limits = limits };
+        return .{ .allocator = allocator, .limits = limits, .profile = profile };
     }
 
     pub fn deinit(self: *Executor) void {
@@ -190,6 +201,10 @@ pub const Executor = struct {
             .remove_whitespace => self.removeBytes(input, isRemovalWhitespace),
             .remove_nulls => self.removeBytes(input, isNull),
             .replace_nulls => self.replaceNulls(input),
+            .hex_decode => self.hexDecode(input),
+            .hex_encode => self.hexEncode(input),
+            .url_decode => self.urlDecode(input),
+            .url_encode => self.urlEncode(input),
             .parity_even_7bit => self.parity(input, true),
             .parity_odd_7bit => self.parity(input, false),
             .parity_zero_7bit => self.parityZero(input),
@@ -282,6 +297,91 @@ pub const Executor = struct {
         return finish(generated, input, true);
     }
 
+    fn hexDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        if (self.profile == .coraza) {
+            if (input.len % 2 != 0) return error.InvalidInput;
+            for (input) |byte| if (!isHex(byte)) return error.InvalidInput;
+        } else if (input.len == 0) {
+            return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        }
+        const generated = try self.writable(input.len / 2);
+        var index: usize = 0;
+        while (index + 1 < input.len) : (index += 2) {
+            const high = if (self.profile == .coraza) hexNibble(input[index]).? else modSecurityHexNibble(input[index]);
+            const low = if (self.profile == .coraza) hexNibble(input[index + 1]).? else modSecurityHexNibble(input[index + 1]);
+            generated.buffer.appendAssumeCapacity(high *% 16 +% low);
+        }
+        return finish(generated, input, true);
+    }
+
+    fn hexEncode(self: *Executor, input: []const u8) ApplyError!Result {
+        if (input.len == 0)
+            return .{ .bytes = input, .changed = self.profile == .coraza, .storage = .borrowed };
+        const capacity = std.math.mul(usize, input.len, 2) catch return error.OutputTooLarge;
+        const generated = try self.writable(capacity);
+        const digits = "0123456789abcdef";
+        for (input) |byte| {
+            generated.buffer.appendAssumeCapacity(digits[byte >> 4]);
+            generated.buffer.appendAssumeCapacity(digits[byte & 0x0f]);
+        }
+        return finish(generated, input, true);
+    }
+
+    fn urlDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        var changed = false;
+        var index: usize = 0;
+        while (index < input.len) : (index += 1) {
+            if (input[index] == '+') {
+                changed = true;
+                break;
+            }
+            if (input[index] == '%' and index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+
+        const generated = try self.writable(input.len);
+        index = 0;
+        while (index < input.len) {
+            if (input[index] == '%' and index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])) {
+                generated.buffer.appendAssumeCapacity(hexNibble(input[index + 1]).? * 16 + hexNibble(input[index + 2]).?);
+                index += 3;
+            } else {
+                generated.buffer.appendAssumeCapacity(if (input[index] == '+') ' ' else input[index]);
+                index += 1;
+            }
+        }
+        return finish(generated, input, true);
+    }
+
+    fn urlEncode(self: *Executor, input: []const u8) ApplyError!Result {
+        var changed = false;
+        for (input) |byte| {
+            if (!isUrlUnescaped(byte)) {
+                changed = true;
+                break;
+            }
+        }
+        if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const capacity = std.math.mul(usize, input.len, 3) catch return error.OutputTooLarge;
+        const generated = try self.writable(capacity);
+        const digits = "0123456789abcdef";
+        for (input) |byte| {
+            if (byte == ' ') {
+                generated.buffer.appendAssumeCapacity('+');
+            } else if (isUrlUnescaped(byte)) {
+                generated.buffer.appendAssumeCapacity(byte);
+            } else {
+                generated.buffer.appendAssumeCapacity('%');
+                generated.buffer.appendAssumeCapacity(digits[byte >> 4]);
+                generated.buffer.appendAssumeCapacity(digits[byte & 0x0f]);
+            }
+        }
+        return finish(generated, input, true);
+    }
+
     fn parity(self: *Executor, input: []const u8, even: bool) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
         const generated = try self.writable(input.len);
@@ -335,6 +435,27 @@ fn isRemovalWhitespace(byte: u8) bool {
 
 fn isNull(byte: u8) bool {
     return byte == 0;
+}
+
+fn isHex(byte: u8) bool {
+    return hexNibble(byte) != null;
+}
+
+fn hexNibble(byte: u8) ?u8 {
+    return switch (byte) {
+        '0'...'9' => byte - '0',
+        'a'...'f' => byte - 'a' + 10,
+        'A'...'F' => byte - 'A' + 10,
+        else => null,
+    };
+}
+
+fn modSecurityHexNibble(byte: u8) u8 {
+    return if (byte >= 'A') ((byte & 0xdf) -% 'A') +% 10 else byte -% '0';
+}
+
+fn isUrlUnescaped(byte: u8) bool {
+    return byte == '*' or std.ascii.isAlphanumeric(byte);
 }
 
 test "stable transformation union and aliases resolve canonically" {
@@ -399,6 +520,38 @@ test "filter parity and length transformations are binary exact" {
     try std.testing.expect(length.changed);
 }
 
+test "hex profiles preserve pinned malformed and empty-input behavior" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("Test\x00Case", (try modsecurity.apply(.hex_decode, "546573740043617365")).bytes);
+    try std.testing.expectEqualStrings("546573740043617365", (try modsecurity.apply(.hex_encode, "Test\x00Case")).bytes);
+    try std.testing.expectEqualStrings("A", (try modsecurity.apply(.hex_decode, "414")).bytes);
+    try std.testing.expect(!(try modsecurity.apply(.hex_decode, "")).changed);
+    try std.testing.expect((try coraza.apply(.hex_decode, "")).changed);
+    try std.testing.expect((try coraza.apply(.hex_encode, "")).changed);
+    try std.testing.expectError(error.InvalidInput, coraza.apply(.hex_decode, "414"));
+    try std.testing.expectError(error.InvalidInput, coraza.apply(.hex_decode, "0z"));
+}
+
+test "URL encoding is byte-oriented and malformed decoding is non-strict" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualStrings("Test Case", (try executor.apply(.url_decode, "Test+Case")).bytes);
+    try std.testing.expectEqualStrings("% ", (try executor.apply(.url_decode, "%%20")).bytes);
+    try std.testing.expectEqualStrings("%0g ", (try executor.apply(.url_decode, "%0g%20")).bytes);
+    const malformed = try executor.apply(.url_decode, "%0%gg");
+    try std.testing.expectEqual(Storage.borrowed, malformed.storage);
+    try std.testing.expect(!malformed.changed);
+    try std.testing.expectEqualStrings("%0%gg", malformed.bytes);
+
+    try std.testing.expectEqualStrings("Test+Case", (try executor.apply(.url_encode, "Test Case")).bytes);
+    try std.testing.expectEqualStrings("*AZaz09%2f%00", (try executor.apply(.url_encode, "*AZaz09/\x00")).bytes);
+}
+
 test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
@@ -409,7 +562,8 @@ test "executor validates deterministic input and output limits" {
     defer executor.deinit();
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
-    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.url_decode, "x"));
+    try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
+    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.base64_decode, "eA"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
