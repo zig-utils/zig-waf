@@ -105,9 +105,17 @@ jobs:
         run: >-
           zig build bench-parser -Doptimize=ReleaseFast
           -Dparser-benchmark=../owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
+      - name: CRS structural plan benchmark
+        working-directory: zig-waf
+        run: >-
+          zig build bench-plan -Doptimize=ReleaseFast
+          -Dplan-benchmark=../owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
       - name: Deterministic parser fuzzing
         working-directory: zig-waf
         run: zig build fuzz-parser -Dparser-fuzz-iterations=10000
+      - name: Deterministic structural plan fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-plan -Dplan-fuzz-iterations=10000
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
