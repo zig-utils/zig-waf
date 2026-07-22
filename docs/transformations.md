@@ -33,17 +33,27 @@ until that slot is reused. The result reports storage provenance and the
 upstream `changed` flag separately because that flag is not always equivalent
 to byte inequality.
 
-The `Limits` contract defines input, output, pipeline-step, and cumulative
-output bounds. The single-step executor currently enforces input and output
-bounds; ordered-pipeline integration will enforce the step and cumulative
-bounds before WAF-16 closes. Expansion sizes use checked arithmetic. Allocation
-failure, invalid strict input, and limit exhaustion are distinct errors.
-Tolerant compatibility decoders preserve their specified malformed bytes
-instead of turning malformed input into an engine error.
+The `Limits` contract defines input, output, pipeline-step, cumulative-output,
+cache-entry, and cache-storage bounds. Ordered execution enforces the step and
+cumulative bounds before returning checkpoints or an operator-visible value.
+Expansion sizes use checked arithmetic. Allocation failure, invalid strict
+input, and limit exhaustion are distinct errors. Tolerant compatibility
+decoders preserve their specified malformed bytes instead of turning malformed
+input into an engine error.
 
 The optional Unicode map used by `urlDecodeUni` is immutable borrowed storage.
 It must outlive every executor that references it and can therefore be shared
 by request workers without mutation or locking.
+
+`SecCacheTransformations On` enables a transaction-local exact-key LRU. Keys
+include the typed pipeline, exact input bytes, and `multiMatch` mode. Hash
+matches are confirmed with complete kind and byte comparisons. Cached values
+and checkpoints are never shared between transactions. If one entry cannot fit
+the configured cache bound, or a cache-only allocation fails, caching enters an
+explicit `limit_exhausted` or `allocation_failed` state for that transaction;
+the requested transformations still execute normally. Cache hit, miss,
+eviction, byte, entry, and status counters are available to evidence and
+benchmark tooling.
 
 ## Compatibility profiles
 
