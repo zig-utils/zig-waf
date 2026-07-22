@@ -44,10 +44,10 @@ jobs:
       - name: Verify dependency lock
         working-directory: zig-waf
         run: |
-          test "$(git -C ../zig-injection rev-parse HEAD)" = "$(jq -r '.dependencies["zig-injection"].commit' dependencies.lock.json)"
-          test "$(git -C ../zig-regex rev-parse HEAD)" = "$(jq -r '.dependencies["zig-regex"].commit' dependencies.lock.json)"
-          test "$(git -C ../zig-tls rev-parse HEAD)" = "$(jq -r '.dependencies["zig-tls"].commit' dependencies.lock.json)"
-          test "$(git -C ../stx rev-parse HEAD)" = "$(jq -r '.dependencies.stx.commit' dependencies.lock.json)"
+          test "$(git -C ../zig-injection rev-parse HEAD)" = "$(jq -r '.repositories["zig-injection"].commit' dependencies.lock.json)"
+          test "$(git -C ../zig-regex rev-parse HEAD)" = "$(jq -r '.repositories["zig-regex"].commit' dependencies.lock.json)"
+          test "$(git -C ../zig-tls rev-parse HEAD)" = "$(jq -r '.repositories["zig-tls"].commit' dependencies.lock.json)"
+          test "$(git -C ../stx rev-parse HEAD)" = "$(jq -r '.repositories.stx.commit' dependencies.lock.json)"
       - name: Format
         working-directory: zig-waf
         run: zig fmt --check build.zig src benchmarks
