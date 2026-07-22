@@ -225,12 +225,17 @@ pub const Builder = struct {
 
     fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
         const waf = try self.allocator.create(Waf);
+        const directive_configuration = if (owned_plan) |value| switch (directives.Configuration.init(value, self.directive_capabilities)) {
+            .configuration => |configuration| configuration,
+            .diagnostic => unreachable,
+        } else null;
         waf.* = .{
             .allocator = self.allocator,
             .config = self.config,
             .io = self.io,
             .clock_source = self.clock_source,
             .plan = owned_plan,
+            .directive_configuration = directive_configuration,
             .active_transactions = std.atomic.Value(usize).init(0),
             .transaction_sequence = std.atomic.Value(u64).init(0),
         };
@@ -254,6 +259,7 @@ pub const Waf = struct {
     io: std.Io,
     clock_source: ?ClockSource,
     plan: ?*compiled_plan.Plan,
+    directive_configuration: ?directives.Configuration,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
 
@@ -286,6 +292,10 @@ pub const Waf = struct {
 
     pub fn compiledPlan(self: *const Waf) ?*const compiled_plan.Plan {
         return self.plan;
+    }
+
+    pub fn directiveConfiguration(self: *const Waf) ?*const directives.Configuration {
+        return if (self.directive_configuration) |*configuration| configuration else null;
     }
 
     fn now(self: *const Waf) ClockSample {
@@ -1850,6 +1860,7 @@ test "builder retains or transfers compiled plans explicitly" {
     retained_plan.deinit();
     try std.testing.expectEqual(@as(usize, 1), retained_waf.compiledPlan().?.sharedReferenceCount());
     try std.testing.expectEqual(@as(usize, 1), retained_waf.compiledPlan().?.rules.len);
+    try std.testing.expect(retained_waf.directiveConfiguration() != null);
     try retained_waf.deinit();
 
     const transferred_plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});

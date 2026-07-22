@@ -224,6 +224,133 @@ pub const ValidationOutcome = union(enum) {
     diagnostic: Diagnostic,
 };
 
+pub const RuleEngine = enum { on, off, detection_only };
+pub const ConnectionEngine = enum { on, off };
+pub const LimitAction = enum { reject, process_partial };
+pub const AuditEngine = enum { on, off, relevant_only };
+pub const AuditLogType = enum { serial, concurrent, https };
+pub const AuditLogFormat = enum { native, json };
+pub const UploadKeepFiles = enum { on, off, relevant_only };
+pub const RemoteFailAction = enum { abort, warn };
+pub const Fingerprint = [32]u8;
+
+pub const Value = union(enum) {
+    text: []const u8,
+    toggle: bool,
+    rule_engine: RuleEngine,
+    connection_engine: ConnectionEngine,
+    unsigned: u64,
+    limit_action: LimitAction,
+    byte_separator: u8,
+    cookie_format: u1,
+    audit_engine: AuditEngine,
+    audit_log_type: AuditLogType,
+    audit_log_format: AuditLogFormat,
+    audit_parts: []const u8,
+    octal_mode: u16,
+    upload_keep_files: UploadKeepFiles,
+    remote_fail_action: RemoteFailAction,
+};
+
+pub const DecodedValue = struct {
+    source: seclang.source.Span,
+    value: Value,
+};
+
+pub const ConfigurationOutcome = union(enum) {
+    configuration: Configuration,
+    diagnostic: Diagnostic,
+};
+
+/// Immutable typed view over a plan. The plan owner must outlive this value.
+pub const Configuration = struct {
+    plan: *const plan_mod.Plan,
+    capabilities: CapabilitySet,
+    fingerprint: Fingerprint,
+
+    pub fn init(plan: *const plan_mod.Plan, capabilities: CapabilitySet) ConfigurationOutcome {
+        switch (validatePlan(plan, capabilities)) {
+            .valid => {},
+            .diagnostic => |value| return .{ .diagnostic = value },
+        }
+        var result = Configuration{
+            .plan = plan,
+            .capabilities = capabilities,
+            .fingerprint = undefined,
+        };
+        result.fingerprint = computeConfigurationFingerprint(&result);
+        return .{ .configuration = result };
+    }
+
+    /// Return the last source occurrence. This is the effective occurrence for
+    /// singular replacement directives; append directives retain all entries.
+    pub fn latest(self: *const Configuration, id: Id) ?DecodedDirective {
+        var index = self.plan.directives.len;
+        while (index > 0) {
+            index -= 1;
+            const directive = &self.plan.directives[index];
+            const name = self.plan.string(directive.name) orelse continue;
+            const entry = lookup(name) orelse continue;
+            if (entry.id == id) return .{ .plan = self.plan, .entry = entry, .directive = directive };
+        }
+        return null;
+    }
+
+    pub fn occurrences(self: *const Configuration, id: Id) OccurrenceIterator {
+        return .{ .plan = self.plan, .id = id };
+    }
+};
+
+pub const DecodedDirective = struct {
+    plan: *const plan_mod.Plan,
+    entry: *const Entry,
+    directive: *const plan_mod.Directive,
+
+    pub fn values(self: DecodedDirective) ValueIterator {
+        const start: usize = self.directive.arguments_start;
+        const count: usize = self.directive.arguments_count;
+        return .{
+            .plan = self.plan,
+            .entry = self.entry,
+            .arguments = self.plan.arguments[start..][0..count],
+        };
+    }
+};
+
+pub const OccurrenceIterator = struct {
+    plan: *const plan_mod.Plan,
+    id: Id,
+    index: usize = 0,
+
+    pub fn next(self: *OccurrenceIterator) ?DecodedDirective {
+        while (self.index < self.plan.directives.len) {
+            const directive = &self.plan.directives[self.index];
+            self.index += 1;
+            const name = self.plan.string(directive.name) orelse continue;
+            const entry = lookup(name) orelse continue;
+            if (entry.id == self.id) return .{ .plan = self.plan, .entry = entry, .directive = directive };
+        }
+        return null;
+    }
+};
+
+pub const ValueIterator = struct {
+    plan: *const plan_mod.Plan,
+    entry: *const Entry,
+    arguments: []const plan_mod.Argument,
+    index: usize = 0,
+
+    pub fn next(self: *ValueIterator) ?DecodedValue {
+        if (self.index >= self.arguments.len) return null;
+        const index = self.index;
+        self.index += 1;
+        const argument = self.arguments[index];
+        const raw = self.plan.string(argument.raw) orelse unreachable;
+        const value = argumentContent(raw, argument.quote);
+        return .{ .source = argument.source, .value = decodeValue(self.entry.schema, index, value) };
+    }
+};
+
 const Arity = struct { minimum: usize, maximum: usize };
 
 const M = Presence{ .modsecurity = true, .coraza = false };
@@ -533,6 +660,145 @@ fn validAuditParts(value: []const u8) bool {
     return saw_part;
 }
 
+fn decodeValue(schema: Schema, index: usize, value: []const u8) Value {
+    _ = index;
+    return switch (schema) {
+        .toggle => .{ .toggle = std.ascii.eqlIgnoreCase(value, "On") },
+        .rule_engine => .{ .rule_engine = if (std.ascii.eqlIgnoreCase(value, "On"))
+            .on
+        else if (std.ascii.eqlIgnoreCase(value, "Off"))
+            .off
+        else
+            .detection_only },
+        .connection_engine => .{ .connection_engine = if (std.ascii.eqlIgnoreCase(value, "On")) .on else .off },
+        .unsigned => .{ .unsigned = parseUnsigned(value).? },
+        .limit_action => .{ .limit_action = if (std.ascii.eqlIgnoreCase(value, "Reject")) .reject else .process_partial },
+        .byte_separator => .{ .byte_separator = value[0] },
+        .cookie_format => .{ .cookie_format = if (value[0] == '1') 1 else 0 },
+        .audit_engine => .{ .audit_engine = if (std.ascii.eqlIgnoreCase(value, "On"))
+            .on
+        else if (std.ascii.eqlIgnoreCase(value, "Off"))
+            .off
+        else
+            .relevant_only },
+        .audit_log_type => .{ .audit_log_type = if (std.ascii.eqlIgnoreCase(value, "Serial"))
+            .serial
+        else if (std.ascii.eqlIgnoreCase(value, "Concurrent"))
+            .concurrent
+        else
+            .https },
+        .audit_log_format => .{ .audit_log_format = if (std.ascii.eqlIgnoreCase(value, "Native")) .native else .json },
+        .audit_parts => .{ .audit_parts = value },
+        .octal_mode => .{ .octal_mode = parseOctalMode(value).? },
+        .upload_keep_files => .{ .upload_keep_files = if (std.ascii.eqlIgnoreCase(value, "On"))
+            .on
+        else if (std.ascii.eqlIgnoreCase(value, "Off"))
+            .off
+        else
+            .relevant_only },
+        .remote_fail_action => .{ .remote_fail_action = if (std.ascii.eqlIgnoreCase(value, "Abort")) .abort else .warn },
+        .rule,
+        .action,
+        .default_action,
+        .marker,
+        .text,
+        .mime_type,
+        .path,
+        .regex,
+        .id_ranges,
+        .rule_update,
+        .remote_rules,
+        .dataset,
+        .hash_parameter,
+        .unicode_map,
+        => .{ .text = value },
+        .clear => unreachable,
+    };
+}
+
+fn computeConfigurationFingerprint(configuration: *const Configuration) Fingerprint {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("zig-waf typed directive configuration\x00");
+    for (registry) |entry| {
+        hashByte(&hasher, @backingInt(entry.id));
+        if (entry.repeatability == .append) {
+            var count: u32 = 0;
+            var counter = configuration.occurrences(entry.id);
+            while (counter.next() != null) count += 1;
+            hashU32(&hasher, count);
+            var occurrences = configuration.occurrences(entry.id);
+            while (occurrences.next()) |directive| hashDecodedDirective(&hasher, directive);
+        } else if (configuration.latest(entry.id)) |directive| {
+            hashByte(&hasher, 1);
+            hashDecodedDirective(&hasher, directive);
+        } else {
+            hashByte(&hasher, 0);
+        }
+    }
+    var result: Fingerprint = undefined;
+    hasher.final(&result);
+    return result;
+}
+
+fn hashDecodedDirective(hasher: *std.crypto.hash.Blake3, directive: DecodedDirective) void {
+    hashByte(hasher, @backingInt(directive.entry.id));
+    hashU32(hasher, directive.directive.arguments_count);
+    if (directive.entry.sensitive) {
+        hasher.update("<redacted>");
+        return;
+    }
+    var values = directive.values();
+    while (values.next()) |value| hashDecodedValue(hasher, value.value);
+}
+
+fn hashDecodedValue(hasher: *std.crypto.hash.Blake3, value: Value) void {
+    hashByte(hasher, @backingInt(std.meta.activeTag(value)));
+    switch (value) {
+        .text => |bytes| hashBytes(hasher, bytes),
+        .toggle => |enabled| hashByte(hasher, @intFromBool(enabled)),
+        .rule_engine => |item| hashByte(hasher, @backingInt(item)),
+        .connection_engine => |item| hashByte(hasher, @backingInt(item)),
+        .unsigned => |item| hashU64(hasher, item),
+        .limit_action => |item| hashByte(hasher, @backingInt(item)),
+        .byte_separator => |item| hashByte(hasher, item),
+        .cookie_format => |item| hashByte(hasher, item),
+        .audit_engine => |item| hashByte(hasher, @backingInt(item)),
+        .audit_log_type => |item| hashByte(hasher, @backingInt(item)),
+        .audit_log_format => |item| hashByte(hasher, @backingInt(item)),
+        .audit_parts => |bytes| hashBytes(hasher, bytes),
+        .octal_mode => |item| hashU16(hasher, item),
+        .upload_keep_files => |item| hashByte(hasher, @backingInt(item)),
+        .remote_fail_action => |item| hashByte(hasher, @backingInt(item)),
+    }
+}
+
+fn hashBytes(hasher: *std.crypto.hash.Blake3, value: []const u8) void {
+    hashU32(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn hashByte(hasher: *std.crypto.hash.Blake3, value: u8) void {
+    hasher.update(&.{value});
+}
+
+fn hashU16(hasher: *std.crypto.hash.Blake3, value: u16) void {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashU32(hasher: *std.crypto.hash.Blake3, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashU64(hasher: *std.crypto.hash.Blake3, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
 test "stable union has one canonical case insensitive entry per id" {
     try std.testing.expectEqual(std.meta.fieldNames(Id).len, registry.len);
     try std.testing.expectEqual(@as(usize, 85), registry.len);
@@ -622,6 +888,60 @@ test "strict enum arity debug and file mode validation rejects malformed input" 
             .diagnostic => {},
         }
     }
+}
+
+test "typed configuration preserves order and exposes normalized effective values" {
+    const compiled = try compileTestPlan(
+        \\SecRuleEngine Off
+        \\SecRuleEngine ON
+        \\SecRequestBodyLimit 1048576
+        \\SecAuditLogFileMode 0640
+        \\SecResponseBodyMimeType application/json text/plain
+        \\SecResponseBodyMimeType text/html
+    );
+    defer compiled.deinit();
+    var configuration = Configuration.init(compiled, .full()).configuration;
+
+    var rule_engine_values = configuration.latest(.sec_rule_engine).?.values();
+    try std.testing.expectEqual(RuleEngine.on, rule_engine_values.next().?.value.rule_engine);
+    try std.testing.expect(rule_engine_values.next() == null);
+    var body_limit_values = configuration.latest(.sec_request_body_limit).?.values();
+    try std.testing.expectEqual(@as(u64, 1_048_576), body_limit_values.next().?.value.unsigned);
+    var file_mode_values = configuration.latest(.sec_audit_log_file_mode).?.values();
+    try std.testing.expectEqual(@as(u16, 0o640), file_mode_values.next().?.value.octal_mode);
+
+    var mime_occurrences = configuration.occurrences(.sec_response_body_mime_type);
+    var mime_count: usize = 0;
+    while (mime_occurrences.next()) |occurrence| {
+        var values = occurrence.values();
+        while (values.next()) |_| mime_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), mime_count);
+}
+
+test "configuration fingerprints normalize enums and replacement while excluding secrets" {
+    const first_plan = try compileTestPlan(
+        \\SecRuleEngine Off
+        \\SecRuleEngine ON
+        \\SecHashKey first-secret
+    );
+    defer first_plan.deinit();
+    const second_plan = try compileTestPlan(
+        \\SecRuleEngine on
+        \\SecHashKey second-secret
+    );
+    defer second_plan.deinit();
+    const first = Configuration.init(first_plan, .full()).configuration;
+    const second = Configuration.init(second_plan, .full()).configuration;
+    try std.testing.expectEqualSlices(u8, &first.fingerprint, &second.fingerprint);
+
+    const changed_plan = try compileTestPlan(
+        \\SecRuleEngine DetectionOnly
+        \\SecHashKey second-secret
+    );
+    defer changed_plan.deinit();
+    const changed = Configuration.init(changed_plan, .full()).configuration;
+    try std.testing.expect(!std.mem.eql(u8, &first.fingerprint, &changed.fingerprint));
 }
 
 fn compileTestPlan(input: []const u8) !*plan_mod.Plan {
