@@ -20,6 +20,12 @@
       "repository": "stacksjs/stx",
       "commit": "38b8e9bfd8079dd3987427894b74608bf4d47876",
       "localPath": "../../Tools/stx"
+    },
+    "owasp-crs": {
+      "repository": "coreruleset/coreruleset",
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c",
+      "localPath": "../owasp-crs"
     }
   }
 }

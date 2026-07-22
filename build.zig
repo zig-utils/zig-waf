@@ -88,6 +88,22 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&c_api.step);
     check_step.dependOn(&tests.step);
 
+    const parser_corpus_module = b.createModule(.{
+        .root_source_file = b.path("tools/parser_corpus.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    parser_corpus_module.addImport("waf", waf);
+    const parser_corpus = b.addExecutable(.{
+        .name = "parser-corpus",
+        .root_module = parser_corpus_module,
+    });
+    const run_parser_corpus = b.addRunArtifact(parser_corpus);
+    if (b.option([]const []const u8, "parser-corpus", "SecLang corpus file or directory (repeatable)")) |corpus_roots|
+        run_parser_corpus.addArgs(corpus_roots);
+    const parser_corpus_step = b.step("test-parser-corpus", "Parse SecLang files beneath corpus roots");
+    parser_corpus_step.dependOn(&run_parser_corpus.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,
