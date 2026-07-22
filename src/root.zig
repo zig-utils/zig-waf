@@ -8,6 +8,7 @@ pub const action_fuzz = @import("action_fuzz.zig");
 pub const collections = @import("collections.zig");
 pub const directives = @import("directives.zig");
 pub const engine = @import("engine.zig");
+pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
 pub const plan = @import("plan.zig");
@@ -54,6 +55,7 @@ test {
     _ = collections;
     _ = directives;
     _ = engine;
+    _ = flow_evidence;
     _ = macros;
     _ = operators;
     _ = plan;

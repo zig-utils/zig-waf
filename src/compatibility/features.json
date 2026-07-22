@@ -220,6 +220,28 @@
       "notes": "Metadata and effect text compile once; standalone rules and complete chains apply through bounded atomic local/persistent staging. Post-action owned intent, capture replacement, transaction-local ENV, checked TX/persistent arithmetic, binding, expiry, deterministic decay, failure policy, differential fixtures, fuzzing, and latency/allocation benchmarks are executable."
     },
     {
+      "id": "engine.disruptive-flow-runtime-controls",
+      "area": "engine",
+      "name": "Typed disruptive decisions, flow cursor, and transaction runtime controls",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/16",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/action_config.zig",
+        "src/plan.zig",
+        "src/engine.zig",
+        "src/flow_evidence.zig",
+        "src/action_fuzz.zig",
+        "src/compatibility/fixtures/disruptive-flow-controls",
+        "src/compatibility/evidence/disruptive-flow-controls.json",
+        "benchmarks/actions.zig",
+        "docs/disruptive-flow-controls.md"
+      ],
+      "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact exclusions, capability-gated proxy, allocation rollback, fuzzing, and benchmarks are executable. Regex-delimited runtime target selectors remain explicitly unsupported until bounded zig-regex worker storage lands."
+    },
+    {
       "id": "fleet.postgresql-18",
       "area": "fleet",
       "name": "Pantry-managed PostgreSQL 18 and native libpq 18",

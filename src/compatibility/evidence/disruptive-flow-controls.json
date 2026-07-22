@@ -1,0 +1,43 @@
+{
+  "issue": "WAF-15",
+  "compilerAbi": 6,
+  "baselines": {
+    "modsecurity": {
+      "version": "3.0.16",
+      "commit": "7ea9fefbe0ba409d8733b4d682c8c4c059cd028d",
+      "references": [
+        "src/actions/disruptive/allow.cc",
+        "src/actions/block.cc",
+        "src/actions/skip.cc",
+        "src/actions/ctl"
+      ]
+    },
+    "coraza": {
+      "version": "3.7.0",
+      "commit": "27069d06c896be74b77b9a6c0b539a0cbfaca360",
+      "references": [
+        "internal/actions/allow.go",
+        "internal/actions/redirect.go",
+        "internal/actions/skip.go",
+        "internal/actions/ctl.go",
+        "testing/engine/ctl.go"
+      ]
+    },
+    "crs": {
+      "version": "4.28.0",
+      "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c"
+    }
+  },
+  "fixtures": [
+    "src/compatibility/fixtures/disruptive-flow-controls/decisions.conf",
+    "src/compatibility/fixtures/disruptive-flow-controls/controls.conf"
+  ],
+  "qualification": {
+    "unitAndIntegration": "zig build test",
+    "fuzz": "zig build fuzz-actions -Daction-fuzz-iterations=10000",
+    "benchmark": "zig build bench-actions -Doptimize=ReleaseFast",
+    "corpus": "zig build test-plan-corpus with pinned CRS, ModSecurity, and Coraza roots",
+    "unexplainedMismatches": 0
+  },
+  "knownExplicitBoundary": "Regex-delimited runtime target selectors return UnsupportedRuntimeControl until bounded zig-regex worker storage lands."
+}
