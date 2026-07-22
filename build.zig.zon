@@ -18,5 +18,6 @@
         "docs",
         "include",
         "src",
+        "tests",
     },
 }
