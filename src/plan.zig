@@ -10,8 +10,14 @@ pub const DefaultId = enum(u32) { _ };
 
 pub const Limits = struct {
     max_documents: usize = 4096,
+    max_source_references: usize = 4096,
     max_directives: usize = 1_000_000,
     max_rules: usize = 500_000,
+    max_rules_per_phase: usize = 500_000,
+    max_chain_members: usize = 4096,
+    max_graph_edges: usize = 500_000,
+    max_generic_directives: usize = 500_000,
+    max_markers: usize = 500_000,
     max_targets: usize = 2_000_000,
     max_actions: usize = 4_000_000,
     max_transformations: usize = 4_000_000,
@@ -27,8 +33,14 @@ pub const Limits = struct {
 
     pub fn validate(self: Limits) error{InvalidPlanLimit}!void {
         if (self.max_documents == 0 or
+            self.max_source_references == 0 or
             self.max_directives == 0 or
             self.max_rules == 0 or
+            self.max_rules_per_phase == 0 or
+            self.max_chain_members == 0 or
+            self.max_graph_edges == 0 or
+            self.max_generic_directives == 0 or
+            self.max_markers == 0 or
             self.max_targets == 0 or
             self.max_actions == 0 or
             self.max_transformations == 0 or
@@ -44,8 +56,15 @@ pub const Limits = struct {
         {
             return error.InvalidPlanLimit;
         }
-        if (self.max_directives > std.math.maxInt(u32) or
+        if (self.max_documents > std.math.maxInt(u32) or
+            self.max_source_references > std.math.maxInt(u32) or
+            self.max_directives > std.math.maxInt(u32) or
             self.max_rules > std.math.maxInt(u32) or
+            self.max_rules_per_phase > std.math.maxInt(u32) or
+            self.max_chain_members > std.math.maxInt(u32) or
+            self.max_graph_edges > std.math.maxInt(u32) or
+            self.max_generic_directives > std.math.maxInt(u32) or
+            self.max_markers > std.math.maxInt(u32) or
             self.max_targets > std.math.maxInt(u32) or
             self.max_actions > std.math.maxInt(u32) or
             self.max_transformations > std.math.maxInt(u32) or
@@ -63,8 +82,14 @@ pub const Limits = struct {
 pub const CompileError = std.mem.Allocator.Error || error{
     InvalidPlanLimit,
     TooManyDocuments,
+    TooManySourceReferences,
     TooManyDirectives,
     TooManyRules,
+    TooManyRulesInPhase,
+    TooManyChainMembers,
+    TooManyGraphEdges,
+    TooManyGenericDirectives,
+    TooManyMarkers,
     TooManyTargets,
     TooManyActions,
     TooManyTransformations,
@@ -195,6 +220,14 @@ pub const Action = struct {
     raw: StringId,
     name: StringId,
     value: ?StringId,
+    class: ActionClass,
+};
+
+pub const ActionClass = enum { transformation, metadata, nondisruptive, disruptive, flow, unknown };
+
+pub const Marker = struct {
+    directive: DirectiveId,
+    name: StringId,
 };
 
 pub const Transformation = struct {
@@ -241,6 +274,8 @@ pub const Plan = struct {
     actions: []const Action,
     transformations: []const Transformation,
     prefilter_literals: []const StringId,
+    markers: []const Marker,
+    generic_directives: []const DirectiveId,
     defaults: []const DefaultSnapshot,
     phase_rules: [5][]const RuleId,
     owned_bytes: usize,
@@ -344,6 +379,7 @@ fn compileDetailed(
 ) CompileError!*Plan {
     try limits.validate();
     if (documents.len > limits.max_documents) return error.TooManyDocuments;
+    if (registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
     var compiler = Compiler.init(allocator, limits, failure);
     defer compiler.deinit();
     for (documents) |*document| {
@@ -369,6 +405,8 @@ const Compiler = struct {
     actions: std.ArrayList(Action) = .empty,
     transformations: std.ArrayList(Transformation) = .empty,
     prefilter_literals: std.ArrayList(StringId) = .empty,
+    markers: std.ArrayList(Marker) = .empty,
+    generic_directives: std.ArrayList(DirectiveId) = .empty,
     prefilter_count: usize = 0,
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
@@ -376,6 +414,8 @@ const Compiler = struct {
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
     active_default: ?DefaultId = null,
     pending_chain: ?RuleId = null,
+    pending_chain_members: usize = 0,
+    graph_edges: usize = 0,
     failure: ?*?Failure,
 
     fn init(allocator: std.mem.Allocator, limits: Limits, failure: ?*?Failure) Compiler {
@@ -391,6 +431,8 @@ const Compiler = struct {
         self.actions.deinit(self.allocator);
         self.transformations.deinit(self.allocator);
         self.prefilter_literals.deinit(self.allocator);
+        self.markers.deinit(self.allocator);
+        self.generic_directives.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
@@ -441,6 +483,18 @@ const Compiler = struct {
                 });
                 self.active_default = default_id;
             },
+            .sec_marker => {
+                if (self.markers.items.len == self.limits.max_markers) return error.TooManyMarkers;
+                try self.markers.append(self.allocator, .{
+                    .directive = directive_id,
+                    .name = try self.interner.intern(directive.arguments[0].content()),
+                });
+            },
+            .generic => {
+                if (self.generic_directives.items.len == self.limits.max_generic_directives)
+                    return error.TooManyGenericDirectives;
+                try self.generic_directives.append(self.allocator, directive_id);
+            },
             else => {},
         }
         try self.directives.append(self.allocator, .{
@@ -482,6 +536,8 @@ const Compiler = struct {
         if (pending) |head_member| {
             if (phase != self.rules.items[@backingInt(head_member)].phase)
                 return self.fail(error.ChainPhaseMismatch, actionSpan(directive), self.rules.items[@backingInt(head_member)].source);
+            if (self.pending_chain_members == self.limits.max_chain_members) return error.TooManyChainMembers;
+            if (self.graph_edges == self.limits.max_graph_edges) return error.TooManyGraphEdges;
         }
         const external_id = explicitRuleId(directive.parsed_actions) catch
             return self.fail(error.InvalidRuleId, actionSpan(directive), null);
@@ -523,10 +579,16 @@ const Compiler = struct {
             const current = &self.rules.items[@backingInt(id)];
             current.chain_head = previous.chain_head;
             current.chain_position = previous.chain_position + 1;
+            self.pending_chain_members += 1;
+            self.graph_edges += 1;
         } else {
+            if (self.phase_rules[phase - 1].items.len == self.limits.max_rules_per_phase)
+                return error.TooManyRulesInPhase;
             try self.phase_rules[phase - 1].append(self.allocator, id);
+            self.pending_chain_members = 1;
         }
         self.pending_chain = if (hasAction(directive.parsed_actions, "chain")) id else null;
+        if (self.pending_chain == null) self.pending_chain_members = 0;
         return id;
     }
 
@@ -545,6 +607,7 @@ const Compiler = struct {
                 .raw = try self.interner.intern(action.raw),
                 .name = try self.interner.intern(action.name),
                 .value = if (action.value) |value| try self.interner.intern(value) else null,
+                .class = classifyAction(action.name),
             });
         }
         return .{ .start = start, .count = try typedIndex(parsed_actions.len) };
@@ -647,6 +710,8 @@ const Compiler = struct {
         const actions = try duplicateCounted(Action, arena_allocator, self.actions.items, &owned_bytes, self.limits);
         const transformations = try duplicateCounted(Transformation, arena_allocator, self.transformations.items, &owned_bytes, self.limits);
         const prefilter_literals = try duplicateCounted(StringId, arena_allocator, self.prefilter_literals.items, &owned_bytes, self.limits);
+        const markers = try duplicateCounted(Marker, arena_allocator, self.markers.items, &owned_bytes, self.limits);
+        const generic_directives = try duplicateCounted(DirectiveId, arena_allocator, self.generic_directives.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         var phase_rules: [5][]const RuleId = undefined;
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
@@ -667,6 +732,8 @@ const Compiler = struct {
             .actions = actions,
             .transformations = transformations,
             .prefilter_literals = prefilter_literals,
+            .markers = markers,
+            .generic_directives = generic_directives,
             .defaults = defaults,
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
@@ -701,6 +768,28 @@ fn explicitPhase(actions: []const seclang.syntax.Action) CompileError!?u8 {
 
 fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
     for (actions) |action| if (std.ascii.eqlIgnoreCase(action.name, name)) return true;
+    return false;
+}
+
+fn classifyAction(name: []const u8) ActionClass {
+    if (std.ascii.eqlIgnoreCase(name, "t")) return .transformation;
+    if (equalsAny(name, &.{ "id", "msg", "logdata", "tag", "severity", "ver", "rev", "maturity", "accuracy" }))
+        return .metadata;
+    if (equalsAny(name, &.{
+        "capture",              "setvar",                "setenv",                 "initcol",     "expirevar",
+        "deprecatevar",         "multimatch",            "log",                    "nolog",       "auditlog",
+        "noauditlog",           "ctl",                   "exec",                   "pause",       "prepend",
+        "append",               "setuid",                "setsid",                 "sanitizeArg", "sanitizeMatched",
+        "sanitizeMatchedBytes", "sanitizeRequestHeader", "sanitizeResponseHeader",
+    })) return .nondisruptive;
+    if (equalsAny(name, &.{ "allow", "block", "deny", "drop", "pass", "proxy", "redirect" }))
+        return .disruptive;
+    if (equalsAny(name, &.{ "chain", "skip", "skipAfter" })) return .flow;
+    return .unknown;
+}
+
+fn equalsAny(value: []const u8, candidates: []const []const u8) bool {
+    for (candidates) |candidate| if (std.ascii.eqlIgnoreCase(value, candidate)) return true;
     return false;
 }
 
@@ -1060,4 +1149,55 @@ test "prefilter limits fail explicitly" {
     var documents = [_]seclang.parser.Document{parsed.document};
     try std.testing.expectError(error.TooManyPrefilterLiterals, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_prefilter_literals = 1 }));
     try std.testing.expectError(error.PrefilterBytesLimitExceeded, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_prefilter_bytes = 3 }));
+}
+
+test "plan indexes markers generic directives and structural action families" {
+    const input =
+        \\SecMarker CHECKPOINT
+        \\SecExample value
+        \\SecAction "id:1,t:none,msg:'notice',setvar:tx.x=1,deny,skip:1,futureAction"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "indexes.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), compiled.markers.len);
+    try std.testing.expectEqualStrings("CHECKPOINT", compiled.string(compiled.markers[0].name).?);
+    try std.testing.expectEqual(@as(DirectiveId, @fromBackingInt(0)), compiled.markers[0].directive);
+    try std.testing.expectEqualSlices(DirectiveId, &.{@as(DirectiveId, @fromBackingInt(1))}, compiled.generic_directives);
+    const classes = [_]ActionClass{ .metadata, .transformation, .metadata, .nondisruptive, .disruptive, .flow, .unknown };
+    for (compiled.actions, classes) |action, class| try std.testing.expectEqual(class, action.class);
+}
+
+test "phase chain marker and generic resource limits fail distinctly" {
+    const cases = [_]struct {
+        input: []const u8,
+        limits: Limits,
+        failure: CompileError,
+    }{
+        .{ .input = "SecRule ARGS @rx id:1\nSecRule TX @rx id:2", .limits = .{ .max_rules_per_phase = 1 }, .failure = error.TooManyRulesInPhase },
+        .{ .input = "SecRule ARGS @rx chain\nSecRule TX @rx", .limits = .{ .max_chain_members = 1 }, .failure = error.TooManyChainMembers },
+        .{ .input = "SecRule ARGS @rx chain\nSecRule TX @rx chain\nSecRule REQUEST_HEADERS @rx", .limits = .{ .max_graph_edges = 1 }, .failure = error.TooManyGraphEdges },
+        .{ .input = "SecMarker one\nSecMarker two", .limits = .{ .max_markers = 1 }, .failure = error.TooManyMarkers },
+        .{ .input = "SecOne value\nSecTwo value", .limits = .{ .max_generic_directives = 1 }, .failure = error.TooManyGenericDirectives },
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bounded.conf", case.input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        try std.testing.expectError(case.failure, compile(std.testing.allocator, &parsed.registry, &documents, case.limits));
+    }
+}
+
+test "source reference limit is independent of document count" {
+    var registry = try seclang.source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    const first = try registry.add("one.conf", "SecAction pass", null);
+    _ = try registry.add("included.conf", "SecAction pass", null);
+    var document = try seclang.parser.parseSource(std.testing.allocator, &registry, first, .{});
+    defer document.deinit();
+    var documents = [_]seclang.parser.Document{document};
+    try std.testing.expectError(error.TooManySourceReferences, compile(std.testing.allocator, &registry, &documents, .{ .max_source_references = 1 }));
 }
