@@ -39,6 +39,7 @@ pub fn fuzzOne(allocator: std.mem.Allocator, input: []const u8) !void {
                         },
                         .diagnostic => |value| {
                             try parsed.registry.validateSpan(value.primary);
+                            if (value.secondary) |secondary| try parsed.registry.validateSpan(secondary);
                             if (value.code.id().len == 0 or value.message.len == 0)
                                 return error.InvalidDirectiveFuzzDiagnostic;
                         },

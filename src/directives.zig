@@ -204,6 +204,7 @@ pub const DiagnosticCode = enum {
     invalid_path,
     invalid_url,
     invalid_list,
+    conflicting_directives,
 
     pub fn id(self: DiagnosticCode) []const u8 {
         return switch (self) {
@@ -215,6 +216,7 @@ pub const DiagnosticCode = enum {
             .invalid_path => "WAF-DIRECTIVE-0106",
             .invalid_url => "WAF-DIRECTIVE-0107",
             .invalid_list => "WAF-DIRECTIVE-0108",
+            .conflicting_directives => "WAF-DIRECTIVE-0109",
         };
     }
 
@@ -228,6 +230,7 @@ pub const DiagnosticCode = enum {
             .invalid_path => "directive path is unsafe or malformed",
             .invalid_url => "remote directive requires a credential-free HTTPS URL",
             .invalid_list => "directive list contains a malformed item",
+            .conflicting_directives => "directive value conflicts with a related configured limit",
         };
     }
 };
@@ -235,6 +238,7 @@ pub const DiagnosticCode = enum {
 pub const Diagnostic = struct {
     code: DiagnosticCode,
     primary: seclang.source.Span,
+    secondary: ?seclang.source.Span = null,
     directive: ?Id = null,
     sensitive: bool = false,
     message: []const u8,
@@ -671,6 +675,10 @@ pub fn validatePlanWithLimits(
                 return diagnostic(.resource_limit, argument.source, entry.id, true);
         }
     }
+    if (conflictingLimit(compiled, .sec_request_body_no_files_limit, .sec_request_body_limit)) |conflict|
+        return conflictDiagnostic(conflict);
+    if (conflictingLimit(compiled, .sec_request_body_in_memory_limit, .sec_request_body_limit)) |conflict|
+        return conflictDiagnostic(conflict);
     return .valid;
 }
 
@@ -687,6 +695,51 @@ fn diagnostic(
         .sensitive = sensitive,
         .message = code.message(),
     } };
+}
+
+const LimitConflict = struct {
+    constrained: Id,
+    constrained_span: seclang.source.Span,
+    total_span: seclang.source.Span,
+};
+
+fn conflictDiagnostic(conflict: LimitConflict) ValidationOutcome {
+    const code: DiagnosticCode = .conflicting_directives;
+    return .{ .diagnostic = .{
+        .code = code,
+        .primary = conflict.constrained_span,
+        .secondary = conflict.total_span,
+        .directive = conflict.constrained,
+        .message = code.message(),
+    } };
+}
+
+fn conflictingLimit(compiled: *const plan_mod.Plan, constrained: Id, total: Id) ?LimitConflict {
+    const constrained_value = latestUnsigned(compiled, constrained) orelse return null;
+    const total_value = latestUnsigned(compiled, total) orelse return null;
+    if (constrained_value.value <= total_value.value) return null;
+    return .{
+        .constrained = constrained,
+        .constrained_span = constrained_value.span,
+        .total_span = total_value.span,
+    };
+}
+
+const UnsignedOccurrence = struct { value: u64, span: seclang.source.Span };
+
+fn latestUnsigned(compiled: *const plan_mod.Plan, id: Id) ?UnsignedOccurrence {
+    var index = compiled.directives.len;
+    while (index > 0) {
+        index -= 1;
+        const directive = compiled.directives[index];
+        const name = compiled.string(directive.name) orelse continue;
+        const entry = lookup(name) orelse continue;
+        if (entry.id != id or directive.arguments_count != 1) continue;
+        const argument = compiled.arguments[directive.arguments_start];
+        const value = planArgumentContent(compiled, argument) orelse return null;
+        return .{ .value = parseUnsigned(value) orelse return null, .span = argument.source };
+    }
+    return null;
 }
 
 fn arity(id: Id) Arity {
@@ -1261,6 +1314,30 @@ test "paths remote URLs MIME values ID ranges and Unicode code pages validate st
     );
     defer valid.deinit();
     try std.testing.expectEqual(ValidationOutcome.valid, validatePlan(valid, .full()));
+}
+
+test "request sub-limits cannot exceed the effective total body limit" {
+    const cases = [_][]const u8{
+        "SecRequestBodyLimit 100\nSecRequestBodyNoFilesLimit 101",
+        "SecRequestBodyLimit 100\nSecRequestBodyInMemoryLimit 101",
+    };
+    for (cases) |input| {
+        const compiled = try compileTestPlan(input);
+        defer compiled.deinit();
+        const failure = validatePlan(compiled, .full()).diagnostic;
+        try std.testing.expectEqual(DiagnosticCode.conflicting_directives, failure.code);
+        try std.testing.expect(failure.secondary != null);
+        try std.testing.expect(failure.primary.start != failure.secondary.?.start);
+    }
+
+    const overridden = try compileTestPlan(
+        \\SecRequestBodyLimit 100
+        \\SecRequestBodyNoFilesLimit 101
+        \\SecRequestBodyLimit 200
+        \\SecRequestBodyInMemoryLimit 150
+    );
+    defer overridden.deinit();
+    try std.testing.expectEqual(ValidationOutcome.valid, validatePlan(overridden, .full()));
 }
 
 test "typed configuration preserves order and exposes normalized effective values" {

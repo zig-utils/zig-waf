@@ -1893,6 +1893,30 @@ test "builder validates directive schemas and reduced build capabilities before 
     try std.testing.expectEqual(@as(usize, 1), audit_plan.sharedReferenceCount());
 }
 
+test "failed directive generation leaves the active runtime usable" {
+    var initial_builder = Builder.init(std.testing.allocator);
+    const runtime = try initial_builder.buildRuntime();
+    defer runtime.deinit() catch unreachable;
+
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "conflict.conf",
+        "SecRequestBodyLimit 100\nSecRequestBodyNoFilesLimit 101",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const conflicting_plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer conflicting_plan.deinit();
+    var replacement_builder = Builder.init(std.testing.allocator);
+    try std.testing.expectError(error.InvalidDirectiveConfiguration, replacement_builder.buildTransferringPlan(conflicting_plan));
+
+    var transaction = try runtime.newTransaction();
+    try std.testing.expectEqual(@as(usize, 1), try runtime.activeTransactionCount());
+    transaction.deinit();
+}
+
 test "failed builds preserve caller plan ownership" {
     var parsed = try seclang.parser.parseBytes(std.testing.allocator, "failed-build.conf", "SecAction pass", .{}, .{});
     defer parsed.deinit();
