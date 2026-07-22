@@ -62,6 +62,11 @@ pub const Spec = struct {
     name: []const u8,
 };
 
+pub const Alias = struct {
+    name: []const u8,
+    kind: Kind,
+};
+
 pub const specs = [_]Spec{
     .{ .kind = .base64_decode, .name = "base64Decode" },
     .{ .kind = .base64_decode_ext, .name = "base64DecodeExt" },
@@ -100,9 +105,24 @@ pub const specs = [_]Spec{
     .{ .kind = .utf8_to_unicode, .name = "utf8toUnicode" },
 };
 
+pub const aliases = [_]Alias{
+    .{ .name = "normalizePath", .kind = .normalise_path },
+    .{ .name = "normalizePathWin", .kind = .normalise_path_win },
+};
+
 comptime {
     for (specs, 0..) |spec, index| {
         if (@backingInt(spec.kind) != index) @compileError("transformation specs must follow enum order");
+    }
+    for (aliases, 0..) |alias, alias_index| {
+        for (specs) |spec| {
+            if (std.ascii.eqlIgnoreCase(alias.name, spec.name))
+                @compileError("transformation alias duplicates a canonical name");
+        }
+        for (aliases[0..alias_index]) |previous| {
+            if (std.ascii.eqlIgnoreCase(alias.name, previous.name))
+                @compileError("duplicate transformation alias");
+        }
     }
 }
 
@@ -111,8 +131,9 @@ pub fn resolve(name: []const u8) ?Resolution {
     for (specs) |spec| {
         if (std.ascii.eqlIgnoreCase(name, spec.name)) return .{ .builtin = spec.kind };
     }
-    if (std.ascii.eqlIgnoreCase(name, "normalizePath")) return .{ .builtin = .normalise_path };
-    if (std.ascii.eqlIgnoreCase(name, "normalizePathWin")) return .{ .builtin = .normalise_path_win };
+    for (aliases) |alias| {
+        if (std.ascii.eqlIgnoreCase(name, alias.name)) return .{ .builtin = alias.kind };
+    }
     return null;
 }
 
