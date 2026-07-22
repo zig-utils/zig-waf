@@ -199,6 +199,9 @@ pub const DiagnosticCode = enum {
     invalid_argument_count,
     invalid_value,
     resource_limit,
+    invalid_path,
+    invalid_url,
+    invalid_list,
 
     pub fn id(self: DiagnosticCode) []const u8 {
         return switch (self) {
@@ -207,6 +210,9 @@ pub const DiagnosticCode = enum {
             .invalid_argument_count => "WAF-DIRECTIVE-0103",
             .invalid_value => "WAF-DIRECTIVE-0104",
             .resource_limit => "WAF-DIRECTIVE-0105",
+            .invalid_path => "WAF-DIRECTIVE-0106",
+            .invalid_url => "WAF-DIRECTIVE-0107",
+            .invalid_list => "WAF-DIRECTIVE-0108",
         };
     }
 
@@ -217,6 +223,9 @@ pub const DiagnosticCode = enum {
             .invalid_argument_count => "directive argument count does not match its canonical schema",
             .invalid_value => "directive value does not match its canonical schema",
             .resource_limit => "directive configuration exceeds a bounded resource limit",
+            .invalid_path => "directive path is unsafe or malformed",
+            .invalid_url => "remote directive requires a credential-free HTTPS URL",
+            .invalid_list => "directive list contains a malformed item",
         };
     }
 };
@@ -628,6 +637,13 @@ pub fn validatePlanWithLimits(
             const primary = if (arguments.len == 0) directive.source else arguments[0].source;
             return diagnostic(.invalid_value, primary, entry.id, entry.sensitive);
         }
+        if (specialValueFailure(compiled, entry, arguments)) |failure| {
+            const primary = if (arguments.len > failure.argument_index)
+                arguments[failure.argument_index].source
+            else
+                directive.source;
+            return diagnostic(failure.code, primary, entry.id, entry.sensitive);
+        }
         if (entry.id == .sec_response_body_mime_type) {
             if (arguments.len > limits.max_mime_types -| mime_types)
                 return diagnostic(.resource_limit, directive.source, entry.id, false);
@@ -734,6 +750,96 @@ fn validValues(compiled: *const plan_mod.Plan, entry: *const Entry, arguments: [
         .unicode_map,
         => true,
     };
+}
+
+const ValueFailure = struct { code: DiagnosticCode, argument_index: usize = 0 };
+
+fn specialValueFailure(
+    compiled: *const plan_mod.Plan,
+    entry: *const Entry,
+    arguments: []const plan_mod.Argument,
+) ?ValueFailure {
+    if (entry.schema == .path) {
+        const value = planArgumentContent(compiled, arguments[0]) orelse return .{ .code = .invalid_path };
+        if (!validPath(value)) return .{ .code = .invalid_path };
+    }
+    if (entry.id == .sec_unicode_map_file) {
+        const path = planArgumentContent(compiled, arguments[0]) orelse return .{ .code = .invalid_path };
+        if (!validPath(path)) return .{ .code = .invalid_path };
+        if (arguments.len == 2) {
+            const code_page = planArgumentContent(compiled, arguments[1]) orelse return .{ .code = .invalid_value, .argument_index = 1 };
+            if (parseUnsigned(code_page) == null) return .{ .code = .invalid_value, .argument_index = 1 };
+        }
+    }
+    if (entry.id == .sec_remote_rules) {
+        const url = planArgumentContent(compiled, arguments[1]) orelse return .{ .code = .invalid_url, .argument_index = 1 };
+        if (!validHttpsUrl(url)) return .{ .code = .invalid_url, .argument_index = 1 };
+    }
+    if (entry.id == .sec_response_body_mime_type) {
+        for (arguments, 0..) |argument, index| {
+            const mime = planArgumentContent(compiled, argument) orelse return .{ .code = .invalid_list, .argument_index = index };
+            if (!validMimeType(mime)) return .{ .code = .invalid_list, .argument_index = index };
+        }
+    }
+    if (entry.id == .sec_rule_remove_by_id) {
+        const ranges = planArgumentContent(compiled, arguments[0]) orelse return .{ .code = .invalid_list };
+        if (!validIdRanges(ranges)) return .{ .code = .invalid_list };
+    }
+    if (entry.id == .sec_rule_update_target_by_id or entry.id == .sec_rule_update_action_by_id) {
+        const ranges = planArgumentContent(compiled, arguments[0]) orelse return .{ .code = .invalid_list };
+        if (!validIdRanges(ranges)) return .{ .code = .invalid_list };
+    }
+    return null;
+}
+
+fn planArgumentContent(compiled: *const plan_mod.Plan, argument: plan_mod.Argument) ?[]const u8 {
+    const raw = compiled.string(argument.raw) orelse return null;
+    return argumentContent(raw, argument.quote);
+}
+
+fn validPath(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (byte == 0 or byte < 0x20 or byte == 0x7f) return false;
+    var components = std.mem.tokenizeAny(u8, value, "/\\");
+    while (components.next()) |component| if (std.mem.eql(u8, component, "..")) return false;
+    return true;
+}
+
+fn validHttpsUrl(value: []const u8) bool {
+    const prefix = "https://";
+    if (value.len <= prefix.len or !std.ascii.startsWithIgnoreCase(value, prefix)) return false;
+    const remainder = value[prefix.len..];
+    const authority_end = std.mem.indexOfAny(u8, remainder, "/?#") orelse remainder.len;
+    const authority = remainder[0..authority_end];
+    if (authority.len == 0 or std.mem.indexOfScalar(u8, authority, '@') != null) return false;
+    for (value) |byte| if (byte <= 0x20 or byte == 0x7f or byte == '\\') return false;
+    return true;
+}
+
+fn validMimeType(value: []const u8) bool {
+    const slash = std.mem.indexOfScalar(u8, value, '/') orelse return false;
+    if (slash == 0 or slash + 1 == value.len or std.mem.indexOfScalar(u8, value[slash + 1 ..], '/') != null) return false;
+    for (value) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '!' and byte != '#' and byte != '$' and byte != '&' and
+            byte != '^' and byte != '_' and byte != '.' and byte != '+' and byte != '-' and byte != '*' and byte != '/') return false;
+    }
+    return true;
+}
+
+fn validIdRanges(value: []const u8) bool {
+    var items = std.mem.tokenizeAny(u8, value, ", \t");
+    var count: usize = 0;
+    while (items.next()) |item| {
+        count += 1;
+        const dash = std.mem.indexOfScalar(u8, item, '-');
+        if (dash) |index| {
+            if (index == 0 or index + 1 == item.len or std.mem.indexOfScalar(u8, item[index + 1 ..], '-') != null) return false;
+            const first = parseUnsigned(item[0..index]) orelse return false;
+            const last = parseUnsigned(item[index + 1 ..]) orelse return false;
+            if (first > last) return false;
+        } else if (parseUnsigned(item) == null) return false;
+    }
+    return count > 0;
 }
 
 fn argumentContent(raw: []const u8, quote: seclang.lexer.Quote) []const u8 {
@@ -1053,6 +1159,33 @@ test "validation limits bound aggregate values MIME lists remote rules paths URL
         try std.testing.expectEqualStrings("WAF-DIRECTIVE-0105", failure.code.id());
     }
     try std.testing.expectEqual(ValidationOutcome.valid, validatePlanWithLimits(compiled, .full(), .{}));
+}
+
+test "paths remote URLs MIME values ID ranges and Unicode code pages validate strictly" {
+    const cases = [_]struct { input: []const u8, code: DiagnosticCode }{
+        .{ .input = "SecDataDir ../secret", .code = .invalid_path },
+        .{ .input = "SecRemoteRules key http://rules.example.test/bundle", .code = .invalid_url },
+        .{ .input = "SecRemoteRules key https://user@rules.example.test/bundle", .code = .invalid_url },
+        .{ .input = "SecResponseBodyMimeType application", .code = .invalid_list },
+        .{ .input = "SecRuleRemoveById 20-10", .code = .invalid_list },
+        .{ .input = "SecRuleUpdateTargetById nope ARGS", .code = .invalid_list },
+        .{ .input = "SecUnicodeMapFile unicode.mapping not-a-code-page", .code = .invalid_value },
+    };
+    for (cases) |case| {
+        const compiled = try compileTestPlan(case.input);
+        defer compiled.deinit();
+        try std.testing.expectEqual(case.code, validatePlan(compiled, .full()).diagnostic.code);
+    }
+
+    const valid = try compileTestPlan(
+        \\SecDataDir /var/lib/zig-waf
+        \\SecRemoteRules key https://rules.example.test/bundle
+        \\SecResponseBodyMimeType application/json text/*
+        \\SecRuleRemoveById "1,10-20 30"
+        \\SecUnicodeMapFile unicode.mapping 20127
+    );
+    defer valid.deinit();
+    try std.testing.expectEqual(ValidationOutcome.valid, validatePlan(valid, .full()));
 }
 
 test "typed configuration preserves order and exposes normalized effective values" {
