@@ -231,6 +231,8 @@ pub const Executor = struct {
             .html_entity_decode => self.htmlEntityDecode(input),
             .js_decode => self.jsDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
+            .normalise_path => self.normalisePath(input, false),
+            .normalise_path_win => self.normalisePath(input, true),
             .uppercase => self.mapAsciiCase(input, true),
             .remove_comments => self.removeComments(input),
             .remove_comments_char => self.removeCommentsChar(input),
@@ -324,6 +326,44 @@ pub const Executor = struct {
             }
         }
         const changed = if (self.profile == .coraza) true else generated.buffer.items.len != input.len;
+        return finish(generated, input, changed);
+    }
+
+    fn normalisePath(self: *Executor, input: []const u8, windows: bool) ApplyError!Result {
+        if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const rooted = pathByte(input[0], windows) == '/';
+        const trailing = pathByte(input[input.len - 1], windows) == '/';
+        const reserve = std.math.add(usize, input.len, @intFromBool(self.profile == .coraza and rooted and trailing)) catch return error.OutputTooLarge;
+        const generated = try self.writable(reserve);
+        if (rooted) generated.buffer.appendAssumeCapacity('/');
+
+        var index: usize = @intFromBool(rooted);
+        while (index <= input.len) {
+            while (index < input.len and pathByte(input[index], windows) == '/') : (index += 1) {}
+            if (index == input.len) break;
+            const start = index;
+            while (index < input.len and pathByte(input[index], windows) != '/') : (index += 1) {}
+            const segment = input[start..index];
+            if (std.mem.eql(u8, segment, ".")) continue;
+            if (std.mem.eql(u8, segment, "..")) {
+                if (!popNormalPathSegment(generated.buffer, rooted)) {
+                    if (!rooted) appendPathSegment(generated.buffer, segment);
+                }
+                continue;
+            }
+            appendPathSegment(generated.buffer, segment);
+        }
+
+        if (generated.buffer.items.len != 0 and trailing) {
+            if (self.profile == .coraza or generated.buffer.items[generated.buffer.items.len - 1] != '/') {
+                generated.buffer.appendAssumeCapacity('/');
+            }
+        }
+
+        const changed = switch (self.profile) {
+            .modsecurity => !std.mem.eql(u8, generated.buffer.items, input),
+            .coraza => generated.buffer.items.len == 0 or trailing or !equalsMappedPath(generated.buffer.items, input, windows),
+        };
         return finish(generated, input, changed);
     }
 
@@ -1079,6 +1119,31 @@ fn isCmdLineSpecial(byte: u8) bool {
     };
 }
 
+fn pathByte(byte: u8, windows: bool) u8 {
+    return if (windows and byte == '\\') '/' else byte;
+}
+
+fn appendPathSegment(buffer: *std.ArrayList(u8), segment: []const u8) void {
+    if (buffer.items.len != 0 and buffer.items[buffer.items.len - 1] != '/') buffer.appendAssumeCapacity('/');
+    buffer.appendSliceAssumeCapacity(segment);
+}
+
+fn popNormalPathSegment(buffer: *std.ArrayList(u8), rooted: bool) bool {
+    const minimum: usize = @intFromBool(rooted);
+    if (buffer.items.len <= minimum) return false;
+    const last_separator = std.mem.lastIndexOfScalar(u8, buffer.items, '/');
+    const segment_start = if (last_separator) |separator| separator + 1 else 0;
+    if (std.mem.eql(u8, buffer.items[segment_start..], "..")) return false;
+    buffer.shrinkRetainingCapacity(if (last_separator) |separator| @max(separator, minimum) else minimum);
+    return true;
+}
+
+fn equalsMappedPath(output: []const u8, input: []const u8, windows: bool) bool {
+    if (output.len != input.len) return false;
+    for (output, input) |actual, original| if (actual != pathByte(original, windows)) return false;
+    return true;
+}
+
 fn startsWithIgnoreCase(input: []const u8, prefix: []const u8) bool {
     return input.len >= prefix.len and std.ascii.eqlIgnoreCase(input[0..prefix.len], prefix);
 }
@@ -1703,6 +1768,40 @@ test "command-line canonicalization preserves profile changed flags" {
     try std.testing.expect(!ordinary.changed);
 }
 
+test "path normalization preserves relative root and trailing profile semantics" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    const vectors = [_]struct { input: []const u8, output: []const u8 }{
+        .{ .input = "/dir/foo//bar", .output = "/dir/foo/bar" },
+        .{ .input = "dir/foo//bar/", .output = "dir/foo/bar/" },
+        .{ .input = "dir/../../foo", .output = "../foo" },
+        .{ .input = "dir/./.././../../foo/bar", .output = "../../foo/bar" },
+        .{ .input = "/../../etc/./passwd", .output = "/etc/passwd" },
+        .{ .input = "./", .output = "" },
+    };
+    for (vectors) |vector| {
+        try std.testing.expectEqualStrings(vector.output, (try modsecurity.apply(.normalise_path, vector.input)).bytes);
+        try std.testing.expectEqualStrings(vector.output, (try coraza.apply(.normalise_path, vector.input)).bytes);
+    }
+
+    const mod_relative = try modsecurity.apply(.normalise_path, "../");
+    try std.testing.expectEqualStrings("../", mod_relative.bytes);
+    try std.testing.expect(!mod_relative.changed);
+    try std.testing.expect((try coraza.apply(.normalise_path, "../")).changed);
+    try std.testing.expectEqualStrings("/", (try modsecurity.apply(.normalise_path, "/")).bytes);
+    try std.testing.expectEqualStrings("//", (try coraza.apply(.normalise_path, "/")).bytes);
+
+    const mod_windows = try modsecurity.apply(.normalise_path_win, "foo\\bar\\..\\baz");
+    try std.testing.expectEqualStrings("foo/baz", mod_windows.bytes);
+    try std.testing.expect(mod_windows.changed);
+    const coraza_windows = try coraza.apply(.normalise_path_win, "foo\\bar");
+    try std.testing.expectEqualStrings("foo/bar", coraza_windows.bytes);
+    try std.testing.expect(!coraza_windows.changed);
+}
+
 test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
@@ -1714,7 +1813,7 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
-    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.normalise_path, "x"));
+    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.md5, "x"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
