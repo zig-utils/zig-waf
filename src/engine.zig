@@ -49,8 +49,8 @@ pub const Limits = struct {
     max_header_bytes: usize = 64 * 1024,
     max_request_body_bytes: usize = 16 * 1024 * 1024,
     max_response_body_bytes: usize = 16 * 1024 * 1024,
-    max_scalar_value_bytes: usize = 16 * 1024,
-    max_scalar_storage_bytes: usize = 64 * 1024,
+    max_scalar_value_bytes: usize = 32 * 1024,
+    max_scalar_storage_bytes: usize = 256 * 1024,
 
     fn validate(self: Limits) ConfigError!void {
         if (self.max_request_target_bytes == 0 or
@@ -69,6 +69,22 @@ pub const Limits = struct {
 pub const Config = struct {
     mode: Mode = .enabled,
     limits: Limits = .{},
+};
+
+pub const ClockSample = struct {
+    unix_nanoseconds: i96,
+    awake_nanoseconds: i96,
+};
+
+/// Optional deterministic clock provider for embedders and tests. The callback
+/// must be nonblocking and thread-safe, and its context must outlive the WAF.
+pub const ClockSource = struct {
+    context: *anyopaque,
+    nowFn: *const fn (context: *anyopaque) ClockSample,
+
+    pub fn now(self: ClockSource) ClockSample {
+        return self.nowFn(self.context);
+    }
 };
 
 pub const ConfigError = error{InvalidLimit};
@@ -96,9 +112,24 @@ pub const Intervention = struct {
 pub const Builder = struct {
     allocator: std.mem.Allocator,
     config: Config = .{},
+    io: std.Io,
+    clock_source: ?ClockSource = null,
 
     pub fn init(allocator: std.mem.Allocator) Builder {
-        return .{ .allocator = allocator };
+        return .{
+            .allocator = allocator,
+            .io = std.Io.Threaded.global_single_threaded.io(),
+        };
+    }
+
+    /// Override the clock backend. The application owns the backend and must
+    /// keep it alive until the WAF and all of its transactions are destroyed.
+    pub fn setIo(self: *Builder, io: std.Io) void {
+        self.io = io;
+    }
+
+    pub fn setClockSource(self: *Builder, source: ClockSource) void {
+        self.clock_source = source;
     }
 
     pub fn setMode(self: *Builder, mode: Mode) void {
@@ -115,7 +146,10 @@ pub const Builder = struct {
         waf.* = .{
             .allocator = self.allocator,
             .config = self.config,
+            .io = self.io,
+            .clock_source = self.clock_source,
             .active_transactions = std.atomic.Value(usize).init(0),
+            .transaction_sequence = std.atomic.Value(u64).init(0),
         };
         return waf;
     }
@@ -134,13 +168,23 @@ pub const Builder = struct {
 pub const Waf = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    io: std.Io,
+    clock_source: ?ClockSource,
     active_transactions: std.atomic.Value(usize),
+    transaction_sequence: std.atomic.Value(u64),
 
     pub const Builder = @import("engine.zig").Builder;
 
     pub fn newTransaction(self: *const Waf) Transaction {
         _ = @constCast(&self.active_transactions).fetchAdd(1, .monotonic);
-        return .{ .waf = self, .scalar_variables = variables.Store.init(self.allocator) };
+        const started = self.now();
+        return .{
+            .waf = self,
+            .scalar_variables = variables.Store.init(self.allocator),
+            .started_real_nanoseconds = started.unix_nanoseconds,
+            .started_awake_nanoseconds = started.awake_nanoseconds,
+            .sequence = @constCast(&self.transaction_sequence).fetchAdd(1, .monotonic),
+        };
     }
 
     pub fn activeTransactionCount(self: *const Waf) usize {
@@ -149,6 +193,14 @@ pub const Waf = struct {
 
     pub fn features(_: *const Waf) FeatureSet {
         return FeatureSet.allCompiled();
+    }
+
+    fn now(self: *const Waf) ClockSample {
+        if (self.clock_source) |source| return source.now();
+        return .{
+            .unix_nanoseconds = std.Io.Clock.now(.real, self.io).nanoseconds,
+            .awake_nanoseconds = std.Io.Clock.now(.awake, self.io).nanoseconds,
+        };
     }
 
     pub fn deinit(self: *Waf) DeinitError!void {
@@ -261,6 +313,7 @@ pub const TransactionError = error{
     InvalidInterventionStatus,
     InterventionAlreadyRecorded,
     TransactionTerminated,
+    ClockBeforeUnixEpoch,
 } || variables.StoreError;
 
 const Lifecycle = enum {
@@ -295,6 +348,10 @@ pub const Transaction = struct {
     scalar_variables: variables.Store,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
+    started_real_nanoseconds: i96,
+    started_awake_nanoseconds: i96,
+    sequence: u64,
+    highest_severity: u8 = 255,
 
     pub fn processConnection(
         self: *Transaction,
@@ -311,6 +368,7 @@ pub const Transaction = struct {
         try self.setScalarUnsigned(.remote_port, client_port, .connection, .connection);
         try self.setScalar(.server_addr, server_address, .connection, .connection);
         try self.setScalarUnsigned(.server_port, server_port, .connection, .connection);
+        try self.initializeCompatibilityScalars();
         self.lifecycle = .connection;
     }
 
@@ -332,15 +390,41 @@ pub const Transaction = struct {
         const filename = if (query_start) |index| uri[0..index] else uri;
         const query = if (query_start) |index| uri[index + 1 ..] else "";
         try self.setScalar(.request_filename, filename, .request_target, .request_headers);
+        try self.setScalar(.path_info, filename, .request_target, .request_headers);
+        const slash = std.mem.lastIndexOfAny(u8, filename, "/\\");
+        const basename = if (slash) |index| filename[index + 1 ..] else filename;
+        try self.setScalar(.request_basename, basename, .request_target, .request_headers);
         try self.setScalar(.query_string, query, .request_target, .request_headers);
         try self.setScalar(.request_method, method, .request_target, .request_headers);
         try self.setScalar(.request_protocol, protocol, .request_target, .request_headers);
+        const request_line = try std.fmt.allocPrint(self.waf.allocator, "{s} {s} {s}", .{ method, uri, protocol });
+        defer self.waf.allocator.free(request_line);
+        try self.setScalar(.request_line, request_line, .request_target, .request_headers);
         self.lifecycle = .uri;
     }
 
     pub fn addRequestHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
         try self.require(.uri);
-        try self.addHeader(name, value, &self.request_header_count, &self.request_header_bytes);
+        const added = try self.validateHeader(name, value, self.request_header_count, self.request_header_bytes);
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            if (startsWithIgnoreCase(value, "multipart/form-data")) {
+                try self.setScalar(.reqbody_processor, "MULTIPART", .request_header, .request_headers);
+            } else if (startsWithIgnoreCase(value, "application/x-www-form-urlencoded")) {
+                try self.setScalar(.reqbody_processor, "URLENCODED", .request_header, .request_headers);
+            } else if (startsWithIgnoreCase(value, "application/json")) {
+                try self.setScalar(.reqbody_processor, "JSON", .request_header, .request_headers);
+            } else if (startsWithIgnoreCase(value, "application/xml") or startsWithIgnoreCase(value, "text/xml")) {
+                try self.setScalar(.reqbody_processor, "XML", .request_header, .request_headers);
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "authorization")) {
+            const end = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
+            if (end != 0) try self.setScalar(.auth_type, value[0..end], .request_header, .request_headers);
+        } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+            const host = hostWithoutPort(value);
+            if (host.len != 0) try self.setScalar(.server_name, host, .request_header, .request_headers);
+        }
+        self.request_header_count += 1;
+        self.request_header_bytes += added;
     }
 
     pub fn processRequestHeaders(self: *Transaction) TransactionError!void {
@@ -362,13 +446,24 @@ pub const Transaction = struct {
 
     pub fn processRequestBody(self: *Transaction) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body_writing });
+        if (self.scalar_variables.get(.request_body_length, .request_body) == null) {
+            try self.setScalarUnsigned(.request_body_length, 0, .request_body, .request_body);
+        }
+        try self.setFlagIfMissing(.reqbody_error, false, .request_body, .request_body);
+        try self.setFlagIfMissing(.reqbody_processor_error, false, .request_body, .request_body);
+        try self.setFlagIfMissing(.inbound_data_error, false, .request_body, .request_body);
         self.phase_interrupted = false;
         self.lifecycle = .request_body;
     }
 
     pub fn addResponseHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body });
-        try self.addHeader(name, value, &self.response_header_count, &self.response_header_bytes);
+        const added = try self.validateHeader(name, value, self.response_header_count, self.response_header_bytes);
+        if (std.ascii.eqlIgnoreCase(name, "content-type")) {
+            try self.setScalar(.response_content_type, value, .response_header, .response_headers);
+        }
+        self.response_header_count += 1;
+        self.response_header_bytes += added;
     }
 
     pub fn processResponseHeaders(self: *Transaction, status: u16, protocol: []const u8) TransactionError!void {
@@ -376,7 +471,11 @@ pub const Transaction = struct {
         if (status < 100 or status > 599) return error.InvalidInterventionStatus;
         if (!validProtocol(protocol)) return error.InvalidProtocol;
         try self.setScalarUnsigned(.response_status, status, .response, .response_headers);
+        try self.setScalarUnsigned(.status, status, .compatibility, .response_headers);
         try self.setScalar(.response_protocol, protocol, .response, .response_headers);
+        const status_line = try std.fmt.allocPrint(self.waf.allocator, "{s} {d}", .{ protocol, status });
+        defer self.waf.allocator.free(status_line);
+        try self.setScalar(.status_line, status_line, .compatibility, .response_headers);
         self.phase_interrupted = false;
         self.lifecycle = .response_headers;
     }
@@ -387,13 +486,19 @@ pub const Transaction = struct {
             return error.ResponseBodyLimitExceeded;
         }
         const next_body_bytes = self.response_body_bytes + chunk.len;
-        try self.setScalarUnsigned(.response_body_length, next_body_bytes, .response, .response_body);
+        try self.setScalarUnsigned(.response_content_length, next_body_bytes, .response, .response_body);
         self.response_body_bytes = next_body_bytes;
         self.lifecycle = .response_body_writing;
     }
 
     pub fn processResponseBody(self: *Transaction) TransactionError!void {
         try self.requireAny(&.{ .response_headers, .response_body_writing });
+        if (self.scalar_variables.get(.response_content_length, .response_body) == null) {
+            try self.setScalarUnsigned(.response_content_length, 0, .response, .response_body);
+        }
+        try self.setFlagIfMissing(.outbound_data_error, false, .response, .response_body);
+        try self.setFlagIfMissing(.res_body_error, false, .response, .response_body);
+        try self.setFlagIfMissing(.res_body_processor_error, false, .response, .response_body);
         self.phase_interrupted = false;
         self.lifecycle = .response_body;
     }
@@ -459,14 +564,16 @@ pub const Transaction = struct {
         return self.lifecycle == .logging;
     }
 
-    pub fn scalar(self: *const Transaction, name: variables.Name) TransactionError!?variables.View {
+    pub fn scalar(self: *Transaction, name: variables.Name) TransactionError!?variables.View {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (name == .duration) try self.updateDuration();
         const availability = self.currentAvailability() orelse return null;
         return self.scalar_variables.get(name, availability);
     }
 
-    pub fn scalarBySecLangName(self: *const Transaction, name: []const u8) TransactionError!?variables.View {
+    pub fn scalarBySecLangName(self: *Transaction, name: []const u8) TransactionError!?variables.View {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (variables.Name.parse(name)) |parsed| if (parsed == .duration) try self.updateDuration();
         const availability = self.currentAvailability() orelse return null;
         return self.scalar_variables.getBySecLangName(name, availability);
     }
@@ -477,11 +584,53 @@ pub const Transaction = struct {
         try self.setScalar(.user_id, user_id, .connector, .request_headers);
     }
 
+    pub fn setServerName(self: *Transaction, server_name: []const u8) TransactionError!void {
+        try self.requireBeforeRequestHeaders();
+        try self.setScalar(.server_name, server_name, .connector, .request_headers);
+    }
+
+    pub fn setCompatibilityIdentity(
+        self: *Transaction,
+        session_id: []const u8,
+        webapp_id: []const u8,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.setScalar(.session_id, session_id, .connector, .request_headers);
+        try self.setScalar(.webapp_id, webapp_id, .connector, .request_headers);
+    }
+
+    pub fn recordRequestBodyError(self: *Transaction, processor: []const u8, message: []const u8) TransactionError!void {
+        try self.requireAny(&.{ .request_headers, .request_body_writing });
+        if (processor.len != 0) try self.setScalar(.reqbody_processor, processor, .parser, .request_body);
+        try self.setScalar(.reqbody_error, "1", .parser, .request_body);
+        try self.setScalar(.reqbody_error_msg, message, .parser, .request_body);
+        try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body);
+        try self.setScalar(.reqbody_processor_error_msg, message, .parser, .request_body);
+    }
+
+    pub fn recordResponseBodyError(self: *Transaction, processor: []const u8, message: []const u8) TransactionError!void {
+        try self.requireAny(&.{ .response_headers, .response_body_writing });
+        if (processor.len != 0) try self.setScalar(.res_body_processor, processor, .parser, .response_body);
+        try self.setScalar(.res_body_error, "1", .parser, .response_body);
+        try self.setScalar(.res_body_error_msg, message, .parser, .response_body);
+        try self.setScalar(.res_body_processor_error, "1", .parser, .response_body);
+        try self.setScalar(.res_body_processor_error_msg, message, .parser, .response_body);
+    }
+
+    pub fn recordRegexError(self: *Transaction, limits_exceeded: bool) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.setScalar(.msc_pcre_error, "1", .compatibility, .request_headers);
+        if (limits_exceeded) try self.setScalar(.msc_pcre_limits_exceeded, "1", .compatibility, .request_headers);
+    }
+
     pub fn recordMatch(self: *Transaction, name: []const u8, value: []const u8, severity: u8) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         try self.setScalar(.matched_var_name, name, .rule, .request_headers);
         try self.setScalar(.matched_var, value, .rule, .request_headers);
-        try self.setScalarUnsigned(.highest_severity, severity, .rule, .request_headers);
+        if (severity < self.highest_severity) {
+            self.highest_severity = severity;
+            try self.setScalarUnsigned(.highest_severity, severity, .rule, .request_headers);
+        }
     }
 
     pub fn deinit(self: *Transaction) void {
@@ -491,19 +640,18 @@ pub const Transaction = struct {
         _ = @constCast(&self.waf.active_transactions).fetchSub(1, .release);
     }
 
-    fn addHeader(
+    fn validateHeader(
         self: *Transaction,
         name: []const u8,
         value: []const u8,
-        count: *usize,
-        bytes: *usize,
-    ) TransactionError!void {
+        count: usize,
+        bytes: usize,
+    ) TransactionError!usize {
         if (!validToken(name) or containsLineBreak(value)) return error.InvalidHeader;
-        if (count.* == self.waf.config.limits.max_header_count) return error.TooManyHeaders;
+        if (count == self.waf.config.limits.max_header_count) return error.TooManyHeaders;
         const added = name.len + value.len;
-        if (added > self.waf.config.limits.max_header_bytes - bytes.*) return error.HeadersTooLarge;
-        count.* += 1;
-        bytes.* += added;
+        if (added > self.waf.config.limits.max_header_bytes - bytes) return error.HeadersTooLarge;
+        return added;
     }
 
     fn require(self: *const Transaction, expected: Lifecycle) TransactionError!void {
@@ -529,6 +677,68 @@ pub const Transaction = struct {
             .response_body_writing, .response_body => .response_body,
             .logging => .logging,
         };
+    }
+
+    fn initializeCompatibilityScalars(self: *Transaction) TransactionError!void {
+        if (self.started_real_nanoseconds < 0) return error.ClockBeforeUnixEpoch;
+        try self.setScalar(.remote_host, (self.scalar_variables.get(.remote_addr, .connection) orelse unreachable).value, .compatibility, .connection);
+        try self.setScalar(.modsec_build, "zig-waf/0.0.0-dev", .compatibility, .request_headers);
+        try self.setScalar(.msc_pcre_error, "0", .compatibility, .request_headers);
+        try self.setScalar(.msc_pcre_limits_exceeded, "0", .compatibility, .request_headers);
+        try self.setScalar(.urlencoded_error, "0", .parser, .request_headers);
+        try self.setScalar(.highest_severity, "255", .rule, .request_headers);
+        try self.setScalar(.duration, "0", .timing, .request_headers);
+
+        var id_buffer: [64]u8 = undefined;
+        const id = std.fmt.bufPrint(&id_buffer, "zigwaf-{x}-{x}", .{ self.started_real_nanoseconds, self.sequence }) catch unreachable;
+        try self.setScalar(.unique_id, id, .engine, .request_headers);
+        try self.setTimeScalars();
+    }
+
+    fn setTimeScalars(self: *Transaction) TransactionError!void {
+        const seconds: u64 = @intCast(@divFloor(self.started_real_nanoseconds, std.time.ns_per_s));
+        const epoch_seconds: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+        const day_seconds = epoch_seconds.getDaySeconds();
+        const year_day = epoch_seconds.getEpochDay().calculateYearDay();
+        const month_day = year_day.calculateMonthDay();
+        const hour = day_seconds.getHoursIntoDay();
+        const minute = day_seconds.getMinutesIntoHour();
+        const second = day_seconds.getSecondsIntoMinute();
+        var time_buffer: [8]u8 = undefined;
+        const formatted_time = std.fmt.bufPrint(&time_buffer, "{d:0>2}:{d:0>2}:{d:0>2}", .{ hour, minute, second }) catch unreachable;
+        try self.setScalar(.time, formatted_time, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_day, @as(u8, month_day.day_index) + 1, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_epoch, seconds, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_hour, hour, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_min, minute, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_mon, month_day.month.numeric(), .timing, .request_headers);
+        try self.setScalarUnsigned(.time_sec, second, .timing, .request_headers);
+        // POSIX/Go convention: Sunday=0. 1970-01-01 was Thursday (4).
+        try self.setScalarUnsigned(.time_wday, (epoch_seconds.getEpochDay().day + 4) % 7, .timing, .request_headers);
+        try self.setScalarUnsigned(.time_year, year_day.year, .timing, .request_headers);
+    }
+
+    fn updateDuration(self: *Transaction) TransactionError!void {
+        const now = self.waf.now();
+        const elapsed = @max(@as(i96, 0), now.awake_nanoseconds - self.started_awake_nanoseconds);
+        try self.setScalarUnsigned(.duration, @divTrunc(elapsed, std.time.ns_per_ms), .timing, .request_headers);
+    }
+
+    fn setFlagIfMissing(
+        self: *Transaction,
+        name: variables.Name,
+        value: bool,
+        origin: variables.Origin,
+        available_from: variables.Availability,
+    ) TransactionError!void {
+        if (self.scalar_variables.get(name, available_from) == null) {
+            try self.setScalar(name, if (value) "1" else "0", origin, available_from);
+        }
+    }
+
+    fn requireBeforeRequestHeaders(self: *const Transaction) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (self.lifecycle != .created and self.lifecycle != .connection and self.lifecycle != .uri) return error.InvalidLifecycle;
     }
 
     fn setScalar(
@@ -597,6 +807,21 @@ fn containsLineBreak(value: []const u8) bool {
     return std.mem.indexOfAny(u8, value, "\r\n\x00") != null;
 }
 
+fn startsWithIgnoreCase(value: []const u8, prefix: []const u8) bool {
+    return value.len >= prefix.len and std.ascii.eqlIgnoreCase(value[0..prefix.len], prefix);
+}
+
+fn hostWithoutPort(value: []const u8) []const u8 {
+    if (value.len == 0) return value;
+    if (value[0] == '[') {
+        const close = std.mem.indexOfScalar(u8, value, ']') orelse return value;
+        return value[1..close];
+    }
+    const first_colon = std.mem.indexOfScalar(u8, value, ':') orelse return value;
+    if (std.mem.indexOfScalarPos(u8, value, first_colon + 1, ':') != null) return value;
+    return value[0..first_colon];
+}
+
 const ReloadWorker = struct {
     runtime: *Runtime,
     pinned: *std.atomic.Value(usize),
@@ -619,6 +844,19 @@ const ReloadWorker = struct {
             };
             tx.deinit();
         }
+    }
+};
+
+const TestClock = struct {
+    unix_nanoseconds: i96,
+    awake_nanoseconds: i96,
+
+    fn now(context: *anyopaque) ClockSample {
+        const self: *TestClock = @ptrCast(@alignCast(context));
+        return .{
+            .unix_nanoseconds = self.unix_nanoseconds,
+            .awake_nanoseconds = self.awake_nanoseconds,
+        };
     }
 };
 
@@ -776,6 +1014,79 @@ test "owns scalar variables and exposes them only in valid phases" {
     try tx.processRequestHeaders();
     try tx.processResponseHeaders(403, "HTTP/2");
     try std.testing.expectEqualStrings("403", (try tx.scalar(.response_status)).?.value);
+}
+
+test "populates timing and compatibility scalars from an injectable clock" {
+    var clock: TestClock = .{ .unix_nanoseconds = 0, .awake_nanoseconds = 1_000_000 };
+    var builder = Builder.init(std.testing.allocator);
+    builder.setClockSource(.{ .context = &clock, .nowFn = TestClock.now });
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try std.testing.expect((try tx.scalar(.time_epoch)) == null);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectEqualStrings("0", (try tx.scalar(.time_epoch)).?.value);
+    try std.testing.expectEqualStrings("00:00:00", (try tx.scalar(.time)).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.time_day)).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.time_mon)).?.value);
+    try std.testing.expectEqualStrings("1970", (try tx.scalar(.time_year)).?.value);
+    try std.testing.expectEqualStrings("4", (try tx.scalar(.time_wday)).?.value);
+    try std.testing.expectEqualStrings("255", (try tx.scalar(.highest_severity)).?.value);
+    try std.testing.expectEqualStrings("0", (try tx.scalar(.msc_pcre_error)).?.value);
+    try std.testing.expect(std.mem.startsWith(u8, (try tx.scalar(.unique_id)).?.value, "zigwaf-"));
+
+    clock.awake_nanoseconds += 12 * std.time.ns_per_ms + 999;
+    try std.testing.expectEqualStrings("12", (try tx.scalar(.duration)).?.value);
+}
+
+test "derives header, identity, match, body error, and response scalars" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+
+    try tx.processConnection("192.0.2.1", 1234, "2001:db8::1", 443);
+    try tx.processUri("/submit?q=1", "POST", "HTTP/1.1");
+    try tx.setIdentity("alice", "user-7");
+    try tx.setCompatibilityIdentity("session-8", "shop");
+    try tx.addRequestHeader("Host", "[2001:db8::2]:8443");
+    try tx.addRequestHeader("Authorization", "Bearer token");
+    try tx.addRequestHeader("Content-Type", "application/json; charset=utf-8");
+    try tx.processRequestHeaders();
+    try std.testing.expectEqualStrings("2001:db8::2", (try tx.scalar(.server_name)).?.value);
+    try std.testing.expectEqualStrings("Bearer", (try tx.scalar(.auth_type)).?.value);
+    try std.testing.expectEqualStrings("JSON", (try tx.scalar(.reqbody_processor)).?.value);
+    try std.testing.expectEqualStrings("alice", (try tx.scalar(.remote_user)).?.value);
+    try std.testing.expectEqualStrings("session-8", (try tx.scalar(.session_id)).?.value);
+
+    try tx.recordMatch("ARGS:q", "attack", 4);
+    try tx.recordMatch("REQUEST_URI", "/submit", 7);
+    try std.testing.expectEqualStrings("4", (try tx.scalar(.highest_severity)).?.value);
+    try tx.recordMatch("REQUEST_URI", "/submit", 1);
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.highest_severity)).?.value);
+    try std.testing.expectEqualStrings("REQUEST_URI", (try tx.scalar(.matched_var_name)).?.value);
+
+    try tx.writeRequestBody("invalid");
+    try tx.recordRequestBodyError("JSON", "unexpected token");
+    try tx.processRequestBody();
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_error)).?.value);
+    try std.testing.expectEqualStrings("unexpected token", (try tx.scalar(.reqbody_processor_error_msg)).?.value);
+    try std.testing.expectEqualStrings("0", (try tx.scalar(.inbound_data_error)).?.value);
+
+    try tx.addResponseHeader("Content-Type", "application/problem+json");
+    try tx.processResponseHeaders(422, "HTTP/1.1");
+    try std.testing.expectEqualStrings("application/problem+json", (try tx.scalar(.response_content_type)).?.value);
+    try std.testing.expectEqualStrings("HTTP/1.1 422", (try tx.scalar(.status_line)).?.value);
+    try tx.writeResponseBody("problem");
+    try tx.recordResponseBodyError("JSON", "invalid response");
+    try tx.processResponseBody();
+    try std.testing.expectEqualStrings("7", (try tx.scalar(.response_content_length)).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.res_body_error)).?.value);
+    try std.testing.expectEqualStrings("0", (try tx.scalar(.outbound_data_error)).?.value);
 }
 
 test "compiled feature discovery is explicit" {

@@ -14,6 +14,8 @@ pub const Intervention = engine.Intervention;
 pub const Phase = engine.Phase;
 pub const Feature = engine.Feature;
 pub const FeatureSet = engine.FeatureSet;
+pub const ClockSample = engine.ClockSample;
+pub const ClockSource = engine.ClockSource;
 
 test {
     _ = version;

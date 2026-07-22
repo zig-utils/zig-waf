@@ -281,6 +281,7 @@ pub const Name = enum {
             .highest_severity, .matched_var, .matched_var_name => .rule,
             .modsec_build, .msc_pcre_error, .msc_pcre_limits_exceeded => .compatibility,
             .args_combined_size, .urlencoded_error => .parser,
+            .unique_id => .engine,
             else => .connector,
         };
     }
@@ -296,6 +297,7 @@ pub const Origin = enum {
     timing,
     parser,
     compatibility,
+    engine,
     rule,
     connector,
 };
