@@ -172,10 +172,34 @@ pub const Result = struct {
     storage: Storage,
 };
 
+pub const Checkpoint = struct {
+    bytes: []const u8,
+    /// Null identifies the original value; otherwise this is the zero-based
+    /// pipeline step whose upstream `changed` result created the checkpoint.
+    after_step: ?u32,
+};
+
+pub const PipelineResult = struct {
+    bytes: []const u8,
+    changed: bool,
+    storage: Storage,
+    checkpoints: []const Checkpoint,
+    steps_executed: u32,
+    cumulative_bytes: usize,
+};
+
+const CheckpointRecord = struct {
+    offset: usize,
+    length: usize,
+    after_step: ?u32,
+};
+
 pub const ApplyError = std.mem.Allocator.Error || error{
     InvalidLimits,
     InputTooLarge,
     OutputTooLarge,
+    TooManyPipelineSteps,
+    CumulativeOutputTooLarge,
     InvalidInput,
 };
 
@@ -193,6 +217,8 @@ pub const Executor = struct {
     profile: Profile,
     unicode_map: ?UnicodeMap,
     buffers: [2]std.ArrayList(u8) = .{ .empty, .empty },
+    checkpoint_bytes: std.ArrayList(u8) = .empty,
+    checkpoints: std.ArrayList(Checkpoint) = .empty,
     next_buffer: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!Executor {
@@ -215,11 +241,17 @@ pub const Executor = struct {
 
     pub fn deinit(self: *Executor) void {
         for (&self.buffers) |*buffer| buffer.deinit(self.allocator);
+        self.checkpoint_bytes.deinit(self.allocator);
+        self.checkpoints.deinit(self.allocator);
         self.* = undefined;
     }
 
     pub fn apply(self: *Executor, kind: Kind, input: []const u8) ApplyError!Result {
         if (input.len > self.limits.max_input_bytes) return error.InputTooLarge;
+        return self.applyStep(kind, input);
+    }
+
+    fn applyStep(self: *Executor, kind: Kind, input: []const u8) ApplyError!Result {
         return switch (kind) {
             .base64_decode => self.base64Decode(input, false),
             .base64_decode_ext => self.base64Decode(input, true),
@@ -257,6 +289,69 @@ pub const Executor = struct {
             .parity_zero_7bit => self.parityZero(input),
             .length => self.length(input),
         };
+    }
+
+    pub fn applyPipeline(self: *Executor, pipeline: []const Kind, input: []const u8, multi_match: bool) ApplyError!PipelineResult {
+        if (input.len > self.limits.max_input_bytes) return error.InputTooLarge;
+        if (pipeline.len > self.limits.max_pipeline_steps) return error.TooManyPipelineSteps;
+        self.checkpoint_bytes.clearRetainingCapacity();
+        self.checkpoints.clearRetainingCapacity();
+        errdefer {
+            self.checkpoint_bytes.clearRetainingCapacity();
+            self.checkpoints.clearRetainingCapacity();
+        }
+
+        var cumulative_bytes = input.len;
+        if (cumulative_bytes > self.limits.max_cumulative_output_bytes) return error.CumulativeOutputTooLarge;
+        var checkpoint_records: std.ArrayList(CheckpointRecord) = .empty;
+        defer checkpoint_records.deinit(self.allocator);
+        if (multi_match) try self.stageCheckpoint(&checkpoint_records, input, null);
+
+        var current = Result{ .bytes = input, .changed = false, .storage = .borrowed };
+        var pipeline_changed = false;
+        for (pipeline, 0..) |kind, step| {
+            const previous_storage = current.storage;
+            var next = try self.applyStep(kind, current.bytes);
+            if (next.storage == .borrowed) next.storage = previous_storage;
+            current = next;
+            cumulative_bytes = std.math.add(usize, cumulative_bytes, current.bytes.len) catch
+                return error.CumulativeOutputTooLarge;
+            if (cumulative_bytes > self.limits.max_cumulative_output_bytes)
+                return error.CumulativeOutputTooLarge;
+            pipeline_changed = pipeline_changed or current.changed;
+            if (multi_match and current.changed) {
+                try self.stageCheckpoint(&checkpoint_records, current.bytes, @intCast(step));
+            }
+        }
+
+        try self.checkpoints.ensureTotalCapacity(self.allocator, checkpoint_records.items.len);
+        for (checkpoint_records.items) |record| {
+            self.checkpoints.appendAssumeCapacity(.{
+                .bytes = self.checkpoint_bytes.items[record.offset..][0..record.length],
+                .after_step = record.after_step,
+            });
+        }
+        return .{
+            .bytes = current.bytes,
+            .changed = pipeline_changed,
+            .storage = current.storage,
+            .checkpoints = self.checkpoints.items,
+            .steps_executed = @intCast(pipeline.len),
+            .cumulative_bytes = cumulative_bytes,
+        };
+    }
+
+    fn stageCheckpoint(
+        self: *Executor,
+        records: *std.ArrayList(CheckpointRecord),
+        bytes: []const u8,
+        after_step: ?u32,
+    ) ApplyError!void {
+        if (bytes.len > self.limits.max_cumulative_output_bytes -| self.checkpoint_bytes.items.len)
+            return error.CumulativeOutputTooLarge;
+        const offset = self.checkpoint_bytes.items.len;
+        try self.checkpoint_bytes.appendSlice(self.allocator, bytes);
+        try records.append(self.allocator, .{ .offset = offset, .length = bytes.len, .after_step = after_step });
     }
 
     fn writable(self: *Executor, capacity: usize) ApplyError!Scratch {
@@ -1838,6 +1933,56 @@ test "compatibility digests return raw binary bytes" {
     try std.testing.expect((try executor.apply(.sha1, "")).changed);
 }
 
+test "ordered pipelines retain storage and stage multi-match checkpoints" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    const pipeline = [_]Kind{ .url_decode, .lowercase, .trim };
+    const result = try executor.applyPipeline(&pipeline, " %41+ ", true);
+    try std.testing.expectEqualStrings("a", result.bytes);
+    try std.testing.expect(result.changed);
+    try std.testing.expect(result.storage != .borrowed);
+    try std.testing.expectEqual(@as(u32, 3), result.steps_executed);
+    try std.testing.expectEqual(@as(usize, 4), result.checkpoints.len);
+    try std.testing.expectEqualStrings(" %41+ ", result.checkpoints[0].bytes);
+    try std.testing.expectEqual(@as(?u32, null), result.checkpoints[0].after_step);
+    try std.testing.expectEqualStrings(" A  ", result.checkpoints[1].bytes);
+    try std.testing.expectEqual(@as(?u32, 0), result.checkpoints[1].after_step);
+    try std.testing.expectEqualStrings(" a  ", result.checkpoints[2].bytes);
+    try std.testing.expectEqual(@as(?u32, 1), result.checkpoints[2].after_step);
+    try std.testing.expectEqualStrings("a", result.checkpoints[3].bytes);
+    try std.testing.expectEqual(@as(?u32, 2), result.checkpoints[3].after_step);
+
+    const unchanged = try executor.applyPipeline(&.{.lowercase}, "ordinary", true);
+    try std.testing.expect(!unchanged.changed);
+    try std.testing.expectEqual(@as(usize, 1), unchanged.checkpoints.len);
+    const upstream_changed = try executor.applyPipeline(&.{.length}, "1", true);
+    try std.testing.expect(upstream_changed.changed);
+    try std.testing.expectEqual(@as(usize, 2), upstream_changed.checkpoints.len);
+    try std.testing.expectEqualStrings("1", upstream_changed.checkpoints[0].bytes);
+    try std.testing.expectEqualStrings("1", upstream_changed.checkpoints[1].bytes);
+    const without_multi_match = try executor.applyPipeline(&pipeline, " %41+ ", false);
+    try std.testing.expectEqual(@as(usize, 0), without_multi_match.checkpoints.len);
+}
+
+test "pipeline failures publish no partial checkpoint storage" {
+    var steps = try Executor.init(std.testing.allocator, .{
+        .max_pipeline_steps = 1,
+    });
+    defer steps.deinit();
+    try std.testing.expectError(error.TooManyPipelineSteps, steps.applyPipeline(&.{ .lowercase, .uppercase }, "x", true));
+
+    var cumulative = try Executor.init(std.testing.allocator, .{
+        .max_output_bytes = 8,
+        .max_cumulative_output_bytes = 8,
+    });
+    defer cumulative.deinit();
+    try std.testing.expectError(error.CumulativeOutputTooLarge, cumulative.applyPipeline(&.{ .lowercase, .uppercase }, "ABCD", true));
+    const recovered = try cumulative.applyPipeline(&.{}, "x", true);
+    try std.testing.expectEqual(@as(usize, 1), recovered.checkpoints.len);
+    try std.testing.expectEqualStrings("x", recovered.checkpoints[0].bytes);
+}
+
 test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
@@ -1859,6 +2004,9 @@ test "executor scratch ownership is exhaustive-allocation-failure safe" {
             try std.testing.expectEqualStrings(" mixed whitespace ", (try executor.apply(.compress_whitespace, "\t mixed\n\nwhitespace \r")).bytes);
             try std.testing.expectEqualStrings("MIXED", (try executor.apply(.uppercase, "mixed")).bytes);
             try std.testing.expectEqualSlices(u8, &.{ 0x41, 0xc3 }, (try executor.apply(.parity_even_7bit, "AC")).bytes);
+            const pipeline = try executor.applyPipeline(&.{ .url_decode, .lowercase, .trim }, " %41+ ", true);
+            try std.testing.expectEqualStrings("a", pipeline.bytes);
+            try std.testing.expectEqual(@as(usize, 4), pipeline.checkpoints.len);
         }
     }.run, .{});
 }
