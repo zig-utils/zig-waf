@@ -177,7 +177,6 @@ pub const ApplyError = std.mem.Allocator.Error || error{
     InputTooLarge,
     OutputTooLarge,
     InvalidInput,
-    UnsupportedTransformation,
 };
 
 /// Reusable bounded scratch for one request worker/transaction. Executor-backed
@@ -231,6 +230,7 @@ pub const Executor = struct {
             .html_entity_decode => self.htmlEntityDecode(input),
             .js_decode => self.jsDecode(input),
             .lowercase => self.mapAsciiCase(input, false),
+            .md5 => self.digest(input, std.crypto.hash.Md5),
             .normalise_path => self.normalisePath(input, false),
             .normalise_path_win => self.normalisePath(input, true),
             .uppercase => self.mapAsciiCase(input, true),
@@ -244,6 +244,7 @@ pub const Executor = struct {
             .remove_whitespace => self.removeBytes(input, isRemovalWhitespace),
             .remove_nulls => self.removeBytes(input, isNull),
             .replace_nulls => self.replaceNulls(input),
+            .sha1 => self.digest(input, std.crypto.hash.Sha1),
             .hex_decode => self.hexDecode(input),
             .hex_encode => self.hexEncode(input),
             .sql_hex_decode => self.sqlHexDecode(input),
@@ -255,7 +256,6 @@ pub const Executor = struct {
             .parity_odd_7bit => self.parity(input, false),
             .parity_zero_7bit => self.parityZero(input),
             .length => self.length(input),
-            else => error.UnsupportedTransformation,
         };
     }
 
@@ -365,6 +365,14 @@ pub const Executor = struct {
             .coraza => generated.buffer.items.len == 0 or trailing or !equalsMappedPath(generated.buffer.items, input, windows),
         };
         return finish(generated, input, changed);
+    }
+
+    fn digest(self: *Executor, input: []const u8, comptime Hash: type) ApplyError!Result {
+        const generated = try self.writable(Hash.digest_length);
+        var output: [Hash.digest_length]u8 = undefined;
+        Hash.hash(input, &output, .{});
+        generated.buffer.appendSliceAssumeCapacity(&output);
+        return finish(generated, input, true);
     }
 
     fn cssDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1802,6 +1810,34 @@ test "path normalization preserves relative root and trailing profile semantics"
     try std.testing.expect(!coraza_windows.changed);
 }
 
+test "compatibility digests return raw binary bytes" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xd4, 0x1d, 0x8c, 0xd9, 0x8f, 0x00, 0xb2, 0x04, 0xe9, 0x80, 0x09, 0x98, 0xec, 0xf8, 0x42, 0x7e },
+        (try executor.apply(.md5, "")).bytes,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xc9, 0xab, 0xa2, 0xc3, 0xe6, 0x01, 0x26, 0x16, 0x9e, 0x80, 0xe9, 0xa2, 0x6b, 0xa2, 0x73, 0xc1 },
+        (try executor.apply(.md5, "TestCase")).bytes,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60, 0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09 },
+        (try executor.apply(.sha1, "")).bytes,
+    );
+    try std.testing.expectEqualSlices(
+        u8,
+        &.{ 0x63, 0xbf, 0x60, 0xc7, 0x10, 0x5a, 0x07, 0xa2, 0xb1, 0x25, 0xbb, 0xf8, 0x9e, 0x61, 0xab, 0xda, 0xbc, 0x69, 0x78, 0xc2 },
+        (try executor.apply(.sha1, "\x00\x01\x02\x03\x04\x05\x06\x07\x08")).bytes,
+    );
+    try std.testing.expect((try executor.apply(.md5, "")).changed);
+    try std.testing.expect((try executor.apply(.sha1, "")).changed);
+}
+
 test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
@@ -1813,7 +1849,6 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
-    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.md5, "x"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
