@@ -77,6 +77,57 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidTransformation,
 };
 
+pub const DiagnosticCode = enum {
+    invalid_rule_id,
+    duplicate_rule_id,
+    invalid_phase,
+    dangling_chain,
+    chain_phase_mismatch,
+    invalid_transformation,
+
+    pub fn id(self: DiagnosticCode) []const u8 {
+        return switch (self) {
+            .invalid_rule_id => "WAF-PLAN-0101",
+            .duplicate_rule_id => "WAF-PLAN-0102",
+            .invalid_phase => "WAF-PLAN-0103",
+            .dangling_chain => "WAF-PLAN-0104",
+            .chain_phase_mismatch => "WAF-PLAN-0105",
+            .invalid_transformation => "WAF-PLAN-0106",
+        };
+    }
+
+    pub fn message(self: DiagnosticCode) []const u8 {
+        return switch (self) {
+            .invalid_rule_id => "rule id must be an unsigned 64-bit integer",
+            .duplicate_rule_id => "rule id is already defined",
+            .invalid_phase => "phase must name or number one of the five SecLang phases",
+            .dangling_chain => "chain action must be followed by another SecRule in the same document",
+            .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
+            .invalid_transformation => "transformation action requires a non-empty name",
+        };
+    }
+};
+
+pub const Diagnostic = struct {
+    code: DiagnosticCode,
+    primary: seclang.source.Span,
+    secondary: ?seclang.source.Span = null,
+    message: []const u8,
+};
+
+pub const CompileOutcome = union(enum) {
+    plan: *Plan,
+    diagnostic: Diagnostic,
+
+    pub fn deinit(self: *CompileOutcome) void {
+        switch (self.*) {
+            .plan => |value| value.deinit(),
+            .diagnostic => {},
+        }
+        self.* = undefined;
+    }
+};
+
 pub const StringRange = struct { start: u32, length: u32 };
 
 pub const SourceRecord = struct {
@@ -223,9 +274,41 @@ pub fn compile(
     documents: []const seclang.parser.Document,
     limits: Limits,
 ) CompileError!*Plan {
+    return compileDetailed(allocator, registry, documents, limits, null);
+}
+
+pub fn compileOutcome(
+    allocator: std.mem.Allocator,
+    registry: *const seclang.source.Registry,
+    documents: []const seclang.parser.Document,
+    limits: Limits,
+) CompileError!CompileOutcome {
+    var failure: ?Failure = null;
+    const plan = compileDetailed(allocator, registry, documents, limits, &failure) catch |cause| {
+        if (failure) |detail| {
+            const code = diagnosticCode(cause) orelse return cause;
+            return .{ .diagnostic = .{
+                .code = code,
+                .primary = detail.primary,
+                .secondary = detail.secondary,
+                .message = code.message(),
+            } };
+        }
+        return cause;
+    };
+    return .{ .plan = plan };
+}
+
+fn compileDetailed(
+    allocator: std.mem.Allocator,
+    registry: *const seclang.source.Registry,
+    documents: []const seclang.parser.Document,
+    limits: Limits,
+    failure: ?*?Failure,
+) CompileError!*Plan {
     try limits.validate();
     if (documents.len > limits.max_documents) return error.TooManyDocuments;
-    var compiler = Compiler.init(allocator, limits);
+    var compiler = Compiler.init(allocator, limits, failure);
     defer compiler.deinit();
     for (documents) |*document| {
         try validateDocument(registry, document);
@@ -233,6 +316,11 @@ pub fn compile(
     }
     return compiler.finish(registry);
 }
+
+const Failure = struct {
+    primary: seclang.source.Span,
+    secondary: ?seclang.source.Span = null,
+};
 
 const Compiler = struct {
     allocator: std.mem.Allocator,
@@ -249,9 +337,10 @@ const Compiler = struct {
     rule_ids: std.AutoHashMapUnmanaged(u64, seclang.source.Span) = .empty,
     active_default: ?DefaultId = null,
     pending_chain: ?RuleId = null,
+    failure: ?*?Failure,
 
-    fn init(allocator: std.mem.Allocator, limits: Limits) Compiler {
-        return .{ .allocator = allocator, .limits = limits, .interner = Interner.init(allocator, limits) };
+    fn init(allocator: std.mem.Allocator, limits: Limits, failure: ?*?Failure) Compiler {
+        return .{ .allocator = allocator, .limits = limits, .interner = Interner.init(allocator, limits), .failure = failure };
     }
 
     fn deinit(self: *Compiler) void {
@@ -269,12 +358,15 @@ const Compiler = struct {
 
     fn addDocument(self: *Compiler, document: *const seclang.parser.Document) CompileError!void {
         for (document.directives.items) |directive| try self.addDirective(directive);
-        if (self.pending_chain != null) return error.DanglingChain;
+        if (self.pending_chain) |pending| return self.fail(error.DanglingChain, self.rules.items[@backingInt(pending)].source, null);
     }
 
     fn addDirective(self: *Compiler, directive: seclang.parser.Directive) CompileError!void {
         if (self.directives.items.len == self.limits.max_directives) return error.TooManyDirectives;
-        if (self.pending_chain != null and directive.kind != .sec_rule) return error.DanglingChain;
+        if (self.pending_chain) |pending| {
+            if (directive.kind != .sec_rule)
+                return self.fail(error.DanglingChain, directive.physical, self.rules.items[@backingInt(pending)].source);
+        }
         if (directive.arguments.len > self.limits.max_arguments -| self.arguments.items.len) return error.TooManyArguments;
         const argument_start = try typedIndex(self.arguments.items.len);
         for (directive.arguments) |argument| {
@@ -297,7 +389,9 @@ const Compiler = struct {
             .sec_default_action => {
                 action_range = try self.addActions(directive.parsed_actions);
                 if (self.defaults.items.len == self.limits.max_defaults) return error.TooManyDefaults;
-                const phase = try explicitPhase(directive.parsed_actions) orelse return error.InvalidPhase;
+                const phase = (explicitPhase(directive.parsed_actions) catch
+                    return self.fail(error.InvalidPhase, actionSpan(directive), null)) orelse
+                    return self.fail(error.InvalidPhase, actionSpan(directive), null);
                 const default_id: DefaultId = @fromBackingInt(try typedIndex(self.defaults.items.len));
                 try self.defaults.append(self.allocator, .{
                     .source = directive.physical,
@@ -337,7 +431,8 @@ const Compiler = struct {
         const parsed_operator = directive.parsed_operator.?;
         const id: RuleId = @fromBackingInt(try typedIndex(self.rules.items.len));
         const pending = self.pending_chain;
-        const parsed_phase = try explicitPhase(directive.parsed_actions);
+        const parsed_phase = explicitPhase(directive.parsed_actions) catch
+            return self.fail(error.InvalidPhase, actionSpan(directive), null);
         const phase = parsed_phase orelse if (pending) |head_member|
             self.rules.items[@backingInt(head_member)].phase
         else if (self.active_default) |default_id|
@@ -345,14 +440,18 @@ const Compiler = struct {
         else
             2;
         if (pending) |head_member| {
-            if (phase != self.rules.items[@backingInt(head_member)].phase) return error.ChainPhaseMismatch;
+            if (phase != self.rules.items[@backingInt(head_member)].phase)
+                return self.fail(error.ChainPhaseMismatch, actionSpan(directive), self.rules.items[@backingInt(head_member)].source);
         }
-        const external_id = try explicitRuleId(directive.parsed_actions);
+        const external_id = explicitRuleId(directive.parsed_actions) catch
+            return self.fail(error.InvalidRuleId, actionSpan(directive), null);
         if (external_id) |value| {
-            if (self.rule_ids.contains(value)) return error.DuplicateRuleId;
+            if (self.rule_ids.get(value)) |first|
+                return self.fail(error.DuplicateRuleId, actionSpan(directive), first);
             try self.rule_ids.put(self.allocator, value, directive.physical);
         }
-        const transformation_range = try self.addTransformations(self.active_default, action_range);
+        const transformation_range = self.addTransformations(self.active_default, action_range) catch |cause|
+            return self.fail(cause, actionSpan(directive), null);
         try self.rules.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
@@ -387,6 +486,11 @@ const Compiler = struct {
         }
         self.pending_chain = if (hasAction(directive.parsed_actions, "chain")) id else null;
         return id;
+    }
+
+    fn fail(self: *Compiler, cause: CompileError, primary: seclang.source.Span, secondary: ?seclang.source.Span) CompileError {
+        if (self.failure) |output| output.* = .{ .primary = primary, .secondary = secondary };
+        return cause;
     }
 
     const ActionRange = struct { start: u32, count: u32 };
@@ -505,6 +609,22 @@ fn explicitPhase(actions: []const seclang.syntax.Action) CompileError!?u8 {
 fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
     for (actions) |action| if (std.ascii.eqlIgnoreCase(action.name, name)) return true;
     return false;
+}
+
+fn actionSpan(directive: seclang.parser.Directive) seclang.source.Span {
+    return if (directive.actions()) |argument| argument.physical else directive.physical;
+}
+
+fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
+    return switch (cause) {
+        error.InvalidRuleId => .invalid_rule_id,
+        error.DuplicateRuleId => .duplicate_rule_id,
+        error.InvalidPhase => .invalid_phase,
+        error.DanglingChain => .dangling_chain,
+        error.ChainPhaseMismatch => .chain_phase_mismatch,
+        error.InvalidTransformation => .invalid_transformation,
+        else => null,
+    };
 }
 
 fn parseUnsigned(input: []const u8) error{InvalidUnsigned}!u64 {
@@ -734,5 +854,54 @@ test "structural compiler rejects duplicate ids invalid phases and malformed cha
         defer parsed.deinit();
         var documents = [_]seclang.parser.Document{parsed.document};
         try std.testing.expectError(case.failure, compile(std.testing.allocator, &parsed.registry, &documents, .{}));
+    }
+}
+
+test "compile outcome anchors semantic diagnostics and related definitions" {
+    const duplicate =
+        \\SecRule ARGS @rx id:700
+        \\SecRule TX @rx id:700
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "duplicate.conf", duplicate, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer outcome.deinit();
+    switch (outcome) {
+        .plan => return error.TestExpectedDiagnostic,
+        .diagnostic => |value| {
+            try std.testing.expectEqual(DiagnosticCode.duplicate_rule_id, value.code);
+            try std.testing.expectEqualStrings("WAF-PLAN-0102", value.code.id());
+            try std.testing.expectEqual(parsed.document.directives.items[1].actions().?.physical, value.primary);
+            try std.testing.expectEqual(parsed.document.directives.items[0].physical, value.secondary.?);
+            const location = try parsed.registry.location(value.primary.source, value.primary.start);
+            try std.testing.expectEqual(@as(u32, 2), location.line);
+        },
+    }
+}
+
+test "compile outcome identifies chain and transformation failures" {
+    const cases = [_]struct {
+        input: []const u8,
+        code: DiagnosticCode,
+        related: bool,
+    }{
+        .{ .input = "SecRule ARGS @rx chain\nSecAction pass", .code = .dangling_chain, .related = true },
+        .{ .input = "SecRule ARGS @rx \"phase:1,chain\"\nSecRule TX @rx phase:2", .code = .chain_phase_mismatch, .related = true },
+        .{ .input = "SecRule ARGS @rx t", .code = .invalid_transformation, .related = false },
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "semantic.conf", case.input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |value| {
+                try std.testing.expectEqual(case.code, value.code);
+                try std.testing.expectEqual(case.related, value.secondary != null);
+            },
+        }
     }
 }
