@@ -15,7 +15,7 @@ pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
 pub const MarkerId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 5;
+pub const compiler_abi_version: u32 = 6;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
@@ -169,6 +169,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidRuleActionUpdate,
     InvalidRuleMetadata,
     InvalidNondisruptiveAction,
+    InvalidDisruptiveAction,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -191,6 +192,7 @@ pub const DiagnosticCode = enum {
     invalid_rule_action_update,
     invalid_rule_metadata,
     invalid_nondisruptive_action,
+    invalid_disruptive_action,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -217,6 +219,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_action_update => "WAF-PLAN-0116",
             .invalid_rule_metadata => "WAF-PLAN-0117",
             .invalid_nondisruptive_action => "WAF-PLAN-0118",
+            .invalid_disruptive_action => "WAF-PLAN-0119",
         };
     }
 
@@ -235,6 +238,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_action_update => "rule action update contains a forbidden or invalid action",
             .invalid_rule_metadata => "rule metadata value is missing, malformed, or outside its supported range",
             .invalid_nondisruptive_action => "non-disruptive action value is missing or malformed",
+            .invalid_disruptive_action => "disruptive or flow action value is missing, malformed, or conflicting",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -431,6 +435,33 @@ pub const NondisruptiveEffect = struct {
     auxiliary: ?EffectText = null,
 };
 
+pub const DisruptiveKind = enum {
+    pass,
+    allow,
+    deny,
+    drop,
+    proxy,
+    redirect,
+};
+
+/// Effective decision for a matching rule after its phase default and explicit
+/// actions have been reconciled. `block` is compiled to the referenced phase
+/// default and never requires action-list scanning on the request path.
+pub const DisruptiveDecision = struct {
+    kind: DisruptiveKind = .pass,
+    status: u16 = 403,
+    status_explicit: bool = false,
+    allow_scope: action_config.AllowScope = .transaction,
+    destination: ?EffectText = null,
+    declared_block: bool = false,
+};
+
+pub const FlowDecision = struct {
+    skip: u32 = 0,
+    skip_after_action: ?u32 = null,
+    multi_match: bool = false,
+};
+
 pub const Rule = struct {
     directive: DirectiveId,
     source: seclang.source.Span,
@@ -450,6 +481,8 @@ pub const Rule = struct {
     metadata: RuleMetadata,
     effects_start: u32,
     effects_count: u32,
+    disruptive: DisruptiveDecision,
+    flow: FlowDecision,
     removed_by: ?DirectiveId,
 };
 
@@ -1241,6 +1274,8 @@ const Compiler = struct {
             .metadata = .{},
             .effects_start = 0,
             .effects_count = 0,
+            .disruptive = .{},
+            .flow = .{},
             .removed_by = null,
         });
         if (pending) |previous_id| {
@@ -1769,6 +1804,106 @@ const Compiler = struct {
         }
     }
 
+    fn compileDisruptiveAndFlow(self: *Compiler) CompileError!void {
+        for (0..self.rules.items.len) |rule_index| {
+            const rule = self.rules.items[rule_index];
+            var disruptive: DisruptiveDecision = .{};
+            if (rule.default) |default_id| {
+                const snapshot = self.defaults.items[@backingInt(default_id)];
+                try self.compileDecisionRange(rule, snapshot.actions_start, snapshot.actions_count, &disruptive, null);
+            }
+            const phase_default = disruptive;
+            var flow: FlowDecision = .{};
+            try self.compileDecisionRange(rule, rule.actions_start, rule.actions_count, &disruptive, &flow);
+            if (disruptive.declared_block) {
+                const explicit_status = disruptive.status;
+                const explicit_status_set = disruptive.status_explicit;
+                disruptive = phase_default;
+                disruptive.declared_block = true;
+                if (explicit_status_set) {
+                    disruptive.status = explicit_status;
+                    disruptive.status_explicit = true;
+                }
+            }
+            self.rules.items[rule_index].disruptive = disruptive;
+            self.rules.items[rule_index].flow = flow;
+        }
+    }
+
+    fn compileDecisionRange(
+        self: *Compiler,
+        rule: Rule,
+        start: u32,
+        count: u32,
+        disruptive: *DisruptiveDecision,
+        flow: ?*FlowDecision,
+    ) CompileError!void {
+        var disruptive_seen = false;
+        for (self.actions.items[start..][0..count], 0..) |action, offset| {
+            const name = self.interner.values.items[@backingInt(action.name)];
+            const action_index = std.math.add(u32, start, @as(u32, @intCast(offset))) catch return error.TypedIdOverflow;
+            if (std.ascii.eqlIgnoreCase(name, "status")) {
+                const value = self.actionValue(action) catch
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                disruptive.status = action_config.parseStatus(value) catch
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                disruptive.status_explicit = true;
+                continue;
+            }
+            if (equalsAny(name, &.{ "allow", "block", "deny", "drop", "pass", "proxy", "redirect" })) {
+                if (disruptive_seen) return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                disruptive_seen = true;
+                disruptive.destination = null;
+                disruptive.declared_block = false;
+                if (std.ascii.eqlIgnoreCase(name, "allow")) {
+                    const value = if (action.value) |id| unquote(self.interner.values.items[@backingInt(id)]) else null;
+                    disruptive.kind = .allow;
+                    disruptive.allow_scope = action_config.parseAllowScope(value) catch
+                        return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                } else if (std.ascii.eqlIgnoreCase(name, "block")) {
+                    if (action.value != null or flow == null)
+                        return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    disruptive.declared_block = true;
+                } else if (std.ascii.eqlIgnoreCase(name, "deny")) {
+                    if (action.value != null) return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    disruptive.kind = .deny;
+                } else if (std.ascii.eqlIgnoreCase(name, "drop")) {
+                    if (action.value != null) return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    disruptive.kind = .drop;
+                } else if (std.ascii.eqlIgnoreCase(name, "pass")) {
+                    if (action.value != null) return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    disruptive.kind = .pass;
+                } else {
+                    const destination = self.actionValue(action) catch
+                        return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                    disruptive.kind = if (std.ascii.eqlIgnoreCase(name, "proxy")) .proxy else .redirect;
+                    disruptive.destination = .{
+                        .value = try self.interner.intern(destination),
+                        .macro = action.macro,
+                    };
+                }
+                continue;
+            }
+            const mutable_flow = flow orelse continue;
+            if (std.ascii.eqlIgnoreCase(name, "skip")) {
+                const value = self.actionValue(action) catch
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                if (mutable_flow.skip != 0)
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                mutable_flow.skip = action_config.parseSkip(value) catch
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+            } else if (std.ascii.eqlIgnoreCase(name, "skipAfter")) {
+                if (mutable_flow.skip_after_action != null or action.value == null)
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                mutable_flow.skip_after_action = action_index;
+            } else if (std.ascii.eqlIgnoreCase(name, "multiMatch")) {
+                if (mutable_flow.multi_match or action.value != null)
+                    return self.fail(error.InvalidDisruptiveAction, rule.source, null);
+                mutable_flow.multi_match = true;
+            }
+        }
+    }
+
     fn compileEffectRange(self: *Compiler, rule: Rule, start: u32, count: u32) CompileError!void {
         for (self.actions.items[start..][0..count], 0..) |action, offset| {
             const name = self.interner.values.items[@backingInt(action.name)];
@@ -1896,6 +2031,7 @@ const Compiler = struct {
         try self.applyRuleActionUpdates();
         try self.compileRuleMetadata();
         try self.compileNondisruptiveEffects();
+        try self.compileDisruptiveAndFlow();
         try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
@@ -2135,6 +2271,18 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashU32(&hasher, rule.metadata.tags_count);
         hashU32(&hasher, rule.effects_start);
         hashU32(&hasher, rule.effects_count);
+        hashU8(&hasher, @intCast(@backingInt(rule.disruptive.kind)));
+        hashU32(&hasher, rule.disruptive.status);
+        hashBool(&hasher, rule.disruptive.status_explicit);
+        hashU8(&hasher, @intCast(@backingInt(rule.disruptive.allow_scope)));
+        hashEffectText(&hasher, plan, rule.disruptive.destination);
+        hashBool(&hasher, rule.disruptive.declared_block);
+        hashU32(&hasher, rule.flow.skip);
+        if (rule.flow.skip_after_action) |action_index| {
+            hashBool(&hasher, true);
+            hashU32(&hasher, action_index);
+        } else hashBool(&hasher, false);
+        hashBool(&hasher, rule.flow.multi_match);
         hashOptionalId(&hasher, rule.removed_by);
     }
 
@@ -2355,11 +2503,11 @@ fn classifyAction(name: []const u8) ActionClass {
     if (equalsAny(name, &.{ "id", "msg", "logdata", "tag", "severity", "ver", "version", "rev", "maturity", "accuracy" }))
         return .metadata;
     if (equalsAny(name, &.{
-        "capture",              "setvar",                "setenv",                 "initcol",     "expirevar",
-        "deprecatevar",         "multimatch",            "log",                    "nolog",       "auditlog",
-        "noauditlog",           "ctl",                   "exec",                   "pause",       "prepend",
-        "append",               "setuid",                "setsid",                 "sanitizeArg", "sanitizeMatched",
-        "sanitizeMatchedBytes", "sanitizeRequestHeader", "sanitizeResponseHeader",
+        "capture",         "setvar",               "setenv",                "initcol",                "expirevar",
+        "deprecatevar",    "multimatch",           "log",                   "nolog",                  "auditlog",
+        "noauditlog",      "ctl",                  "exec",                  "pause",                  "prepend",
+        "status",          "append",               "setuid",                "setsid",                 "sanitizeArg",
+        "sanitizeMatched", "sanitizeMatchedBytes", "sanitizeRequestHeader", "sanitizeResponseHeader",
     })) return .nondisruptive;
     if (equalsAny(name, &.{ "allow", "block", "deny", "drop", "pass", "proxy", "redirect" }))
         return .disruptive;
@@ -2416,6 +2564,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidRuleActionUpdate => .invalid_rule_action_update,
         error.InvalidRuleMetadata => .invalid_rule_metadata,
         error.InvalidNondisruptiveAction => .invalid_nondisruptive_action,
+        error.InvalidDisruptiveAction => .invalid_disruptive_action,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -3677,6 +3826,63 @@ test "non-disruptive effect storage has an independent resource limit" {
     defer parsed.deinit();
     var documents = [_]seclang.parser.Document{parsed.document};
     try std.testing.expectError(error.TooManyNondisruptiveEffects, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_nondisruptive_effects = 1 }));
+}
+
+test "disruptive and flow actions compile to effective typed decisions" {
+    const input =
+        \\SecDefaultAction "phase:2,deny,status:429"
+        \\SecRule ARGS @rx "id:1,allow:request,status:204"
+        \\SecRule ARGS @rx "id:2,redirect:'https://example.test/%{TX.path}',status:307,skip:2,skipAfter:END,multiMatch"
+        \\SecMarker END
+        \\SecRule ARGS @rx "id:3,block,status:451"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "decisions.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(DisruptiveKind.allow, compiled.rules[0].disruptive.kind);
+    try std.testing.expectEqual(action_config.AllowScope.request, compiled.rules[0].disruptive.allow_scope);
+    try std.testing.expectEqual(@as(u16, 204), compiled.rules[0].disruptive.status);
+
+    const redirect = compiled.rules[1];
+    try std.testing.expectEqual(DisruptiveKind.redirect, redirect.disruptive.kind);
+    try std.testing.expectEqual(@as(u16, 307), redirect.disruptive.status);
+    try std.testing.expectEqualStrings("https://example.test/%{TX.path}", compiled.string(redirect.disruptive.destination.?.value).?);
+    try std.testing.expect(redirect.disruptive.destination.?.macro != null);
+    try std.testing.expectEqual(@as(u32, 2), redirect.flow.skip);
+    try std.testing.expect(redirect.flow.skip_after_action != null);
+    try std.testing.expect(redirect.flow.multi_match);
+
+    const block = compiled.rules[2].disruptive;
+    try std.testing.expect(block.declared_block);
+    try std.testing.expectEqual(DisruptiveKind.deny, block.kind);
+    try std.testing.expectEqual(@as(u16, 451), block.status);
+    try std.testing.expect(block.status_explicit);
+}
+
+test "invalid disruptive and flow values have a stable diagnostic" {
+    const cases = [_][]const u8{
+        "SecRule ARGS @rx \"id:1,allow:response\"",
+        "SecRule ARGS @rx \"id:1,status:99\"",
+        "SecRule ARGS @rx \"id:1,skip:0\"",
+        "SecRule ARGS @rx \"id:1,redirect\"",
+        "SecRule ARGS @rx \"id:1,deny:value\"",
+        "SecRule ARGS @rx \"id:1,pass,deny\"",
+    };
+    for (cases) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-decision.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |diagnostic| try std.testing.expectEqual(DiagnosticCode.invalid_disruptive_action, diagnostic.code),
+        }
+    }
+    try std.testing.expectEqualStrings("WAF-PLAN-0119", DiagnosticCode.invalid_disruptive_action.id());
 }
 
 test "structural plan evidence is valid and pinned to compiler ABI" {
