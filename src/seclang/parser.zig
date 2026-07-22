@@ -3,14 +3,17 @@
 const std = @import("std");
 const lexer = @import("lexer.zig");
 const source = @import("source.zig");
+const syntax = @import("syntax.zig");
 
 pub const Limits = struct {
     lexer: lexer.Limits = .{},
+    syntax: syntax.Limits = .{},
     max_directives: usize = 100_000,
     max_arguments: usize = 500_000,
 
     pub fn validate(self: Limits) error{InvalidParserLimit}!void {
         self.lexer.validate() catch return error.InvalidParserLimit;
+        self.syntax.validate() catch return error.InvalidParserLimit;
         if (self.max_directives == 0 or self.max_arguments == 0) return error.InvalidParserLimit;
     }
 };
@@ -46,6 +49,9 @@ pub const Directive = struct {
     physical: source.Span,
     arguments: []const Argument,
     kind: Kind,
+    parsed_targets: []const syntax.Target = &.{},
+    parsed_operator: ?syntax.Operator = null,
+    parsed_actions: []const syntax.Action = &.{},
 
     pub fn targets(self: Directive) ?Argument {
         if (self.kind != .sec_rule) return null;
@@ -79,7 +85,7 @@ pub const Document = struct {
     }
 };
 
-pub const ParseError = lexer.LexerError || std.mem.Allocator.Error || error{
+pub const ParseError = lexer.LexerError || syntax.SyntaxError || std.mem.Allocator.Error || error{
     InvalidParserLimit,
     InvalidSourceId,
     TooManyDirectives,
@@ -130,12 +136,31 @@ pub fn parseSource(
                 .physical = token.physical,
             };
         }
+        var parsed_targets: []const syntax.Target = &.{};
+        var parsed_operator: ?syntax.Operator = null;
+        var parsed_actions: []const syntax.Action = &.{};
+        switch (kind) {
+            .sec_rule => {
+                parsed_targets = try syntax.parseTargets(arena, arguments[0].content(), limits.syntax);
+                parsed_operator = try syntax.parseOperator(arguments[1].content());
+                if (arguments.len == 3) {
+                    parsed_actions = try syntax.parseActions(arena, arguments[2].content(), limits.syntax);
+                }
+            },
+            .sec_action, .sec_default_action => {
+                parsed_actions = try syntax.parseActions(arena, arguments[0].content(), limits.syntax);
+            },
+            else => {},
+        }
         try document.directives.append(arena, .{
             .name = try arena.dupe(u8, name_token.raw),
             .name_span = name_token.physical,
             .physical = line.physical,
             .arguments = arguments,
             .kind = kind,
+            .parsed_targets = parsed_targets,
+            .parsed_operator = parsed_operator,
+            .parsed_actions = parsed_actions,
         });
         document.argument_count += argument_count;
     }
@@ -199,8 +224,37 @@ test "parser owns directive shapes across comments and continuations" {
     try std.testing.expectEqualStrings("ARGS", rule.targets().?.content());
     try std.testing.expectEqualStrings("@rx ^#attack", rule.operator().?.content());
     try std.testing.expectEqualStrings("id:1,deny", rule.actions().?.content());
+    try std.testing.expectEqual(@as(usize, 1), rule.parsed_targets.len);
+    try std.testing.expectEqualStrings("ARGS", rule.parsed_targets[0].collection);
+    try std.testing.expectEqualStrings("rx", rule.parsed_operator.?.name);
+    try std.testing.expectEqualStrings("^#attack", rule.parsed_operator.?.parameter);
+    try std.testing.expectEqual(@as(usize, 2), rule.parsed_actions.len);
+    try std.testing.expectEqualStrings("deny", rule.parsed_actions[1].name);
     try std.testing.expectEqual(Kind.sec_action, document.directives.items[1].kind);
+    try std.testing.expectEqual(@as(usize, 2), document.directives.items[1].parsed_actions.len);
     try std.testing.expectEqual(Kind.include_optional, document.directives.items[2].kind);
+}
+
+test "parser attaches structured targets operators and actions" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    const id = try registry.add(
+        "structured.conf",
+        "SecRule ARGS|!REQUEST_HEADERS:authorization \"!@contains secret\" \"id:42,msg:'private, token',deny\"\nSecDefaultAction \"phase:2,log,pass\"",
+        null,
+    );
+    var document = try parseSource(std.testing.allocator, &registry, id, .{});
+    defer document.deinit();
+    const rule = document.directives.items[0];
+    try std.testing.expectEqual(@as(usize, 2), rule.parsed_targets.len);
+    try std.testing.expectEqual(syntax.Modifier.negated, rule.parsed_targets[1].modifier);
+    try std.testing.expectEqualStrings("authorization", rule.parsed_targets[1].selector.?);
+    try std.testing.expect(rule.parsed_operator.?.negated);
+    try std.testing.expectEqualStrings("contains", rule.parsed_operator.?.name);
+    try std.testing.expectEqualStrings("secret", rule.parsed_operator.?.parameter);
+    try std.testing.expectEqual(@as(usize, 3), rule.parsed_actions.len);
+    try std.testing.expectEqualStrings("'private, token'", rule.parsed_actions[1].value.?);
+    try std.testing.expectEqual(@as(usize, 3), document.directives.items[1].parsed_actions.len);
 }
 
 test "parser strictly validates directive and rule shapes" {
@@ -222,4 +276,13 @@ test "parser enforces document aggregate limits" {
     const id = try registry.add("rules.conf", "SecAction pass\nSecAction deny", null);
     try std.testing.expectError(error.TooManyDirectives, parseSource(std.testing.allocator, &registry, id, .{ .max_directives = 1 }));
     try std.testing.expectError(error.TooManyArguments, parseSource(std.testing.allocator, &registry, id, .{ .max_arguments = 1 }));
+}
+
+test "parser propagates structured syntax failures and limits" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    const malformed = try registry.add("malformed.conf", "SecRule \"ARGS||TX\" @rx", null);
+    try std.testing.expectError(error.EmptyTarget, parseSource(std.testing.allocator, &registry, malformed, .{}));
+    const bounded = try registry.add("bounded.conf", "SecAction \"log,pass\"", null);
+    try std.testing.expectError(error.TooManyActions, parseSource(std.testing.allocator, &registry, bounded, .{ .syntax = .{ .max_actions = 1 } }));
 }
