@@ -89,6 +89,7 @@ Semantic failures use stable codes:
 | `WAF-PLAN-0111` | Default is missing a disruptive action |
 | `WAF-PLAN-0112` | Invalid rule-selection syntax after directive validation |
 | `WAF-PLAN-0113` | Update selected a non-head chain member; related span is that member |
+| `WAF-PLAN-0114` | Static `skipAfter` target has no following marker |
 
 Default actions require an explicit phase and a disruptive action. A phase may
 be defined once per compiled configuration context. Metadata and flow actions,
@@ -110,6 +111,14 @@ ModSecurity's regex selector capability; Coraza's narrower case-sensitive
 equality behavior remains a supported subset. Compiled removal matchers are
 released before publication because the effective plan and removal evidence
 contain all request-path state.
+
+Static `skipAfter` actions resolve during candidate compilation to the first
+same-name `SecMarker` after the rule and the first still-executable chain head
+after that marker in the rule's phase. Duplicate marker names therefore retain
+source-order behavior. Macro-bearing targets retain a compiled macro plus the
+allocation-free `resolveMarkerAfter` lookup for WAF-15. Marker resolution is
+bounded by `max_flow_targets`; neither static nor dynamic execution needs a
+filesystem, database, network call, or regex compilation.
 
 Allocation and configured capacity failures remain distinct typed errors.
 

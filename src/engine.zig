@@ -104,7 +104,7 @@ pub const ClockSource = struct {
     }
 };
 
-pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration };
+pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration, InvalidExecutionPlan };
 pub const DeinitError = error{TransactionsActive};
 
 pub const Intervention = struct {
@@ -197,6 +197,11 @@ pub const Builder = struct {
         return directives.validatePlan(value, self.directive_capabilities);
     }
 
+    pub fn validateExecutionPlan(self: *const Builder, value: *const compiled_plan.Plan) compiled_plan.ExecutionValidation {
+        _ = self;
+        return value.validateExecutionPlan();
+    }
+
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
         try self.validate(self.retained_plan);
         const retained = if (self.retained_plan) |value| try value.retain(self.allocator) else null;
@@ -220,6 +225,10 @@ pub const Builder = struct {
         if (candidate) |value| switch (self.validateCompiledPlan(value)) {
             .valid => {},
             .diagnostic => return error.InvalidDirectiveConfiguration,
+        };
+        if (candidate) |value| switch (self.validateExecutionPlan(value)) {
+            .valid => {},
+            .diagnostic => return error.InvalidExecutionPlan,
         };
     }
 
@@ -1931,6 +1940,33 @@ test "failed builds preserve caller plan ownership" {
     try std.testing.expectEqual(@as(usize, 1), value.sharedReferenceCount());
     try std.testing.expectError(error.InvalidLimit, builder.buildTransferringPlan(value));
     try std.testing.expectEqual(@as(usize, 1), value.sharedReferenceCount());
+}
+
+test "builder rejects unresolved static skipAfter after final source assembly" {
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "unresolved-marker.conf",
+        "SecRule ARGS @rx \"id:1,skipAfter:EXTERNAL_MARKER\"",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const candidate = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer candidate.deinit();
+
+    var builder = Builder.init(std.testing.allocator);
+    switch (builder.validateExecutionPlan(candidate)) {
+        .valid => return error.TestExpectedDiagnostic,
+        .diagnostic => |diagnostic| {
+            try std.testing.expectEqual(compiled_plan.DiagnosticCode.missing_static_marker, diagnostic.code);
+            try std.testing.expectEqualStrings("WAF-PLAN-0114", diagnostic.code.id());
+        },
+    }
+    try std.testing.expectError(error.InvalidExecutionPlan, builder.buildTransferringPlan(candidate));
+    try std.testing.expectEqual(@as(usize, 1), candidate.sharedReferenceCount());
+    const target = candidate.firstUnresolvedStaticMarker().?;
+    try std.testing.expectEqualStrings("skipAfter", candidate.string(candidate.actions[target.action_index].name).?);
 }
 
 test "transactions remain pinned to their compiled plan across reload" {

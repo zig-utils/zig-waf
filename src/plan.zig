@@ -10,6 +10,7 @@ pub const DirectiveId = enum(u32) { _ };
 pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
+pub const MarkerId = enum(u32) { _ };
 pub const compiler_abi_version: u32 = 3;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
@@ -35,6 +36,7 @@ pub const Limits = struct {
     max_defaults: usize = 100_000,
     max_rule_updates: usize = 500_000,
     max_id_intervals: usize = 1_000_000,
+    max_flow_targets: usize = 500_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
     max_string_bytes: usize = 1024 * 1024,
@@ -62,6 +64,7 @@ pub const Limits = struct {
             self.max_defaults == 0 or
             self.max_rule_updates == 0 or
             self.max_id_intervals == 0 or
+            self.max_flow_targets == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
             self.max_string_bytes == 0 or
@@ -89,6 +92,7 @@ pub const Limits = struct {
             self.max_defaults > std.math.maxInt(u32) or
             self.max_rule_updates > std.math.maxInt(u32) or
             self.max_id_intervals > std.math.maxInt(u32) or
+            self.max_flow_targets > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
         {
@@ -119,6 +123,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyDefaults,
     TooManyRuleUpdates,
     TooManyIdIntervals,
+    TooManyFlowTargets,
     TooManyArguments,
     TooManyStrings,
     StringTooLarge,
@@ -135,6 +140,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     MissingDefaultDisruptiveAction,
     InvalidRuleSelector,
     PartialChainSelection,
+    MissingStaticMarker,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -151,6 +157,7 @@ pub const DiagnosticCode = enum {
     missing_default_disruptive_action,
     invalid_rule_selector,
     partial_chain_selection,
+    missing_static_marker,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -172,6 +179,7 @@ pub const DiagnosticCode = enum {
             .missing_default_disruptive_action => "WAF-PLAN-0111",
             .invalid_rule_selector => "WAF-PLAN-0112",
             .partial_chain_selection => "WAF-PLAN-0113",
+            .missing_static_marker => "WAF-PLAN-0114",
         };
     }
 
@@ -185,6 +193,7 @@ pub const DiagnosticCode = enum {
             .missing_default_disruptive_action => "SecDefaultAction must specify a disruptive action",
             .invalid_rule_selector => "rule ID selector must contain valid unsigned IDs or inclusive ranges",
             .partial_chain_selection => "rule update cannot select a non-head chain member",
+            .missing_static_marker => "static skipAfter target has no following SecMarker",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -212,6 +221,11 @@ pub const CompileOutcome = union(enum) {
         }
         self.* = undefined;
     }
+};
+
+pub const ExecutionValidation = union(enum) {
+    valid,
+    diagnostic: Diagnostic,
 };
 
 pub const StringRange = struct { start: u32, length: u32 };
@@ -282,6 +296,19 @@ pub const Marker = struct {
     name: StringId,
 };
 
+pub const SkipAfterTarget = struct {
+    rule: RuleId,
+    action_index: u32,
+    marker: ?MarkerId,
+    resume_rule: ?RuleId,
+    dynamic: bool,
+};
+
+pub const MarkerResolution = struct {
+    marker: MarkerId,
+    resume_rule: ?RuleId,
+};
+
 pub const MacroTokenKind = enum { literal, scalar, collection };
 
 pub const MacroToken = struct {
@@ -350,6 +377,7 @@ const Component = struct {
     transformations: []const Transformation,
     prefilter_literals: []const StringId,
     markers: []const Marker,
+    skip_after_targets: []const SkipAfterTarget,
     generic_directives: []const DirectiveId,
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
@@ -391,6 +419,7 @@ pub const Plan = struct {
     transformations: []const Transformation,
     prefilter_literals: []const StringId,
     markers: []const Marker,
+    skip_after_targets: []const SkipAfterTarget,
     generic_directives: []const DirectiveId,
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
@@ -454,6 +483,46 @@ pub const Plan = struct {
     pub fn phaseRules(self: *const Plan, phase: u8) []const RuleId {
         if (phase < 1 or phase > 5) return &.{};
         return self.phase_rules[phase - 1];
+    }
+
+    /// Resolve a dynamic skipAfter value without allocation. Duplicate marker
+    /// names select the first matching marker after the executing rule.
+    pub fn resolveMarkerAfter(self: *const Plan, rule_id: RuleId, name: []const u8) ?MarkerResolution {
+        const rule_index: usize = @backingInt(rule_id);
+        if (rule_index >= self.rules.len) return null;
+        const rule = self.rules[rule_index];
+        for (self.markers, 0..) |marker, marker_index| {
+            if (@backingInt(marker.directive) <= @backingInt(rule.directive)) continue;
+            if (!std.mem.eql(u8, self.string(marker.name).?, name)) continue;
+            var resume_rule: ?RuleId = null;
+            for (self.phaseRules(rule.phase)) |candidate| {
+                if (@backingInt(self.rules[@backingInt(candidate)].directive) > @backingInt(marker.directive)) {
+                    resume_rule = candidate;
+                    break;
+                }
+            }
+            return .{ .marker = @fromBackingInt(@as(u32, @intCast(marker_index))), .resume_rule = resume_rule };
+        }
+        return null;
+    }
+
+    pub fn firstUnresolvedStaticMarker(self: *const Plan) ?SkipAfterTarget {
+        for (self.skip_after_targets) |target| {
+            if (!target.dynamic and target.marker == null) return target;
+        }
+        return null;
+    }
+
+    pub fn validateExecutionPlan(self: *const Plan) ExecutionValidation {
+        if (self.firstUnresolvedStaticMarker()) |target| {
+            const code: DiagnosticCode = .missing_static_marker;
+            return .{ .diagnostic = .{
+                .code = code,
+                .primary = self.rules[@backingInt(target.rule)].source,
+                .message = code.message(),
+            } };
+        }
+        return .valid;
     }
 
     /// Returns false only when the advisory prefilter proves the operator cannot
@@ -569,6 +638,7 @@ const Compiler = struct {
     transformations: std.ArrayList(Transformation) = .empty,
     prefilter_literals: std.ArrayList(StringId) = .empty,
     markers: std.ArrayList(Marker) = .empty,
+    skip_after_targets: std.ArrayList(SkipAfterTarget) = .empty,
     generic_directives: std.ArrayList(DirectiveId) = .empty,
     macro_programs: std.ArrayList(MacroProgram) = .empty,
     macro_tokens: std.ArrayList(MacroToken) = .empty,
@@ -601,6 +671,7 @@ const Compiler = struct {
         self.transformations.deinit(self.allocator);
         self.prefilter_literals.deinit(self.allocator);
         self.markers.deinit(self.allocator);
+        self.skip_after_targets.deinit(self.allocator);
         self.generic_directives.deinit(self.allocator);
         self.macro_programs.deinit(self.allocator);
         self.macro_tokens.deinit(self.allocator);
@@ -1089,8 +1160,45 @@ const Compiler = struct {
         return false;
     }
 
+    fn resolveSkipAfterTargets(self: *Compiler) CompileError!void {
+        for (self.rules.items, 0..) |rule, rule_index| {
+            const actions = self.actions.items[rule.actions_start..][0..rule.actions_count];
+            for (actions, 0..) |action, action_offset| {
+                if (!std.ascii.eqlIgnoreCase(self.interner.values.items[@backingInt(action.name)], "skipAfter")) continue;
+                if (self.skip_after_targets.items.len == self.limits.max_flow_targets) return error.TooManyFlowTargets;
+                const value_id = action.value orelse return self.fail(error.MissingStaticMarker, rule.source, null);
+                const value = unquote(self.interner.values.items[@backingInt(value_id)]);
+                const dynamic = std.mem.indexOf(u8, value, "%{") != null;
+                var marker_id: ?MarkerId = null;
+                var resume_rule: ?RuleId = null;
+                if (!dynamic) {
+                    for (self.markers.items, 0..) |marker, marker_index| {
+                        if (@backingInt(marker.directive) <= @backingInt(rule.directive)) continue;
+                        if (!std.mem.eql(u8, self.interner.values.items[@backingInt(marker.name)], value)) continue;
+                        marker_id = @fromBackingInt(@as(u32, @intCast(marker_index)));
+                        for (self.phase_rules[rule.phase - 1].items) |candidate| {
+                            if (@backingInt(self.rules.items[@backingInt(candidate)].directive) > @backingInt(marker.directive)) {
+                                resume_rule = candidate;
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                }
+                try self.skip_after_targets.append(self.allocator, .{
+                    .rule = @fromBackingInt(@as(u32, @intCast(rule_index))),
+                    .action_index = rule.actions_start + @as(u32, @intCast(action_offset)),
+                    .marker = marker_id,
+                    .resume_rule = resume_rule,
+                    .dynamic = dynamic,
+                });
+            }
+        }
+    }
+
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
         try self.applyRuleRemovals();
+        try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
         plan.* = undefined;
@@ -1112,6 +1220,7 @@ const Compiler = struct {
         const transformations = try duplicateCounted(Transformation, arena_allocator, self.transformations.items, &owned_bytes, self.limits);
         const prefilter_literals = try duplicateCounted(StringId, arena_allocator, self.prefilter_literals.items, &owned_bytes, self.limits);
         const markers = try duplicateCounted(Marker, arena_allocator, self.markers.items, &owned_bytes, self.limits);
+        const skip_after_targets = try duplicateCounted(SkipAfterTarget, arena_allocator, self.skip_after_targets.items, &owned_bytes, self.limits);
         const generic_directives = try duplicateCounted(DirectiveId, arena_allocator, self.generic_directives.items, &owned_bytes, self.limits);
         const macro_programs = try duplicateCounted(MacroProgram, arena_allocator, self.macro_programs.items, &owned_bytes, self.limits);
         const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
@@ -1138,6 +1247,7 @@ const Compiler = struct {
             .transformations = transformations,
             .prefilter_literals = prefilter_literals,
             .markers = markers,
+            .skip_after_targets = skip_after_targets,
             .generic_directives = generic_directives,
             .macro_programs = macro_programs,
             .macro_tokens = macro_tokens,
@@ -1169,6 +1279,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.transformations = component.transformations;
     plan.prefilter_literals = component.prefilter_literals;
     plan.markers = component.markers;
+    plan.skip_after_targets = component.skip_after_targets;
     plan.generic_directives = component.generic_directives;
     plan.macro_programs = component.macro_programs;
     plan.macro_tokens = component.macro_tokens;
@@ -1195,6 +1306,7 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(Transformation, first.transformations, second.transformations) or
         !std.mem.eql(StringId, first.prefilter_literals, second.prefilter_literals) or
         !slicesEqual(Marker, first.markers, second.markers) or
+        !slicesEqual(SkipAfterTarget, first.skip_after_targets, second.skip_after_targets) or
         !std.mem.eql(DirectiveId, first.generic_directives, second.generic_directives) or
         !slicesEqual(MacroProgram, first.macro_programs, second.macro_programs) or
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
@@ -1299,6 +1411,14 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
     for (plan.markers) |marker| {
         hashU32(&hasher, @backingInt(marker.directive));
         hashString(&hasher, plan.string(marker.name).?);
+    }
+    hashU32(&hasher, @intCast(plan.skip_after_targets.len));
+    for (plan.skip_after_targets) |target| {
+        hashU32(&hasher, @backingInt(target.rule));
+        hashU32(&hasher, target.action_index);
+        hashOptionalId(&hasher, target.marker);
+        hashOptionalId(&hasher, target.resume_rule);
+        hashBool(&hasher, target.dynamic);
     }
     hashU32(&hasher, @intCast(plan.generic_directives.len));
     for (plan.generic_directives) |directive| hashU32(&hasher, @backingInt(directive));
@@ -1450,6 +1570,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.MissingDefaultDisruptiveAction => .missing_default_disruptive_action,
         error.InvalidRuleSelector => .invalid_rule_selector,
         error.PartialChainSelection => .partial_chain_selection,
+        error.MissingStaticMarker => .missing_static_marker,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -1850,6 +1971,64 @@ test "remove by tag and message compile zig-regex selectors once per operation" 
     }, compiled.rule_removals);
 }
 
+test "static skipAfter targets resolve to the next marker and phase rule" {
+    const input =
+        \\SecMarker END
+        \\SecRule ARGS @rx "id:1,phase:1,skipAfter:END"
+        \\SecRule ARGS @rx "id:2,phase:1"
+        \\SecMarker END
+        \\SecRule ARGS @rx "id:3,phase:1"
+        \\SecMarker END
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "markers.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), compiled.markers.len);
+    try std.testing.expectEqual(@as(usize, 1), compiled.skip_after_targets.len);
+    const target = compiled.skip_after_targets[0];
+    try std.testing.expectEqual(@as(RuleId, @fromBackingInt(0)), target.rule);
+    try std.testing.expectEqual(@as(?MarkerId, @fromBackingInt(1)), target.marker);
+    try std.testing.expectEqual(@as(?RuleId, @fromBackingInt(2)), target.resume_rule);
+    try std.testing.expect(!target.dynamic);
+    const resolved = compiled.resolveMarkerAfter(@fromBackingInt(0), "END").?;
+    try std.testing.expectEqual(target.marker.?, resolved.marker);
+    try std.testing.expectEqual(target.resume_rule, resolved.resume_rule);
+}
+
+test "dynamic skipAfter retains bounded runtime marker resolution" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:2,skipAfter:%{TX.marker}"
+        \\SecMarker END
+        \\SecRule ARGS @rx "id:2,phase:2"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "dynamic-marker.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), compiled.skip_after_targets.len);
+    try std.testing.expect(compiled.skip_after_targets[0].dynamic);
+    try std.testing.expectEqual(@as(?MarkerId, null), compiled.skip_after_targets[0].marker);
+    const resolved = compiled.resolveMarkerAfter(@fromBackingInt(0), "END").?;
+    try std.testing.expectEqual(@as(MarkerId, @fromBackingInt(0)), resolved.marker);
+    try std.testing.expectEqual(@as(?RuleId, @fromBackingInt(1)), resolved.resume_rule);
+}
+
+test "unresolved static skipAfter marker is retained for final source linking" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "missing-marker.conf", "SecRule ARGS @rx \"id:1,skipAfter:ABSENT\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+    const unresolved = compiled.firstUnresolvedStaticMarker().?;
+    try std.testing.expect(!unresolved.dynamic);
+    try std.testing.expectEqual(@as(?MarkerId, null), unresolved.marker);
+}
+
 test "invalid tag and message regexes produce stable plan diagnostics" {
     const cases = [_][]const u8{
         "SecRuleRemoveByTag [",
@@ -2056,6 +2235,7 @@ test "phase chain marker and generic resource limits fail distinctly" {
         .{ .input = "SecOne value\nSecTwo value", .limits = .{ .max_generic_directives = 1 }, .failure = error.TooManyGenericDirectives },
         .{ .input = "SecRuleRemoveById 1\nSecRuleRemoveById 2", .limits = .{ .max_rule_updates = 1 }, .failure = error.TooManyRuleUpdates },
         .{ .input = "SecRuleRemoveById \"1 3\"", .limits = .{ .max_id_intervals = 1 }, .failure = error.TooManyIdIntervals },
+        .{ .input = "SecRule ARGS @rx skipAfter:END\nSecRule TX @rx skipAfter:END\nSecMarker END", .limits = .{ .max_flow_targets = 1 }, .failure = error.TooManyFlowTargets },
     };
     for (cases) |case| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bounded.conf", case.input, .{}, .{});
