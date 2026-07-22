@@ -192,6 +192,9 @@ pub const Executor = struct {
     pub fn apply(self: *Executor, kind: Kind, input: []const u8) ApplyError!Result {
         if (input.len > self.limits.max_input_bytes) return error.InputTooLarge;
         return switch (kind) {
+            .base64_decode => self.base64Decode(input, false),
+            .base64_decode_ext => self.base64Decode(input, true),
+            .base64_encode => self.base64Encode(input),
             .lowercase => self.mapAsciiCase(input, false),
             .uppercase => self.mapAsciiCase(input, true),
             .trim => trimResult(input, true, true),
@@ -310,6 +313,108 @@ pub const Executor = struct {
             const high = if (self.profile == .coraza) hexNibble(input[index]).? else modSecurityHexNibble(input[index]);
             const low = if (self.profile == .coraza) hexNibble(input[index + 1]).? else modSecurityHexNibble(input[index + 1]);
             generated.buffer.appendAssumeCapacity(high *% 16 +% low);
+        }
+        return finish(generated, input, true);
+    }
+
+    fn base64Encode(self: *Executor, input: []const u8) ApplyError!Result {
+        if (input.len == 0)
+            return .{ .bytes = input, .changed = self.profile == .coraza, .storage = .borrowed };
+        const groups = std.math.add(usize, input.len, 2) catch return error.OutputTooLarge;
+        const capacity = std.math.mul(usize, groups / 3, 4) catch return error.OutputTooLarge;
+        const generated = try self.writable(capacity);
+        const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        var index: usize = 0;
+        while (index + 3 <= input.len) : (index += 3) {
+            const bits = (@as(u24, input[index]) << 16) | (@as(u24, input[index + 1]) << 8) | input[index + 2];
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast((bits >> 18) & 0x3f)]);
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast((bits >> 12) & 0x3f)]);
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast((bits >> 6) & 0x3f)]);
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast(bits & 0x3f)]);
+        }
+        const remaining = input.len - index;
+        if (remaining != 0) {
+            const first: u24 = @as(u24, input[index]) << 16;
+            const second: u24 = if (remaining == 2) @as(u24, input[index + 1]) << 8 else 0;
+            const bits = first | second;
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast((bits >> 18) & 0x3f)]);
+            generated.buffer.appendAssumeCapacity(alphabet[@intCast((bits >> 12) & 0x3f)]);
+            generated.buffer.appendAssumeCapacity(if (remaining == 2) alphabet[@intCast((bits >> 6) & 0x3f)] else '=');
+            generated.buffer.appendAssumeCapacity('=');
+        }
+        return finish(generated, input, true);
+    }
+
+    fn base64Decode(self: *Executor, input: []const u8, extended: bool) ApplyError!Result {
+        if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
+        const base_capacity = std.math.mul(usize, input.len / 4, 3) catch return error.OutputTooLarge;
+        const capacity = std.math.add(usize, base_capacity, 2) catch return error.OutputTooLarge;
+        const generated = try self.writable(capacity);
+        var accumulator: u32 = 0;
+        var sextets: u3 = 0;
+        var padding: u3 = 0;
+        var saw_padding = false;
+        var invalid = false;
+
+        const strict_modsecurity = self.profile == .modsecurity and !extended;
+        for (input) |byte| {
+            if (strict_modsecurity and byte == 0) break;
+            if (byte == '=') {
+                if (self.profile == .modsecurity and extended) continue;
+                saw_padding = true;
+                padding +|= 1;
+                continue;
+            }
+            if (base64Value(byte)) |value| {
+                if (saw_padding) {
+                    invalid = true;
+                    break;
+                }
+                accumulator = (accumulator << 6) | value;
+                sextets += 1;
+                if (sextets == 4) {
+                    generated.buffer.appendAssumeCapacity(@intCast((accumulator >> 16) & 0xff));
+                    generated.buffer.appendAssumeCapacity(@intCast((accumulator >> 8) & 0xff));
+                    generated.buffer.appendAssumeCapacity(@intCast(accumulator & 0xff));
+                    accumulator = 0;
+                    sextets = 0;
+                }
+                continue;
+            }
+
+            const ignored = if (extended)
+                if (self.profile == .modsecurity) true else byte == '.' or isCorazaBase64Whitespace(byte)
+            else
+                byte == '\r' or byte == '\n';
+            if (ignored) continue;
+            if (self.profile == .coraza) break;
+            invalid = true;
+            break;
+        }
+
+        if (strict_modsecurity) {
+            const valid_padding = switch (sextets) {
+                0 => padding == 0,
+                2 => padding == 0 or padding == 2,
+                3 => padding == 0 or padding == 1,
+                else => false,
+            };
+            if (invalid or !valid_padding) {
+                generated.buffer.clearRetainingCapacity();
+                return .{ .bytes = input, .changed = false, .storage = .borrowed };
+            }
+        }
+        switch (sextets) {
+            2 => {
+                accumulator <<= 12;
+                generated.buffer.appendAssumeCapacity(@intCast((accumulator >> 16) & 0xff));
+            },
+            3 => {
+                accumulator <<= 6;
+                generated.buffer.appendAssumeCapacity(@intCast((accumulator >> 16) & 0xff));
+                generated.buffer.appendAssumeCapacity(@intCast((accumulator >> 8) & 0xff));
+            },
+            else => {},
         }
         return finish(generated, input, true);
     }
@@ -458,6 +563,21 @@ fn isUrlUnescaped(byte: u8) bool {
     return byte == '*' or std.ascii.isAlphanumeric(byte);
 }
 
+fn base64Value(byte: u8) ?u6 {
+    return switch (byte) {
+        'A'...'Z' => @intCast(byte - 'A'),
+        'a'...'z' => @intCast(byte - 'a' + 26),
+        '0'...'9' => @intCast(byte - '0' + 52),
+        '+' => 62,
+        '/' => 63,
+        else => null,
+    };
+}
+
+fn isCorazaBase64Whitespace(byte: u8) bool {
+    return isAsciiWhitespace(byte) or byte == 0x85 or byte == 0xa0;
+}
+
 test "stable transformation union and aliases resolve canonically" {
     try std.testing.expectEqual(@as(usize, 35), specs.len);
     for (specs) |spec| {
@@ -536,6 +656,30 @@ test "hex profiles preserve pinned malformed and empty-input behavior" {
     try std.testing.expectError(error.InvalidInput, coraza.apply(.hex_decode, "0z"));
 }
 
+test "Base64 profiles separate strict partial and forgiving decoding" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("VGVzdENhc2U=", (try modsecurity.apply(.base64_encode, "TestCase")).bytes);
+    try std.testing.expectEqualStrings("TestCase", (try modsecurity.apply(.base64_decode, "VGVzdENhc2U=")).bytes);
+    try std.testing.expectEqualStrings("TestCase1", (try modsecurity.apply(.base64_decode, "VGVzdENhc2Ux")).bytes);
+    try std.testing.expectEqualStrings("Test\x00Case", (try modsecurity.apply(.base64_decode, "VGVzdABDYXNl")).bytes);
+
+    const strict_invalid = try modsecurity.apply(.base64_decode, "VGVz!dA==");
+    try std.testing.expectEqual(Storage.borrowed, strict_invalid.storage);
+    try std.testing.expect(!strict_invalid.changed);
+    try std.testing.expectEqualStrings("VGVz!dA==", strict_invalid.bytes);
+    try std.testing.expectEqualStrings("Test", (try coraza.apply(.base64_decode, "VGVzdA!ignored")).bytes);
+    try std.testing.expectEqualStrings("Test", (try modsecurity.apply(.base64_decode_ext, "V.G V\n z-dA==")).bytes);
+    try std.testing.expectEqualStrings("Test", (try coraza.apply(.base64_decode_ext, "V.G V\n zdA==")).bytes);
+
+    try std.testing.expect(!(try modsecurity.apply(.base64_encode, "")).changed);
+    try std.testing.expect((try coraza.apply(.base64_encode, "")).changed);
+    try std.testing.expect(!(try coraza.apply(.base64_decode, "")).changed);
+}
+
 test "URL encoding is byte-oriented and malformed decoding is non-strict" {
     var executor = try Executor.init(std.testing.allocator, .{});
     defer executor.deinit();
@@ -563,7 +707,7 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
-    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.base64_decode, "eA"));
+    try std.testing.expectError(error.UnsupportedTransformation, executor.apply(.cmd_line, "x"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
