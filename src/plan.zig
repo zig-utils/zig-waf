@@ -459,6 +459,8 @@ pub const DisruptiveDecision = struct {
 pub const FlowDecision = struct {
     skip: u32 = 0,
     skip_after_action: ?u32 = null,
+    skip_after_target: ?u32 = null,
+    skip_after_value: ?EffectText = null,
     multi_match: bool = false,
 };
 
@@ -1712,6 +1714,8 @@ const Compiler = struct {
                     .resume_rule = resume_rule,
                     .dynamic = dynamic,
                 });
+                self.rules.items[rule_index].flow.skip_after_target =
+                    @intCast(self.skip_after_targets.items.len - 1);
             }
         }
     }
@@ -1896,6 +1900,11 @@ const Compiler = struct {
                 if (mutable_flow.skip_after_action != null or action.value == null)
                     return self.fail(error.InvalidDisruptiveAction, rule.source, null);
                 mutable_flow.skip_after_action = action_index;
+                mutable_flow.skip_after_value = .{
+                    .value = try self.interner.intern(self.actionValue(action) catch
+                        return self.fail(error.InvalidDisruptiveAction, rule.source, null)),
+                    .macro = action.macro,
+                };
             } else if (std.ascii.eqlIgnoreCase(name, "multiMatch")) {
                 if (mutable_flow.multi_match or action.value != null)
                     return self.fail(error.InvalidDisruptiveAction, rule.source, null);
@@ -2282,6 +2291,11 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
             hashBool(&hasher, true);
             hashU32(&hasher, action_index);
         } else hashBool(&hasher, false);
+        if (rule.flow.skip_after_target) |target_index| {
+            hashBool(&hasher, true);
+            hashU32(&hasher, target_index);
+        } else hashBool(&hasher, false);
+        hashEffectText(&hasher, plan, rule.flow.skip_after_value);
         hashBool(&hasher, rule.flow.multi_match);
         hashOptionalId(&hasher, rule.removed_by);
     }
@@ -3853,6 +3867,8 @@ test "disruptive and flow actions compile to effective typed decisions" {
     try std.testing.expect(redirect.disruptive.destination.?.macro != null);
     try std.testing.expectEqual(@as(u32, 2), redirect.flow.skip);
     try std.testing.expect(redirect.flow.skip_after_action != null);
+    try std.testing.expect(redirect.flow.skip_after_target != null);
+    try std.testing.expectEqualStrings("END", compiled.string(redirect.flow.skip_after_value.?.value).?);
     try std.testing.expect(redirect.flow.multi_match);
 
     const block = compiled.rules[2].disruptive;

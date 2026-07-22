@@ -534,6 +534,8 @@ pub const MatchIntent = struct {
     decision_enforced: bool,
     skip: u32,
     skip_after_action: ?u32,
+    skip_after_active: bool,
+    skip_after_resume: ?compiled_plan.RuleId,
     multi_match: bool,
 };
 
@@ -551,12 +553,16 @@ pub const LocalEffectOutcome = struct {
     decision_enforced: bool,
     skip: u32,
     skip_after_action: ?u32,
+    skip_after_active: bool,
+    skip_after_resume: ?compiled_plan.RuleId,
     multi_match: bool,
 };
 
 pub const FlowState = struct {
     skip: u32 = 0,
     skip_after_action: ?u32 = null,
+    skip_after_active: bool = false,
+    skip_after_resume: ?compiled_plan.RuleId = null,
     allow_scope: ?action_config.AllowScope = null,
     phase: ?Phase = null,
 };
@@ -943,6 +949,8 @@ pub const Transaction = struct {
             .decision_enforced = self.waf.config.mode == .enabled,
             .skip = head.flow.skip,
             .skip_after_action = head.flow.skip_after_action,
+            .skip_after_active = false,
+            .skip_after_resume = null,
             .multi_match = head.flow.multi_match,
         };
         const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
@@ -1109,6 +1117,9 @@ pub const Transaction = struct {
             }
         }
 
+        const skip_after = try self.resolveSkipAfter(selected.chain_head, head, &batch, &scalar_batch, plan);
+        result.skip_after_active = skip_after.active;
+        result.skip_after_resume = skip_after.resume_rule;
         var prepared_intent = try self.prepareMatchIntent(rule_id, selected, head, context, result, &batch, &scalar_batch, plan);
         var intent_committed = false;
         defer if (!intent_committed) prepared_intent.deinit();
@@ -1154,10 +1165,38 @@ pub const Transaction = struct {
         return result;
     }
 
+    const SkipAfterResolution = struct {
+        active: bool = false,
+        resume_rule: ?compiled_plan.RuleId = null,
+    };
+
+    fn resolveSkipAfter(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        head: compiled_plan.Rule,
+        batch: *const ShadowBatch,
+        scalar_batch: *const ScalarShadowBatch,
+        plan: *const compiled_plan.Plan,
+    ) TransactionError!SkipAfterResolution {
+        const target_index = head.flow.skip_after_target orelse return .{};
+        if (target_index >= plan.skip_after_targets.len) return error.InvalidRuleReference;
+        const target = plan.skip_after_targets[target_index];
+        if (target.rule != rule_id or target.action_index != head.flow.skip_after_action)
+            return error.InvalidRuleReference;
+        if (!target.dynamic) return .{ .active = true, .resume_rule = target.resume_rule };
+        const value = head.flow.skip_after_value orelse return error.InvalidRuleReference;
+        const expanded = try self.expandEffectTextStaged(value, batch, scalar_batch, plan);
+        defer self.waf.allocator.free(expanded);
+        const resolved = plan.resolveMarkerAfter(rule_id, expanded) orelse return .{};
+        return .{ .active = true, .resume_rule = resolved.resume_rule };
+    }
+
     fn commitDecision(self: *Transaction, head: compiled_plan.Rule, intent: *const MatchIntent) void {
         self.flow_state.phase = self.currentPhase();
-        self.flow_state.skip = if (head.flow.skip_after_action == null) head.flow.skip else 0;
+        self.flow_state.skip = if (!intent.skip_after_active) head.flow.skip else 0;
         self.flow_state.skip_after_action = head.flow.skip_after_action;
+        self.flow_state.skip_after_active = intent.skip_after_active;
+        self.flow_state.skip_after_resume = intent.skip_after_resume;
         if (head.disruptive.kind == .allow) {
             if (self.waf.config.mode == .enabled) {
                 self.flow_state.allow_scope = head.disruptive.allow_scope;
@@ -2033,6 +2072,8 @@ pub const Transaction = struct {
                 .decision_enforced = outcome.decision_enforced,
                 .skip = outcome.skip,
                 .skip_after_action = outcome.skip_after_action,
+                .skip_after_active = outcome.skip_after_active,
+                .skip_after_resume = outcome.skip_after_resume,
                 .multi_match = outcome.multi_match,
             },
         };
@@ -2384,6 +2425,22 @@ pub const PhaseCursor = struct {
         }
         const plan = self.transaction.compiledPlan() orelse return error.MissingCompiledPlan;
         const rules = plan.phaseRules(@backingInt(self.phase));
+        if (self.transaction.flow_state.phase == self.phase and self.transaction.flow_state.skip_after_active) {
+            const resume_rule = self.transaction.flow_state.skip_after_resume;
+            self.transaction.flow_state.skip_after_active = false;
+            self.transaction.flow_state.skip_after_resume = null;
+            if (resume_rule) |rule_id| {
+                var found = false;
+                while (self.index < rules.len) : (self.index += 1) {
+                    if (rules[self.index] != rule_id) continue;
+                    found = true;
+                    break;
+                }
+                if (!found) return error.InvalidRuleReference;
+            } else {
+                self.index = rules.len;
+            }
+        }
         if (self.transaction.flow_state.phase == self.phase and self.transaction.flow_state.skip != 0) {
             var remaining = self.transaction.flow_state.skip;
             self.transaction.flow_state.skip = 0;
@@ -3492,6 +3549,41 @@ test "phase cursor applies skip and phase-scoped allow without allocation" {
     try tx.processLogging();
     var logging_cursor = try PhaseCursor.init(&tx, .logging);
     try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(7)), (try logging_cursor.next()).?);
+}
+
+test "dynamic skipAfter resolves staged macros and resumes after marker" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:2,setvar:'tx.marker=DYNAMIC',skipAfter:'%{TX.marker}'"
+        \\SecRule ARGS @rx "id:2,phase:2"
+        \\SecMarker DYNAMIC
+        \\SecRule ARGS @rx "id:3,phase:2"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "dynamic-skip-after.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.processRequestBody();
+    var cursor = try PhaseCursor.init(&tx, .request_body);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
+    const outcome = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    });
+    try std.testing.expect(outcome.skip_after_active);
+    try std.testing.expectEqual(@as(?compiled_plan.RuleId, @fromBackingInt(2)), outcome.skip_after_resume);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(2)), (try cursor.next()).?);
+    try std.testing.expect((try cursor.next()) == null);
 }
 
 test "failed combined effect preflight rolls back persistent session state" {
