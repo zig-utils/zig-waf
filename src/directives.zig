@@ -12,6 +12,8 @@ pub const Id = enum(u8) {
     sec_component_signature,
     sec_rule_engine,
     sec_conn_engine,
+    sec_conn_read_state_limit,
+    sec_conn_write_state_limit,
     sec_web_app_id,
     sec_server_signature,
     sec_sensor_id,
@@ -366,6 +368,8 @@ pub const registry = [_]Entry{
     row(.sec_component_signature, "SecComponentSignature", .text, .append, .core, MC, 13),
     row(.sec_rule_engine, "SecRuleEngine", .rule_engine, .singular_replace, .core, MCR, 13),
     row(.sec_conn_engine, "SecConnEngine", .connection_engine, .singular_replace, .connection_limits, MC, 13),
+    row(.sec_conn_read_state_limit, "SecConnReadStateLimit", .unsigned, .singular_replace, .connection_limits, MC, 13),
+    row(.sec_conn_write_state_limit, "SecConnWriteStateLimit", .unsigned, .singular_replace, .connection_limits, MC, 13),
     row(.sec_web_app_id, "SecWebAppId", .text, .singular_replace, .core, MC, 13),
     row(.sec_server_signature, "SecServerSignature", .text, .singular_replace, .core, MC, 13),
     row(.sec_sensor_id, "SecSensorId", .text, .singular_replace, .core, MC, 13),
@@ -801,7 +805,7 @@ fn hashU64(hasher: *std.crypto.hash.Blake3, value: u64) void {
 
 test "stable union has one canonical case insensitive entry per id" {
     try std.testing.expectEqual(std.meta.fieldNames(Id).len, registry.len);
-    try std.testing.expectEqual(@as(usize, 85), registry.len);
+    try std.testing.expectEqual(@as(usize, 87), registry.len);
     for (registry, 0..) |entry, index| {
         try std.testing.expectEqual(index, @backingInt(entry.id));
         try std.testing.expectEqual(entry.id, lookup(entry.name).?.id);
