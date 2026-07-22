@@ -121,12 +121,17 @@ pub const Limits = struct {
     max_output_bytes: usize = 4 * 1024 * 1024,
     max_pipeline_steps: usize = 64,
     max_cumulative_output_bytes: usize = 16 * 1024 * 1024,
+    max_cache_entries: usize = 256,
+    max_cache_bytes: usize = 4 * 1024 * 1024,
 
     pub fn validate(self: Limits) error{InvalidLimits}!void {
         if (self.max_input_bytes == 0 or
             self.max_output_bytes == 0 or
             self.max_pipeline_steps == 0 or
-            self.max_cumulative_output_bytes < self.max_output_bytes)
+            self.max_cumulative_output_bytes < self.max_output_bytes or
+            self.max_cache_entries == 0 or
+            self.max_cache_entries > std.math.maxInt(u32) or
+            self.max_cache_bytes == 0)
         {
             return error.InvalidLimits;
         }
@@ -137,6 +142,7 @@ pub const Storage = enum {
     borrowed,
     executor_a,
     executor_b,
+    cache,
 };
 
 pub const Profile = enum {
@@ -161,6 +167,23 @@ pub const UnicodeMap = struct {
 pub const Options = struct {
     profile: Profile = .modsecurity,
     unicode_map: ?UnicodeMap = null,
+    cache_enabled: bool = false,
+};
+
+pub const CacheStatus = enum {
+    disabled,
+    enabled,
+    limit_exhausted,
+    allocation_failed,
+};
+
+pub const CacheStats = struct {
+    status: CacheStatus,
+    entries: usize,
+    bytes: usize,
+    hits: u64,
+    misses: u64,
+    evictions: u64,
 };
 
 pub const Result = struct {
@@ -194,6 +217,30 @@ const CheckpointRecord = struct {
     after_step: ?u32,
 };
 
+const CacheEntry = struct {
+    hash: u64,
+    pipeline: []Kind,
+    input: []u8,
+    multi_match: bool,
+    output: []u8,
+    changed: bool,
+    checkpoints: []Checkpoint,
+    checkpoint_bytes: []u8,
+    steps_executed: u32,
+    cumulative_bytes: usize,
+    owned_bytes: usize,
+    last_used: u64,
+
+    fn deinit(self: *CacheEntry, allocator: std.mem.Allocator) void {
+        allocator.free(self.pipeline);
+        allocator.free(self.input);
+        allocator.free(self.output);
+        allocator.free(self.checkpoints);
+        allocator.free(self.checkpoint_bytes);
+        self.* = undefined;
+    }
+};
+
 pub const ApplyError = std.mem.Allocator.Error || error{
     InvalidLimits,
     InputTooLarge,
@@ -219,6 +266,13 @@ pub const Executor = struct {
     buffers: [2]std.ArrayList(u8) = .{ .empty, .empty },
     checkpoint_bytes: std.ArrayList(u8) = .empty,
     checkpoints: std.ArrayList(Checkpoint) = .empty,
+    cache_entries: std.ArrayList(CacheEntry) = .empty,
+    cache_status: CacheStatus,
+    cache_bytes: usize = 0,
+    cache_clock: u64 = 0,
+    cache_hits: u64 = 0,
+    cache_misses: u64 = 0,
+    cache_evictions: u64 = 0,
     next_buffer: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!Executor {
@@ -236,6 +290,7 @@ pub const Executor = struct {
             .limits = limits,
             .profile = options.profile,
             .unicode_map = options.unicode_map,
+            .cache_status = if (options.cache_enabled) .enabled else .disabled,
         };
     }
 
@@ -243,7 +298,20 @@ pub const Executor = struct {
         for (&self.buffers) |*buffer| buffer.deinit(self.allocator);
         self.checkpoint_bytes.deinit(self.allocator);
         self.checkpoints.deinit(self.allocator);
+        self.clearCacheEntries();
+        self.cache_entries.deinit(self.allocator);
         self.* = undefined;
+    }
+
+    pub fn cacheStats(self: *const Executor) CacheStats {
+        return .{
+            .status = self.cache_status,
+            .entries = self.cache_entries.items.len,
+            .bytes = self.cache_bytes,
+            .hits = self.cache_hits,
+            .misses = self.cache_misses,
+            .evictions = self.cache_evictions,
+        };
     }
 
     pub fn apply(self: *Executor, kind: Kind, input: []const u8) ApplyError!Result {
@@ -294,6 +362,24 @@ pub const Executor = struct {
     pub fn applyPipeline(self: *Executor, pipeline: anytype, input: []const u8, multi_match: bool) ApplyError!PipelineResult {
         if (input.len > self.limits.max_input_bytes) return error.InputTooLarge;
         if (pipeline.len > self.limits.max_pipeline_steps) return error.TooManyPipelineSteps;
+        var cache_hash: u64 = 0;
+        if (self.cache_status == .enabled) {
+            cache_hash = pipelineHash(pipeline, input, multi_match);
+            if (self.findCacheEntry(pipeline, input, multi_match, cache_hash)) |entry| {
+                self.cache_hits +|= 1;
+                self.cache_clock +|= 1;
+                entry.last_used = self.cache_clock;
+                return .{
+                    .bytes = entry.output,
+                    .changed = entry.changed,
+                    .storage = .cache,
+                    .checkpoints = entry.checkpoints,
+                    .steps_executed = entry.steps_executed,
+                    .cumulative_bytes = entry.cumulative_bytes,
+                };
+            }
+            self.cache_misses +|= 1;
+        }
         self.checkpoint_bytes.clearRetainingCapacity();
         self.checkpoints.clearRetainingCapacity();
         errdefer {
@@ -332,7 +418,7 @@ pub const Executor = struct {
                 .after_step = record.after_step,
             });
         }
-        return .{
+        const result = PipelineResult{
             .bytes = current.bytes,
             .changed = pipeline_changed,
             .storage = current.storage,
@@ -340,6 +426,8 @@ pub const Executor = struct {
             .steps_executed = @intCast(pipeline.len),
             .cumulative_bytes = cumulative_bytes,
         };
+        if (self.cache_status == .enabled) self.storeCacheEntry(pipeline, input, multi_match, cache_hash, result);
+        return result;
     }
 
     fn stageCheckpoint(
@@ -353,6 +441,129 @@ pub const Executor = struct {
         const offset = self.checkpoint_bytes.items.len;
         try self.checkpoint_bytes.appendSlice(self.allocator, bytes);
         try records.append(self.allocator, .{ .offset = offset, .length = bytes.len, .after_step = after_step });
+    }
+
+    fn findCacheEntry(self: *Executor, pipeline: anytype, input: []const u8, multi_match: bool, hash: u64) ?*CacheEntry {
+        for (self.cache_entries.items) |*entry| {
+            if (entry.hash != hash or entry.multi_match != multi_match or
+                !std.mem.eql(u8, entry.input, input) or entry.pipeline.len != pipeline.len)
+            {
+                continue;
+            }
+            var equal = true;
+            for (pipeline, entry.pipeline) |configured, kind| {
+                if (kind != pipelineKind(configured)) {
+                    equal = false;
+                    break;
+                }
+            }
+            if (equal) return entry;
+        }
+        return null;
+    }
+
+    fn storeCacheEntry(
+        self: *Executor,
+        pipeline: anytype,
+        input: []const u8,
+        multi_match: bool,
+        hash: u64,
+        result: PipelineResult,
+    ) void {
+        var entry = self.createCacheEntry(pipeline, input, multi_match, hash, result) catch {
+            self.disableCache(.allocation_failed);
+            return;
+        };
+        if (entry.owned_bytes > self.limits.max_cache_bytes) {
+            entry.deinit(self.allocator);
+            self.disableCache(.limit_exhausted);
+            return;
+        }
+        while (self.cache_entries.items.len >= self.limits.max_cache_entries or
+            entry.owned_bytes > self.limits.max_cache_bytes - self.cache_bytes)
+        {
+            if (self.cache_entries.items.len == 0) {
+                entry.deinit(self.allocator);
+                self.disableCache(.limit_exhausted);
+                return;
+            }
+            var oldest: usize = 0;
+            for (self.cache_entries.items[1..], 1..) |candidate, index| {
+                if (candidate.last_used < self.cache_entries.items[oldest].last_used) oldest = index;
+            }
+            var evicted = self.cache_entries.orderedRemove(oldest);
+            self.cache_bytes -= evicted.owned_bytes;
+            evicted.deinit(self.allocator);
+            self.cache_evictions +|= 1;
+        }
+        self.cache_clock +|= 1;
+        entry.last_used = self.cache_clock;
+        self.cache_entries.append(self.allocator, entry) catch {
+            entry.deinit(self.allocator);
+            self.disableCache(.allocation_failed);
+            return;
+        };
+        self.cache_bytes += entry.owned_bytes;
+    }
+
+    fn createCacheEntry(
+        self: *Executor,
+        pipeline: anytype,
+        input: []const u8,
+        multi_match: bool,
+        hash: u64,
+        result: PipelineResult,
+    ) std.mem.Allocator.Error!CacheEntry {
+        const owned_pipeline = try self.allocator.alloc(Kind, pipeline.len);
+        errdefer self.allocator.free(owned_pipeline);
+        for (pipeline, owned_pipeline) |configured, *destination| destination.* = pipelineKind(configured);
+        const owned_input = try self.allocator.dupe(u8, input);
+        errdefer self.allocator.free(owned_input);
+        const owned_output = try self.allocator.dupe(u8, result.bytes);
+        errdefer self.allocator.free(owned_output);
+        const owned_checkpoint_bytes = try self.allocator.dupe(u8, self.checkpoint_bytes.items);
+        errdefer self.allocator.free(owned_checkpoint_bytes);
+        const owned_checkpoints = try self.allocator.alloc(Checkpoint, result.checkpoints.len);
+        errdefer self.allocator.free(owned_checkpoints);
+        var offset: usize = 0;
+        for (result.checkpoints, owned_checkpoints) |source, *destination| {
+            destination.* = .{
+                .bytes = owned_checkpoint_bytes[offset..][0..source.bytes.len],
+                .after_step = source.after_step,
+            };
+            offset += source.bytes.len;
+        }
+        const pipeline_bytes = std.math.mul(usize, owned_pipeline.len, @sizeOf(Kind)) catch return error.OutOfMemory;
+        const checkpoint_table_bytes = std.math.mul(usize, owned_checkpoints.len, @sizeOf(Checkpoint)) catch return error.OutOfMemory;
+        var owned_bytes: usize = @sizeOf(CacheEntry);
+        inline for (.{ pipeline_bytes, owned_input.len, owned_output.len, owned_checkpoint_bytes.len, checkpoint_table_bytes }) |amount| {
+            owned_bytes = std.math.add(usize, owned_bytes, amount) catch return error.OutOfMemory;
+        }
+        return .{
+            .hash = hash,
+            .pipeline = owned_pipeline,
+            .input = owned_input,
+            .multi_match = multi_match,
+            .output = owned_output,
+            .changed = result.changed,
+            .checkpoints = owned_checkpoints,
+            .checkpoint_bytes = owned_checkpoint_bytes,
+            .steps_executed = result.steps_executed,
+            .cumulative_bytes = result.cumulative_bytes,
+            .owned_bytes = owned_bytes,
+            .last_used = 0,
+        };
+    }
+
+    fn disableCache(self: *Executor, status: CacheStatus) void {
+        self.clearCacheEntries();
+        self.cache_status = status;
+    }
+
+    fn clearCacheEntries(self: *Executor) void {
+        for (self.cache_entries.items) |*entry| entry.deinit(self.allocator);
+        self.cache_entries.clearRetainingCapacity();
+        self.cache_bytes = 0;
     }
 
     fn writable(self: *Executor, capacity: usize) ApplyError!Scratch {
@@ -1196,6 +1407,14 @@ fn pipelineKind(configured: anytype) Kind {
     @compileError("pipeline entries must be transformation Kind values or structs with a Kind field");
 }
 
+fn pipelineHash(pipeline: anytype, input: []const u8, multi_match: bool) u64 {
+    var hasher = std.hash.Wyhash.init(0x7a69672d776166);
+    hasher.update(&.{@intFromBool(multi_match)});
+    for (pipeline) |configured| hasher.update(&.{@backingInt(pipelineKind(configured))});
+    hasher.update(input);
+    return hasher.final();
+}
+
 fn trimResult(input: []const u8, left: bool, right: bool) Result {
     var start: usize = 0;
     var end = input.len;
@@ -1989,6 +2208,62 @@ test "pipeline failures publish no partial checkpoint storage" {
     const recovered = try cumulative.applyPipeline(&[_]Kind{}, "x", true);
     try std.testing.expectEqual(@as(usize, 1), recovered.checkpoints.len);
     try std.testing.expectEqualStrings("x", recovered.checkpoints[0].bytes);
+}
+
+test "transaction-local pipeline cache uses exact keys and preserves checkpoints" {
+    var executor = try Executor.initWithOptions(std.testing.allocator, .{}, .{ .cache_enabled = true });
+    defer executor.deinit();
+    const pipeline = [_]Kind{ .url_decode, .lowercase };
+
+    const miss = try executor.applyPipeline(&pipeline, "%41", true);
+    try std.testing.expectEqualStrings("a", miss.bytes);
+    try std.testing.expect(miss.storage != .cache);
+    var stats = executor.cacheStats();
+    try std.testing.expectEqual(CacheStatus.enabled, stats.status);
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+    try std.testing.expectEqual(@as(usize, 1), stats.entries);
+
+    const hit = try executor.applyPipeline(&pipeline, "%41", true);
+    try std.testing.expectEqual(Storage.cache, hit.storage);
+    try std.testing.expectEqualStrings("a", hit.bytes);
+    try std.testing.expectEqual(@as(usize, 3), hit.checkpoints.len);
+    try std.testing.expectEqualStrings("%41", hit.checkpoints[0].bytes);
+    try std.testing.expectEqualStrings("A", hit.checkpoints[1].bytes);
+    try std.testing.expectEqualStrings("a", hit.checkpoints[2].bytes);
+    stats = executor.cacheStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
+
+    _ = try executor.applyPipeline(&pipeline, "%41", false);
+    _ = try executor.applyPipeline(&[_]Kind{.url_decode}, "%41", true);
+    _ = try executor.applyPipeline(&pipeline, "%42", true);
+    stats = executor.cacheStats();
+    try std.testing.expectEqual(@as(u64, 4), stats.misses);
+    try std.testing.expectEqual(@as(usize, 4), stats.entries);
+}
+
+test "cache evicts least-recent entries and disables on an oversized entry" {
+    var lru = try Executor.initWithOptions(std.testing.allocator, .{
+        .max_cache_entries = 1,
+    }, .{ .cache_enabled = true });
+    defer lru.deinit();
+    _ = try lru.applyPipeline(&[_]Kind{.lowercase}, "A", false);
+    _ = try lru.applyPipeline(&[_]Kind{.lowercase}, "B", false);
+    const lru_stats = lru.cacheStats();
+    try std.testing.expectEqual(@as(usize, 1), lru_stats.entries);
+    try std.testing.expectEqual(@as(u64, 1), lru_stats.evictions);
+
+    var bounded = try Executor.initWithOptions(std.testing.allocator, .{
+        .max_cache_bytes = 1,
+    }, .{ .cache_enabled = true });
+    defer bounded.deinit();
+    const result = try bounded.applyPipeline(&[_]Kind{.lowercase}, "ABC", true);
+    try std.testing.expectEqualStrings("abc", result.bytes);
+    const bounded_stats = bounded.cacheStats();
+    try std.testing.expectEqual(CacheStatus.limit_exhausted, bounded_stats.status);
+    try std.testing.expectEqual(@as(usize, 0), bounded_stats.entries);
+    _ = try bounded.applyPipeline(&[_]Kind{.lowercase}, "ABC", true);
+    try std.testing.expectEqual(@as(u64, 1), bounded.cacheStats().misses);
 }
 
 test "executor validates deterministic input and output limits" {

@@ -112,6 +112,7 @@ pub const Config = struct {
     transformation_limits: transformations.Limits = .{},
     transformation_profile: transformations.Profile = .modsecurity,
     transformation_unicode_map: ?transformations.UnicodeMap = null,
+    transformation_cache_enabled: ?bool = null,
 };
 
 pub const InterventionCapabilities = struct {
@@ -231,6 +232,12 @@ pub const Builder = struct {
         self.config.transformation_unicode_map = unicode_map;
     }
 
+    /// Override SecCacheTransformations for embedders. Null configuration uses
+    /// the effective ruleset directive and otherwise defaults to disabled.
+    pub fn setTransformationCacheEnabled(self: *Builder, enabled: bool) void {
+        self.config.transformation_cache_enabled = enabled;
+    }
+
     /// Select the directive capabilities compiled into this WAF build. A plan
     /// using an omitted capability is rejected before publication.
     pub fn setDirectiveCapabilities(self: *Builder, capabilities: directives.CapabilitySet) void {
@@ -297,6 +304,16 @@ pub const Builder = struct {
             .configuration => |configuration| configuration,
             .diagnostic => unreachable,
         } else null;
+        const transformation_cache_enabled = self.config.transformation_cache_enabled orelse blk: {
+            const configuration = if (directive_configuration) |*value| value else break :blk false;
+            const directive = configuration.latest(.sec_cache_transformations) orelse break :blk false;
+            var values = directive.values();
+            const decoded = values.next() orelse break :blk false;
+            break :blk switch (decoded.value) {
+                .toggle => |enabled| enabled,
+                else => unreachable,
+            };
+        };
         waf.* = .{
             .allocator = self.allocator,
             .config = self.config,
@@ -304,6 +321,7 @@ pub const Builder = struct {
             .clock_source = self.clock_source,
             .plan = owned_plan,
             .directive_configuration = directive_configuration,
+            .transformation_cache_enabled = transformation_cache_enabled,
             .active_transactions = std.atomic.Value(usize).init(0),
             .transaction_sequence = std.atomic.Value(u64).init(0),
         };
@@ -328,6 +346,7 @@ pub const Waf = struct {
     clock_source: ?ClockSource,
     plan: ?*compiled_plan.Plan,
     directive_configuration: ?directives.Configuration,
+    transformation_cache_enabled: bool,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
 
@@ -347,6 +366,7 @@ pub const Waf = struct {
             .transformation_executor = transformations.Executor.initWithOptions(self.allocator, self.config.transformation_limits, .{
                 .profile = self.config.transformation_profile,
                 .unicode_map = self.config.transformation_unicode_map,
+                .cache_enabled = self.transformation_cache_enabled,
             }) catch unreachable,
             .control_state = .{
                 .rule_engine = if (self.config.mode == .enabled) .on else .detection_only,
@@ -552,6 +572,7 @@ pub const TransformedValue = struct {
     value: []const u8,
     source: collections.Source,
     changed: bool,
+    storage: transformations.Storage,
     checkpoints: []const transformations.Checkpoint,
     steps_executed: u32,
     cumulative_bytes: usize,
@@ -921,10 +942,15 @@ pub const Transaction = struct {
             .value = result.bytes,
             .source = context.source,
             .changed = result.changed,
+            .storage = result.storage,
             .checkpoints = result.checkpoints,
             .steps_executed = result.steps_executed,
             .cumulative_bytes = result.cumulative_bytes,
         };
+    }
+
+    pub fn transformationCacheStats(self: *const Transaction) transformations.CacheStats {
+        return self.transformation_executor.cacheStats();
     }
 
     /// Atomically replace the transaction-local RULE projection with typed
@@ -4041,6 +4067,7 @@ test "proxy decisions require an explicitly advertised connector capability" {
 
 test "transaction executes typed member pipelines without publishing match state" {
     const input =
+        \\SecCacheTransformations On
         \\SecRule ARGS @rx "id:31,multiMatch,t:urlDecode,t:lowercase,chain"
         \\SecRule ARGS @rx "t:none,t:uppercase"
     ;
@@ -4072,6 +4099,16 @@ test "transaction executes typed member pipelines without publishing match state
     try std.testing.expectEqualStrings("a", head.checkpoints[2].bytes);
     try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
     try std.testing.expect((try tx.intervention()) == null);
+
+    const cached_head = try tx.transformRuleValue(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "%41",
+        .source = source,
+    });
+    try std.testing.expectEqual(transformations.Storage.cache, cached_head.storage);
+    try std.testing.expectEqualStrings("a", cached_head.value);
+    try std.testing.expectEqual(@as(usize, 3), cached_head.checkpoints.len);
+    try std.testing.expectEqual(@as(u64, 1), tx.transformationCacheStats().hits);
 
     const member = try tx.transformRuleValue(@fromBackingInt(1), .{
         .name = "ARGS:value",
