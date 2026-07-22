@@ -6,6 +6,11 @@ may be bound to cross-request storage through the versioned
 no backend calls. A request pays persistence cost only after explicitly
 initializing a persistent namespace.
 
+The callback table is ABI-versioned and exposes feature bits for optimistic
+revisions, atomic batches, per-variable expiry, bounded cleanup, durable
+storage, and hard deadlines. Configuration can reject a backend whose features
+do not satisfy its deployment policy.
+
 ## Ownership and lifecycle
 
 The application owns the backend context and must keep it alive until the WAF

@@ -5,6 +5,40 @@ const collections = @import("collections.zig");
 
 pub const backend_abi_version: u32 = 1;
 
+pub const BackendFeature = enum(u8) {
+    optimistic_revisions,
+    atomic_batches,
+    per_variable_expiry,
+    bounded_cleanup,
+    durable_storage,
+    hard_deadlines,
+};
+
+pub const BackendFeatureSet = struct {
+    bits: u64 = 0,
+
+    pub fn core() BackendFeatureSet {
+        var result: BackendFeatureSet = .{};
+        result.insert(.optimistic_revisions);
+        result.insert(.atomic_batches);
+        result.insert(.per_variable_expiry);
+        result.insert(.bounded_cleanup);
+        return result;
+    }
+
+    pub fn insert(self: *BackendFeatureSet, feature: BackendFeature) void {
+        self.bits |= @as(u64, 1) << @as(u6, @intCast(@backingInt(feature)));
+    }
+
+    pub fn has(self: BackendFeatureSet, feature: BackendFeature) bool {
+        return self.bits & (@as(u64, 1) << @as(u6, @intCast(@backingInt(feature)))) != 0;
+    }
+
+    pub fn containsAll(self: BackendFeatureSet, required: BackendFeatureSet) bool {
+        return self.bits & required.bits == required.bits;
+    }
+};
+
 pub const Namespace = enum(u8) {
     ip,
     session,
@@ -152,6 +186,7 @@ pub const CleanupResult = struct {
 /// must exceed the WAF and every transaction that can call this backend.
 pub const Backend = struct {
     abi_version: u32 = backend_abi_version,
+    features: BackendFeatureSet = BackendFeatureSet.core(),
     context: *anyopaque,
     loadFn: *const fn (
         context: *anyopaque,
@@ -408,6 +443,7 @@ pub const InMemoryBackend = struct {
 
     pub fn backend(self: *InMemoryBackend) Backend {
         return .{
+            .features = BackendFeatureSet.core(),
             .context = self,
             .loadFn = loadCallback,
             .commitFn = commitCallback,

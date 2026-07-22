@@ -62,7 +62,10 @@ pub const LmdbBackend = struct {
     }
 
     pub fn backend(self: *LmdbBackend) persistent.Backend {
+        var features = persistent.BackendFeatureSet.core();
+        features.insert(.durable_storage);
         return .{
+            .features = features,
             .context = self,
             .loadFn = loadCallback,
             .commitFn = commitCallback,
@@ -352,6 +355,19 @@ test "record codec rejects truncation and trailing data" {
     @memcpy(with_trailer[0..encoded.len], encoded);
     with_trailer[encoded.len] = 0;
     try std.testing.expectError(error.CorruptData, decodeRecord(std.testing.allocator, with_trailer, .{}));
+}
+
+test "LMDB backend advertises durable atomic persistence" {
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, ".zig-cache/tmp/{s}", .{temporary.sub_path}, 0);
+    defer std.testing.allocator.free(path);
+    var lmdb = try LmdbBackend.init(std.testing.allocator, path, .{});
+    defer lmdb.deinit();
+    const features = lmdb.backend().features;
+    try std.testing.expect(features.has(.durable_storage));
+    try std.testing.expect(features.has(.atomic_batches));
+    try std.testing.expect(!features.has(.hard_deadlines));
 }
 
 test "LMDB backend survives reopen and filters expired values" {

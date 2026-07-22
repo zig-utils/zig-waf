@@ -81,6 +81,7 @@ pub const Config = struct {
     persistent_backend: ?persistent.Backend = null,
     persistent_limits: persistent.Limits = .{},
     persistent_failure_policy: persistent.FailurePolicy = .fail_closed,
+    persistent_required_features: persistent.BackendFeatureSet = persistent.BackendFeatureSet.core(),
 };
 
 pub const ClockSample = struct {
@@ -99,7 +100,7 @@ pub const ClockSource = struct {
     }
 };
 
-pub const ConfigError = error{InvalidLimit};
+pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature };
 pub const DeinitError = error{TransactionsActive};
 
 pub const Intervention = struct {
@@ -168,9 +169,16 @@ pub const Builder = struct {
         self.config.persistent_failure_policy = policy;
     }
 
+    pub fn setPersistentRequiredFeatures(self: *Builder, required: persistent.BackendFeatureSet) void {
+        self.config.persistent_required_features = required;
+    }
+
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
         try self.config.limits.validate();
         self.config.persistent_limits.validate() catch return error.InvalidLimit;
+        if (self.config.persistent_backend) |backend| {
+            if (!backend.features.containsAll(self.config.persistent_required_features)) return error.MissingPersistentBackendFeature;
+        }
         const waf = try self.allocator.create(Waf);
         waf.* = .{
             .allocator = self.allocator,
@@ -1711,6 +1719,16 @@ test "persistent backend failure policy is explicit and observable" {
     try closed_tx.processUri("/", "GET", "HTTP/1.1");
     try std.testing.expectError(error.Unavailable, closed_tx.initializePersistentCollection(.ip, "192.0.2.20"));
     try std.testing.expectEqual(PersistentFailure.unavailable, closed_tx.lastPersistentFailure().?);
+}
+
+test "builder rejects missing persistent backend capabilities" {
+    var unavailable: UnavailablePersistence = .{};
+    var required = persistent.BackendFeatureSet.core();
+    required.insert(.hard_deadlines);
+    var builder = Builder.init(std.testing.allocator);
+    builder.setPersistentBackend(unavailable.backend());
+    builder.setPersistentRequiredFeatures(required);
+    try std.testing.expectError(error.MissingPersistentBackendFeature, builder.build());
 }
 
 test "TX numeric mutation follows setvar prefix and overflow semantics" {
