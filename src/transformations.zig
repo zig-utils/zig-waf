@@ -143,6 +143,25 @@ pub const Profile = enum {
     coraza,
 };
 
+/// Immutable ModSecurity Unicode-map values indexed by a 16-bit code point.
+/// Negative and out-of-range entries are unmapped. The backing table must
+/// outlive the executor and may be shared by request workers.
+pub const UnicodeMap = struct {
+    table: []const i32,
+
+    pub fn lookup(self: UnicodeMap, code_point: u16) ?u8 {
+        if (code_point >= self.table.len) return null;
+        const mapped = self.table[code_point];
+        if (mapped < 0) return null;
+        return @truncate(@as(u32, @intCast(mapped)));
+    }
+};
+
+pub const Options = struct {
+    profile: Profile = .modsecurity,
+    unicode_map: ?UnicodeMap = null,
+};
+
 pub const Result = struct {
     bytes: []const u8,
     /// Upstream transformation semantics, which can differ from byte equality.
@@ -172,16 +191,26 @@ pub const Executor = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
     profile: Profile,
+    unicode_map: ?UnicodeMap,
     buffers: [2]std.ArrayList(u8) = .{ .empty, .empty },
     next_buffer: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, limits: Limits) error{InvalidLimits}!Executor {
-        return initWithProfile(allocator, limits, .modsecurity);
+        return initWithOptions(allocator, limits, .{});
     }
 
     pub fn initWithProfile(allocator: std.mem.Allocator, limits: Limits, profile: Profile) error{InvalidLimits}!Executor {
+        return initWithOptions(allocator, limits, .{ .profile = profile });
+    }
+
+    pub fn initWithOptions(allocator: std.mem.Allocator, limits: Limits, options: Options) error{InvalidLimits}!Executor {
         try limits.validate();
-        return .{ .allocator = allocator, .limits = limits, .profile = profile };
+        return .{
+            .allocator = allocator,
+            .limits = limits,
+            .profile = options.profile,
+            .unicode_map = options.unicode_map,
+        };
     }
 
     pub fn deinit(self: *Executor) void {
@@ -208,6 +237,7 @@ pub const Executor = struct {
             .hex_encode => self.hexEncode(input),
             .sql_hex_decode => self.sqlHexDecode(input),
             .url_decode => self.urlDecode(input),
+            .url_decode_uni => self.urlDecodeUni(input),
             .url_encode => self.urlEncode(input),
             .parity_even_7bit => self.parity(input, true),
             .parity_odd_7bit => self.parity(input, false),
@@ -472,6 +502,14 @@ pub const Executor = struct {
     }
 
     fn urlDecode(self: *Executor, input: []const u8) ApplyError!Result {
+        return self.urlDecodeInternal(input, false);
+    }
+
+    fn urlDecodeUni(self: *Executor, input: []const u8) ApplyError!Result {
+        return self.urlDecodeInternal(input, true);
+    }
+
+    fn urlDecodeInternal(self: *Executor, input: []const u8, unicode: bool) ApplyError!Result {
         var changed = false;
         var index: usize = 0;
         while (index < input.len) : (index += 1) {
@@ -479,9 +517,14 @@ pub const Executor = struct {
                 changed = true;
                 break;
             }
-            if (input[index] == '%' and index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])) {
-                changed = true;
-                break;
+            if (input[index] == '%') {
+                if (self.profile == .coraza or
+                    (unicode and isValidUrlUnicodeEscape(input, index)) or
+                    (index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])))
+                {
+                    changed = true;
+                    break;
+                }
             }
         }
         if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
@@ -489,7 +532,26 @@ pub const Executor = struct {
         const generated = try self.writable(input.len);
         index = 0;
         while (index < input.len) {
-            if (input[index] == '%' and index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])) {
+            if (unicode and isValidUrlUnicodeEscape(input, index)) {
+                const code_point = decodeHexU16(input[index + 2 .. index + 6]);
+                var decoded = if (self.unicode_map) |unicode_map|
+                    unicode_map.lookup(code_point)
+                else
+                    null;
+                if (decoded == null) {
+                    decoded = @truncate(code_point);
+                    if (decoded.? > 0 and decoded.? < 0x5f and (code_point & 0xff00) == 0xff00) {
+                        decoded.? += 0x20;
+                    }
+                }
+                generated.buffer.appendAssumeCapacity(decoded.?);
+                index += 6;
+            } else if (unicode and input[index] == '%' and index + 1 < input.len and
+                (input[index + 1] == 'u' or input[index + 1] == 'U'))
+            {
+                generated.buffer.appendSliceAssumeCapacity(input[index .. index + 2]);
+                index += 2;
+            } else if (input[index] == '%' and index + 2 < input.len and isHex(input[index + 1]) and isHex(input[index + 2])) {
                 generated.buffer.appendAssumeCapacity(hexNibble(input[index + 1]).? * 16 + hexNibble(input[index + 2]).?);
                 index += 3;
             } else {
@@ -600,6 +662,23 @@ fn modSecurityHexNibble(byte: u8) u8 {
 
 fn isUrlUnescaped(byte: u8) bool {
     return byte == '*' or std.ascii.isAlphanumeric(byte);
+}
+
+fn isValidUrlUnicodeEscape(input: []const u8, index: usize) bool {
+    return index + 5 < input.len and
+        input[index] == '%' and
+        (input[index + 1] == 'u' or input[index + 1] == 'U') and
+        isHex(input[index + 2]) and
+        isHex(input[index + 3]) and
+        isHex(input[index + 4]) and
+        isHex(input[index + 5]);
+}
+
+fn decodeHexU16(input: []const u8) u16 {
+    return (@as(u16, hexNibble(input[0]).?) << 12) |
+        (@as(u16, hexNibble(input[1]).?) << 8) |
+        (@as(u16, hexNibble(input[2]).?) << 4) |
+        hexNibble(input[3]).?;
 }
 
 fn base64Value(byte: u8) ?u6 {
@@ -749,6 +828,38 @@ test "URL encoding is byte-oriented and malformed decoding is non-strict" {
 
     try std.testing.expectEqualStrings("Test+Case", (try executor.apply(.url_encode, "Test Case")).bytes);
     try std.testing.expectEqualStrings("*AZaz09%2f%00", (try executor.apply(.url_encode, "*AZaz09/\x00")).bytes);
+}
+
+test "URL Unicode decoding matches profile flags and IIS full-width folding" {
+    var modsecurity = try Executor.initWithProfile(std.testing.allocator, .{}, .modsecurity);
+    defer modsecurity.deinit();
+    var coraza = try Executor.initWithProfile(std.testing.allocator, .{}, .coraza);
+    defer coraza.deinit();
+
+    try std.testing.expectEqualStrings("Test Case", (try modsecurity.apply(.url_decode_uni, "Test%u0020Case")).bytes);
+    try std.testing.expectEqualStrings("ABC", (try modsecurity.apply(.url_decode_uni, "%u0041%U0042%43")).bytes);
+    try std.testing.expectEqualStrings("!~", (try modsecurity.apply(.url_decode_uni, "%uff01%uFF5e")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0xff }, (try modsecurity.apply(.url_decode_uni, "%u1100%u00ff")).bytes);
+    try std.testing.expectEqualStrings("%u000g ", (try modsecurity.apply(.url_decode_uni, "%u000g%u0020")).bytes);
+    try std.testing.expectEqualStrings("%u", (try modsecurity.apply(.url_decode_uni, "%u")).bytes);
+
+    const modsecurity_malformed = try modsecurity.apply(.url_decode_uni, "%gg");
+    try std.testing.expect(!modsecurity_malformed.changed);
+    const coraza_malformed = try coraza.apply(.url_decode_uni, "%gg");
+    try std.testing.expect(coraza_malformed.changed);
+    try std.testing.expectEqual(Storage.borrowed, coraza_malformed.storage);
+    try std.testing.expectEqualStrings("%gg", coraza_malformed.bytes);
+    try std.testing.expect((try coraza.apply(.url_decode, "%gg")).changed);
+
+    var table: [0x42]i32 = undefined;
+    @memset(&table, -1);
+    table[0x41] = 'z';
+    var mapped = try Executor.initWithOptions(std.testing.allocator, .{}, .{
+        .profile = .modsecurity,
+        .unicode_map = .{ .table = &table },
+    });
+    defer mapped.deinit();
+    try std.testing.expectEqualStrings("zB", (try mapped.apply(.url_decode_uni, "%u0041%u0042")).bytes);
 }
 
 test "executor validates deterministic input and output limits" {
