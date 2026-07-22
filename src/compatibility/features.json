@@ -239,7 +239,7 @@
         "benchmarks/actions.zig",
         "docs/disruptive-flow-controls.md"
       ],
-      "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact exclusions, capability-gated proxy, allocation rollback, fuzzing, and benchmarks are executable. Regex-delimited runtime target selectors remain explicitly unsupported until bounded zig-regex worker storage lands."
+      "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact and bounded zig-regex target exclusions, capability-gated proxy, exhaustive allocation rollback, fuzzing, and benchmarks are executable. Final cursor/exclusion benchmark qualification and exact hosted closing-SHA verification remain."
     },
     {
       "id": "fleet.postgresql-18",

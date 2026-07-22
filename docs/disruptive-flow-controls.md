@@ -20,11 +20,12 @@ reachable.
 
 Transaction-local controls cover rule engine, audit engine and parts, request
 body access/limit/processor, force-request-body, response-body access, rule ID
-and tag exclusions, and exact target exclusions by ID or tag. Body controls
-reject changes after their consumption boundary. Exclusions are bounded by
-count and owned bytes and affect only subsequent evaluation. Regex-delimited
-target keys are rejected explicitly until bounded `zig-regex` workers are
-stored per transaction; they are never treated as exact strings or ignored.
+and tag exclusions, and exact or regex-delimited target exclusions by ID or
+tag. Body controls reject changes after their consumption boundary. Exclusions
+are bounded by count and owned bytes and affect only subsequent evaluation.
+Regex target selectors compile through the pinned `zig-regex` dependency and
+use pointer-stable compiled programs with isolated per-transaction workers;
+matcher limits surface as explicit transaction errors.
 
 Executable evidence is recorded in
 `src/compatibility/evidence/disruptive-flow-controls.json`. CI runs unit and

@@ -51,7 +51,8 @@ test "pinned control fixture compiles the stable typed control families" {
     defer fixture.compiled.deinit();
     const rule = fixture.compiled.rules[0];
     const compiled_controls = fixture.compiled.runtime_controls[rule.controls_start..][0..rule.controls_count];
-    try std.testing.expectEqual(@as(usize, 10), compiled_controls.len);
+    try std.testing.expectEqual(@as(usize, 11), compiled_controls.len);
     try std.testing.expectEqual(action_config.ControlKind.rule_engine, compiled_controls[0].kind);
     try std.testing.expectEqual(action_config.ControlKind.rule_remove_target_by_tag, compiled_controls[9].kind);
+    try std.testing.expectEqual(action_config.ControlKind.rule_remove_target_by_id, compiled_controls[10].kind);
 }

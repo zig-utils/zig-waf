@@ -26,6 +26,10 @@
     "crs": {
       "version": "4.28.0",
       "commit": "55b09f5acfd16413e7b31041100711ceb7adc89c"
+    },
+    "zigRegex": {
+      "commit": "1b2293e749de60620cb6024c551fedb3d02d54c0",
+      "issue": "https://github.com/zig-utils/zig-regex/issues/18"
     }
   },
   "fixtures": [
@@ -38,6 +42,5 @@
     "benchmark": "zig build bench-actions -Doptimize=ReleaseFast",
     "corpus": "zig build test-plan-corpus with pinned CRS, ModSecurity, and Coraza roots",
     "unexplainedMismatches": 0
-  },
-  "knownExplicitBoundary": "Regex-delimited runtime target selectors return UnsupportedRuntimeControl until bounded zig-regex worker storage lands."
+  }
 }
