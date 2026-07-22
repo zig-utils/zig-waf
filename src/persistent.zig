@@ -294,6 +294,7 @@ pub const Session = struct {
                         );
                         binding.revision = current.revision;
                         current.deinit();
+                        conflictBackoff(attempt);
                         continue;
                     },
                     else => return err,
@@ -632,6 +633,15 @@ fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) : (spins += 1) {
         if ((spins & 0xff) == 0) std.Thread.yield() catch {} else std.atomic.spinLoopHint();
     }
+}
+
+fn conflictBackoff(attempt: u8) void {
+    if (attempt < 4) {
+        const spins = @as(usize, 1) << @intCast(attempt);
+        for (0..spins) |_| std.atomic.spinLoopHint();
+        return;
+    }
+    std.Thread.yield() catch {};
 }
 
 test "persistent namespace registry maps to collection names" {
