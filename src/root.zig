@@ -6,6 +6,7 @@ pub const collections = @import("collections.zig");
 pub const engine = @import("engine.zig");
 pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
+pub const selectors = @import("selectors.zig");
 pub const variables = @import("variables.zig");
 
 pub const Waf = engine.Waf;
@@ -26,5 +27,6 @@ test {
     _ = engine;
     _ = macros;
     _ = operators;
+    _ = selectors;
     _ = variables;
 }

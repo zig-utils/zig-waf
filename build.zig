@@ -7,6 +7,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const regex_dependency = b.dependency("regex", .{
+        .target = target,
+        .optimize = optimize,
+    });
 
     const waf = b.addModule("waf", .{
         .root_source_file = b.path("src/root.zig"),
@@ -14,6 +18,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     waf.addImport("injection", injection_dependency.module("injection"));
+    waf.addImport("regex", regex_dependency.module("regex"));
 
     const cli_module = b.createModule(.{
         .root_source_file = b.path("src/cli.zig"),
