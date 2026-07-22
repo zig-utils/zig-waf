@@ -77,6 +77,14 @@ jobs:
           -Dparser-corpus=../owasp-crs/crs-setup.conf.example
           -Dparser-corpus=../owasp-crs/plugins
           -Dparser-corpus=../owasp-crs/rules
+      - name: CRS parser benchmark
+        working-directory: zig-waf
+        run: >-
+          zig build bench-parser -Doptimize=ReleaseFast
+          -Dparser-benchmark=../owasp-crs/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf
+      - name: Deterministic parser fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-parser -Dparser-fuzz-iterations=10000
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
