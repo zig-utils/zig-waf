@@ -3872,6 +3872,56 @@ test "phase cursor applies skip and phase-scoped allow without allocation" {
     try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(7)), (try logging_cursor.next()).?);
 }
 
+test "request and transaction allow scopes preserve response and logging boundaries" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:1,allow:request"
+        \\SecRule ARGS @rx "id:2,phase:2"
+        \\SecRule ARGS @rx "id:3,phase:3"
+        \\SecRule ARGS @rx "id:4,phase:3,allow"
+        \\SecRule ARGS @rx "id:5,phase:4"
+        \\SecRule ARGS @rx "id:6,phase:5"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "allow-scopes.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 5 },
+    };
+    var request_headers = try PhaseCursor.init(&tx, .request_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try request_headers.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), context);
+    try std.testing.expect((try request_headers.next()) == null);
+    try tx.processRequestBody();
+    var request_body = try PhaseCursor.init(&tx, .request_body);
+    try std.testing.expect((try request_body.next()) == null);
+
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    var response_headers = try PhaseCursor.init(&tx, .response_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(2)), (try response_headers.next()).?);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(3)), (try response_headers.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(3), context);
+    try std.testing.expect((try response_headers.next()) == null);
+    try tx.processResponseBody();
+    var response_body = try PhaseCursor.init(&tx, .response_body);
+    try std.testing.expect((try response_body.next()) == null);
+    try tx.processLogging();
+    var logging = try PhaseCursor.init(&tx, .logging);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(5)), (try logging.next()).?);
+}
+
 test "dynamic skipAfter resolves staged macros and resumes after marker" {
     const input =
         \\SecRule ARGS @rx "id:1,phase:2,setvar:'tx.marker=DYNAMIC',skipAfter:'%{TX.marker}'"
