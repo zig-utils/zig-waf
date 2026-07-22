@@ -176,6 +176,9 @@ pub const Presence = struct {
     crs: bool = false,
 };
 
+pub const UpstreamSupport = enum { absent, implemented, recognized_limited };
+pub const ImplementationState = enum { schema_only, implemented, accepted_no_effect };
+
 pub const Entry = struct {
     id: Id,
     name: []const u8,
@@ -183,6 +186,9 @@ pub const Entry = struct {
     repeatability: Repeatability = .singular_replace,
     capability: Capability = .core,
     presence: Presence,
+    modsecurity_support: UpstreamSupport,
+    coraza_support: UpstreamSupport,
+    implementation: ImplementationState = .schema_only,
     sensitive: bool = false,
     owner_issue: u16,
 };
@@ -469,8 +475,63 @@ fn row(
         .repeatability = repeatability,
         .capability = capability,
         .presence = presence,
+        .modsecurity_support = baselineSupport(.modsecurity, id, presence.modsecurity),
+        .coraza_support = baselineSupport(.coraza, id, presence.coraza),
         .owner_issue = owner_issue,
     };
+}
+
+const Baseline = enum { modsecurity, coraza };
+
+fn baselineSupport(baseline: Baseline, id: Id, present: bool) UpstreamSupport {
+    if (!present) return .absent;
+    const limited = switch (baseline) {
+        .modsecurity => switch (id) {
+            .sec_conn_engine,
+            .sec_conn_read_state_limit,
+            .sec_conn_write_state_limit,
+            .sec_server_signature,
+            .sec_sensor_id,
+            .sec_status_engine,
+            .sec_stream_in_body_inspection,
+            .sec_stream_out_body_inspection,
+            .sec_content_injection,
+            .sec_disable_backend_compression,
+            .sec_cookie_format,
+            .sec_cookie_v0_separator,
+            .sec_data_dir,
+            .sec_guardian_log,
+            .sec_tmp_dir,
+            .sec_chroot_dir,
+            .sec_rule_inheritance,
+            .sec_rule_perf_time,
+            .sec_intercept_on_error,
+            .sec_cache_transformations,
+            .sec_collection_timeout,
+            .sec_gsb_lookup_db,
+            .sec_pcre_match_limit_recursion,
+            .sec_upload_keep_files,
+            .sec_hash_engine,
+            .sec_hash_key,
+            .sec_hash_param,
+            .sec_hash_method_rx,
+            .sec_hash_method_pm,
+            => true,
+            else => false,
+        },
+        .coraza => switch (id) {
+            .sec_argument_separator,
+            .sec_cookie_format,
+            .sec_rule_update_target_by_msg,
+            .sec_rule_script,
+            .sec_rule_perf_time,
+            .sec_unicode_map,
+            .sec_tmp_dir,
+            => true,
+            else => false,
+        },
+    };
+    return if (limited) .recognized_limited else .implemented;
 }
 
 fn secretRow(

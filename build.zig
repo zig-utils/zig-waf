@@ -131,6 +131,8 @@ pub fn build(b: *std.Build) void {
     const run_directive_inventory = b.addRunArtifact(directive_inventory);
     if (b.option([]const u8, "modsecurity-scanner", "Pinned ModSecurity seclang-scanner.ll")) |path|
         run_directive_inventory.addArg(path);
+    if (b.option([]const u8, "modsecurity-parser", "Pinned ModSecurity seclang-parser.yy")) |path|
+        run_directive_inventory.addArg(path);
     if (b.option([]const u8, "coraza-directives", "Pinned Coraza directivesmap.gen.go")) |path|
         run_directive_inventory.addArg(path);
     const directive_inventory_step = b.step("test-directive-inventory", "Compare the registry with pinned upstream inventories");

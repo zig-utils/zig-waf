@@ -105,6 +105,7 @@ jobs:
         run: >-
           zig build test-directive-inventory
           -Dmodsecurity-scanner=../modsecurity/src/parser/seclang-scanner.ll
+          -Dmodsecurity-parser=../modsecurity/src/parser/seclang-parser.yy
           -Dcoraza-directives=../coraza/internal/seclang/directivesmap.gen.go
       - name: Stable directive corpus
         working-directory: zig-waf
