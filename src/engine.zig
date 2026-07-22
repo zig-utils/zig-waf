@@ -308,6 +308,10 @@ pub const Waf = struct {
                 persistent.Session.init(self.allocator, backend, self.config.persistent_limits) catch unreachable
             else
                 null,
+            .control_state = .{
+                .rule_engine = if (self.config.mode == .enabled) .on else .detection_only,
+                .request_body_limit = self.config.limits.max_request_body_bytes,
+            },
             .started_real_nanoseconds = started.unix_nanoseconds,
             .started_awake_nanoseconds = started.awake_nanoseconds,
             .sequence = @constCast(&self.transaction_sequence).fetchAdd(1, .monotonic),
@@ -463,6 +467,8 @@ pub const TransactionError = error{
     CollectionSizeOverflow,
     PersistentBackendNotConfigured,
     PersistentTimestampOverflow,
+    ControlTooLate,
+    UnsupportedRuntimeControl,
 } || variables.StoreError || collections.StoreError || collections.SelectorError || persistent.SessionError;
 
 const Lifecycle = enum {
@@ -537,6 +543,7 @@ pub const MatchIntent = struct {
     skip_after_active: bool,
     skip_after_resume: ?compiled_plan.RuleId,
     multi_match: bool,
+    controls_applied: usize,
 };
 
 pub const LocalEffectOutcome = struct {
@@ -556,6 +563,7 @@ pub const LocalEffectOutcome = struct {
     skip_after_active: bool,
     skip_after_resume: ?compiled_plan.RuleId,
     multi_match: bool,
+    controls_applied: usize,
 };
 
 pub const FlowState = struct {
@@ -565,6 +573,16 @@ pub const FlowState = struct {
     skip_after_resume: ?compiled_plan.RuleId = null,
     allow_scope: ?action_config.AllowScope = null,
     phase: ?Phase = null,
+};
+
+pub const ControlState = struct {
+    rule_engine: action_config.EngineMode,
+    audit_engine: action_config.AuditEngine = .relevant_only,
+    force_request_body_variable: bool = false,
+    request_body_access: bool = true,
+    request_body_limit: usize,
+    request_body_processor: ?action_config.BodyProcessor = null,
+    response_body_access: bool = true,
 };
 
 pub const PersistentFailure = enum {
@@ -754,6 +772,7 @@ pub const Transaction = struct {
     match_intents: std.ArrayList(MatchIntent) = .empty,
     match_intent_bytes: usize = 0,
     flow_state: FlowState = .{},
+    control_state: ControlState,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -912,13 +931,6 @@ pub const Transaction = struct {
         const selected = plan.rules[rule_index];
         const head_index: usize = @backingInt(selected.chain_head);
         const head = plan.rules[head_index];
-        const has_enforced_intervention = self.waf.config.mode == .enabled and switch (head.disruptive.kind) {
-            .deny, .drop, .proxy, .redirect => true,
-            .pass, .allow => false,
-        };
-        if (has_enforced_intervention and self.pending_intervention != null)
-            return error.InterventionAlreadyRecorded;
-
         var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
         defer batch.deinit();
         var scalar_batch: ScalarShadowBatch = .{ .allocator = self.waf.allocator };
@@ -952,6 +964,7 @@ pub const Transaction = struct {
             .skip_after_active = false,
             .skip_after_resume = null,
             .multi_match = head.flow.multi_match,
+            .controls_applied = 0,
         };
         const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
         for (matches) |matched| {
@@ -1117,6 +1130,15 @@ pub const Transaction = struct {
             }
         }
 
+        var staged_controls = self.control_state;
+        result.controls_applied = try self.stageRuntimeControls(matches, &staged_controls, &batch, &scalar_batch, plan);
+        result.decision_enforced = staged_controls.rule_engine == .on;
+        const has_enforced_intervention = result.decision_enforced and switch (head.disruptive.kind) {
+            .deny, .drop, .proxy, .redirect => true,
+            .pass, .allow => false,
+        };
+        if (has_enforced_intervention and self.pending_intervention != null)
+            return error.InterventionAlreadyRecorded;
         const skip_after = try self.resolveSkipAfter(selected.chain_head, head, &batch, &scalar_batch, plan);
         result.skip_after_active = skip_after.active;
         result.skip_after_resume = skip_after.resume_rule;
@@ -1160,6 +1182,7 @@ pub const Transaction = struct {
         self.match_intents.appendAssumeCapacity(prepared_intent.value);
         self.match_intent_bytes += prepared_intent.owned_bytes;
         intent_committed = true;
+        self.control_state = staged_controls;
         const committed_intent = &self.match_intents.items[self.match_intents.items.len - 1];
         self.commitDecision(head, committed_intent);
         return result;
@@ -1169,6 +1192,66 @@ pub const Transaction = struct {
         active: bool = false,
         resume_rule: ?compiled_plan.RuleId = null,
     };
+
+    fn stageRuntimeControls(
+        self: *Transaction,
+        matches: []const MatchedRule,
+        staged: *ControlState,
+        batch: *const ShadowBatch,
+        scalar_batch: *const ScalarShadowBatch,
+        plan: *const compiled_plan.Plan,
+    ) TransactionError!usize {
+        var count: usize = 0;
+        for (matches) |matched| {
+            const rule = plan.rules[@backingInt(matched.rule)];
+            if (rule.controls_start + rule.controls_count > plan.runtime_controls.len)
+                return error.InvalidRuleReference;
+            for (plan.runtime_controls[rule.controls_start..][0..rule.controls_count]) |control| {
+                const expanded = try self.expandEffectTextStaged(control.value, batch, scalar_batch, plan);
+                defer self.waf.allocator.free(expanded);
+                switch (control.kind) {
+                    .rule_engine => staged.rule_engine = action_config.parseEngineMode(expanded) catch
+                        return error.InvalidActionValue,
+                    .audit_engine => staged.audit_engine = action_config.parseAuditEngine(expanded) catch
+                        return error.InvalidActionValue,
+                    .force_request_body_variable => {
+                        if (self.currentPhase() != .request_headers) return error.ControlTooLate;
+                        staged.force_request_body_variable = action_config.parseBoolean(expanded) catch
+                            return error.InvalidActionValue;
+                    },
+                    .request_body_access => {
+                        if (self.currentPhase() != .request_headers) return error.ControlTooLate;
+                        staged.request_body_access = action_config.parseBoolean(expanded) catch
+                            return error.InvalidActionValue;
+                    },
+                    .request_body_limit => {
+                        if (self.currentPhase() != .request_headers) return error.ControlTooLate;
+                        staged.request_body_limit = action_config.parsePositiveUsize(expanded) catch
+                            return error.InvalidActionValue;
+                    },
+                    .request_body_processor => {
+                        if (self.currentPhase() != .request_headers) return error.ControlTooLate;
+                        staged.request_body_processor = action_config.parseBodyProcessor(expanded) catch
+                            return error.InvalidActionValue;
+                    },
+                    .response_body_access => {
+                        const phase = self.currentPhase() orelse return error.InvalidLifecycle;
+                        if (@backingInt(phase) > @backingInt(Phase.response_headers)) return error.ControlTooLate;
+                        staged.response_body_access = action_config.parseBoolean(expanded) catch
+                            return error.InvalidActionValue;
+                    },
+                    .audit_log_parts,
+                    .rule_remove_by_id,
+                    .rule_remove_by_tag,
+                    .rule_remove_target_by_id,
+                    .rule_remove_target_by_tag,
+                    => return error.UnsupportedRuntimeControl,
+                }
+                count += 1;
+            }
+        }
+        return count;
+    }
 
     fn resolveSkipAfter(
         self: *Transaction,
@@ -1198,7 +1281,7 @@ pub const Transaction = struct {
         self.flow_state.skip_after_active = intent.skip_after_active;
         self.flow_state.skip_after_resume = intent.skip_after_resume;
         if (head.disruptive.kind == .allow) {
-            if (self.waf.config.mode == .enabled) {
+            if (intent.decision_enforced) {
                 self.flow_state.allow_scope = head.disruptive.allow_scope;
                 self.phase_interrupted = true;
             }
@@ -1216,9 +1299,9 @@ pub const Transaction = struct {
             .status = intent.disruptive_status,
             .rule_id = if (head.external_id) |value| if (value <= std.math.maxInt(u32)) @intCast(value) else null else null,
             .destination = intent.disruptive_destination,
-            .enforced = self.waf.config.mode == .enabled,
+            .enforced = intent.decision_enforced,
         };
-        if (self.waf.config.mode == .enabled) {
+        if (intent.decision_enforced) {
             self.phase_interrupted = true;
             self.transaction_terminated = action == .drop;
         }
@@ -1320,7 +1403,7 @@ pub const Transaction = struct {
 
     pub fn writeRequestBody(self: *Transaction, chunk: []const u8) TransactionError!void {
         try self.requireAny(&.{ .request_headers, .request_body_writing });
-        if (chunk.len > self.waf.config.limits.max_request_body_bytes - self.request_body_bytes) {
+        if (chunk.len > self.control_state.request_body_limit -| self.request_body_bytes) {
             return error.RequestBodyLimitExceeded;
         }
         const next_body_bytes = self.request_body_bytes + chunk.len;
@@ -1433,9 +1516,9 @@ pub const Transaction = struct {
             .action = action,
             .status = status,
             .rule_id = rule_id,
-            .enforced = self.waf.config.mode == .enabled,
+            .enforced = self.control_state.rule_engine == .on,
         };
-        if (self.waf.config.mode == .enabled) {
+        if (self.control_state.rule_engine == .on) {
             self.phase_interrupted = true;
             self.transaction_terminated = action == .drop;
         }
@@ -1744,6 +1827,10 @@ pub const Transaction = struct {
 
     pub fn flowState(self: *const Transaction) FlowState {
         return self.flow_state;
+    }
+
+    pub fn controlState(self: *const Transaction) ControlState {
+        return self.control_state;
     }
 
     pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
@@ -2075,6 +2162,7 @@ pub const Transaction = struct {
                 .skip_after_active = outcome.skip_after_active,
                 .skip_after_resume = outcome.skip_after_resume,
                 .multi_match = outcome.multi_match,
+                .controls_applied = outcome.controls_applied,
             },
         };
     }
@@ -2419,7 +2507,10 @@ pub const PhaseCursor = struct {
         if (self.transaction.lifecycle == .deinitialized) return error.Deinitialized;
         if (self.transaction.currentPhase() != self.phase) return error.InvalidLifecycle;
         if (self.phase != .logging and
-            (self.transaction.transaction_terminated or self.transaction.phase_interrupted or self.allowSuppressesPhase()))
+            (self.transaction.control_state.rule_engine == .off or
+                self.transaction.transaction_terminated or
+                self.transaction.phase_interrupted or
+                self.allowSuppressesPhase()))
         {
             return null;
         }
@@ -3584,6 +3675,84 @@ test "dynamic skipAfter resolves staged macros and resumes after marker" {
     try std.testing.expectEqual(@as(?compiled_plan.RuleId, @fromBackingInt(2)), outcome.skip_after_resume);
     try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(2)), (try cursor.next()).?);
     try std.testing.expect((try cursor.next()) == null);
+}
+
+test "runtime engine and request-body controls commit with match decisions" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:1,setvar:'tx.mode=DetectionOnly',ctl:ruleEngine=%{TX.mode},ctl:requestBodyAccess=Off,ctl:requestBodyLimit=4,ctl:requestBodyProcessor=JSON,ctl:auditEngine=On,deny"
+        \\SecRule ARGS @rx "id:2,phase:1,ctl:ruleEngine=Off"
+        \\SecRule ARGS @rx "id:3,phase:1"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "runtime-controls.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "POST", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 5 },
+    };
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
+    const outcome = try tx.applyMatchedRule(@fromBackingInt(0), context);
+    try std.testing.expectEqual(@as(usize, 5), outcome.controls_applied);
+    try std.testing.expect(!outcome.decision_enforced);
+    try std.testing.expect(!(try tx.intervention()).?.enforced);
+    try std.testing.expect(!tx.isPhaseInterrupted());
+    const state = tx.controlState();
+    try std.testing.expectEqual(action_config.EngineMode.detection_only, state.rule_engine);
+    try std.testing.expectEqual(action_config.AuditEngine.on, state.audit_engine);
+    try std.testing.expect(!state.request_body_access);
+    try std.testing.expectEqual(@as(usize, 4), state.request_body_limit);
+    try std.testing.expectEqual(action_config.BodyProcessor.json, state.request_body_processor.?);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(1)), (try cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(1), context);
+    try std.testing.expectEqual(action_config.EngineMode.off, tx.controlState().rule_engine);
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expectError(error.RequestBodyLimitExceeded, tx.writeRequestBody("12345"));
+}
+
+test "invalid or late runtime controls roll back the entire match" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:1,setvar:'tx.flag=1',ctl:requestBodyAccess=%{TX.missing}"
+        \\SecRule ARGS @rx "id:2,phase:2,setvar:'tx.late=1',ctl:requestBodyAccess=On"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "control-rollback.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "POST", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 5 },
+    };
+    try std.testing.expectError(error.InvalidActionValue, tx.applyMatchedRule(@fromBackingInt(0), context));
+    try std.testing.expect((try tx.collectionFirst(.tx, "flag")) == null);
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
+    try tx.processRequestBody();
+    try std.testing.expectError(error.ControlTooLate, tx.applyMatchedRule(@fromBackingInt(1), context));
+    try std.testing.expect((try tx.collectionFirst(.tx, "late")) == null);
+    try std.testing.expectEqual(@as(usize, 0), tx.matchIntentCount());
 }
 
 test "failed combined effect preflight rolls back persistent session state" {

@@ -1998,7 +1998,7 @@ const Compiler = struct {
             try self.runtime_controls.append(self.allocator, .{
                 .action_index = std.math.add(u32, start, @as(u32, @intCast(offset))) catch return error.TypedIdOverflow,
                 .kind = control.kind,
-                .value = .{ .value = try self.interner.intern(control.value), .macro = action.macro },
+                .value = .{ .value = try self.interner.intern(control.value), .macro = try self.addMacro(control.value) },
             });
         }
     }

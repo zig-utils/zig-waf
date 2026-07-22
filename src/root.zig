@@ -40,6 +40,7 @@ pub const MatchIntentId = engine.MatchIntentId;
 pub const MatchIntent = engine.MatchIntent;
 pub const FlowState = engine.FlowState;
 pub const PhaseCursor = engine.PhaseCursor;
+pub const ControlState = engine.ControlState;
 
 test {
     _ = version;
