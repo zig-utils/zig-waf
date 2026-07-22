@@ -80,7 +80,8 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             rule.actions_start + rule.actions_count > compiled.actions.len or
             rule.transformations_start + rule.transformations_count > compiled.transformations.len or
             rule.metadata.tags_start + rule.metadata.tags_count > compiled.metadata_tags.len or
-            rule.effects_start + rule.effects_count > compiled.nondisruptive_effects.len)
+            rule.effects_start + rule.effects_count > compiled.nondisruptive_effects.len or
+            rule.controls_start + rule.controls_count > compiled.runtime_controls.len)
         {
             return error.InvalidPlanFuzzRange;
         }
@@ -95,6 +96,10 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             try validateEffectText(compiled, effect.name);
             try validateEffectText(compiled, effect.value);
             try validateEffectText(compiled, effect.auxiliary);
+        }
+        for (compiled.runtime_controls[rule.controls_start..][0..rule.controls_count]) |control| {
+            if (control.action_index >= compiled.actions.len) return error.InvalidPlanFuzzEffect;
+            try validateEffectText(compiled, control.value);
         }
         if (rule.chain_position == 0 and rule.chain_head != @as(plan.RuleId, @fromBackingInt(@intCast(index))))
             return error.InvalidPlanFuzzChain;

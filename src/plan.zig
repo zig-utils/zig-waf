@@ -45,6 +45,7 @@ pub const Limits = struct {
     max_action_expansion: usize = 8_000_000,
     max_metadata_tags: usize = 2_000_000,
     max_nondisruptive_effects: usize = 4_000_000,
+    max_runtime_controls: usize = 4_000_000,
     max_configuration_warnings: usize = 1_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
@@ -78,6 +79,7 @@ pub const Limits = struct {
             self.max_action_expansion == 0 or
             self.max_metadata_tags == 0 or
             self.max_nondisruptive_effects == 0 or
+            self.max_runtime_controls == 0 or
             self.max_configuration_warnings == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
@@ -111,6 +113,7 @@ pub const Limits = struct {
             self.max_action_expansion > std.math.maxInt(u32) or
             self.max_metadata_tags > std.math.maxInt(u32) or
             self.max_nondisruptive_effects > std.math.maxInt(u32) or
+            self.max_runtime_controls > std.math.maxInt(u32) or
             self.max_configuration_warnings > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
@@ -147,6 +150,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     ActionExpansionLimitExceeded,
     TooManyMetadataTags,
     TooManyNondisruptiveEffects,
+    TooManyRuntimeControls,
     TooManyConfigurationWarnings,
     TooManyArguments,
     TooManyStrings,
@@ -170,6 +174,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     InvalidRuleMetadata,
     InvalidNondisruptiveAction,
     InvalidDisruptiveAction,
+    InvalidRuntimeControl,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -193,6 +198,7 @@ pub const DiagnosticCode = enum {
     invalid_rule_metadata,
     invalid_nondisruptive_action,
     invalid_disruptive_action,
+    invalid_runtime_control,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -220,6 +226,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_metadata => "WAF-PLAN-0117",
             .invalid_nondisruptive_action => "WAF-PLAN-0118",
             .invalid_disruptive_action => "WAF-PLAN-0119",
+            .invalid_runtime_control => "WAF-PLAN-0120",
         };
     }
 
@@ -239,6 +246,7 @@ pub const DiagnosticCode = enum {
             .invalid_rule_metadata => "rule metadata value is missing, malformed, or outside its supported range",
             .invalid_nondisruptive_action => "non-disruptive action value is missing or malformed",
             .invalid_disruptive_action => "disruptive or flow action value is missing, malformed, or conflicting",
+            .invalid_runtime_control => "runtime ctl action name or value is missing, malformed, or unsupported",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -464,6 +472,12 @@ pub const FlowDecision = struct {
     multi_match: bool = false,
 };
 
+pub const RuntimeControl = struct {
+    action_index: u32,
+    kind: action_config.ControlKind,
+    value: EffectText,
+};
+
 pub const Rule = struct {
     directive: DirectiveId,
     source: seclang.source.Span,
@@ -485,6 +499,8 @@ pub const Rule = struct {
     effects_count: u32,
     disruptive: DisruptiveDecision,
     flow: FlowDecision,
+    controls_start: u32,
+    controls_count: u32,
     removed_by: ?DirectiveId,
 };
 
@@ -528,6 +544,7 @@ const Component = struct {
     defaults: []const DefaultSnapshot,
     metadata_tags: []const MetadataText,
     nondisruptive_effects: []const NondisruptiveEffect,
+    runtime_controls: []const RuntimeControl,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -575,6 +592,7 @@ pub const Plan = struct {
     defaults: []const DefaultSnapshot,
     metadata_tags: []const MetadataText,
     nondisruptive_effects: []const NondisruptiveEffect,
+    runtime_controls: []const RuntimeControl,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -879,6 +897,7 @@ const Compiler = struct {
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
     metadata_tags: std.ArrayList(MetadataText) = .empty,
     nondisruptive_effects: std.ArrayList(NondisruptiveEffect) = .empty,
+    runtime_controls: std.ArrayList(RuntimeControl) = .empty,
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
     id_requests: std.ArrayList(rule_config.IdInterval) = .empty,
     rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
@@ -920,6 +939,7 @@ const Compiler = struct {
         self.defaults.deinit(self.allocator);
         self.metadata_tags.deinit(self.allocator);
         self.nondisruptive_effects.deinit(self.allocator);
+        self.runtime_controls.deinit(self.allocator);
         self.id_intervals.deinit(self.allocator);
         self.id_requests.deinit(self.allocator);
         self.rule_removal_operations.deinit(self.allocator);
@@ -1278,6 +1298,8 @@ const Compiler = struct {
             .effects_count = 0,
             .disruptive = .{},
             .flow = .{},
+            .controls_start = 0,
+            .controls_count = 0,
             .removed_by = null,
         });
         if (pending) |previous_id| {
@@ -1929,6 +1951,58 @@ const Compiler = struct {
         );
     }
 
+    fn compileRuntimeControls(self: *Compiler) CompileError!void {
+        for (0..self.rules.items.len) |rule_index| {
+            const rule = self.rules.items[rule_index];
+            const start = try typedIndex(self.runtime_controls.items.len);
+            if (rule.default) |default_id| {
+                const snapshot = self.defaults.items[@backingInt(default_id)];
+                try self.compileControlRange(rule, snapshot.actions_start, snapshot.actions_count);
+            }
+            try self.compileControlRange(rule, rule.actions_start, rule.actions_count);
+            self.rules.items[rule_index].controls_start = start;
+            self.rules.items[rule_index].controls_count = try typedIndex(self.runtime_controls.items.len - start);
+        }
+    }
+
+    fn compileControlRange(self: *Compiler, rule: Rule, start: u32, count: u32) CompileError!void {
+        for (self.actions.items[start..][0..count], 0..) |action, offset| {
+            const name = self.interner.values.items[@backingInt(action.name)];
+            if (!std.ascii.eqlIgnoreCase(name, "ctl")) continue;
+            if (self.runtime_controls.items.len == self.limits.max_runtime_controls)
+                return error.TooManyRuntimeControls;
+            const raw = self.actionValue(action) catch
+                return self.fail(error.InvalidRuntimeControl, rule.source, null);
+            const control = action_config.parseControl(raw) catch
+                return self.fail(error.InvalidRuntimeControl, rule.source, null);
+            if (std.mem.indexOf(u8, control.value, "%{") == null) {
+                switch (control.kind) {
+                    .rule_engine => _ = action_config.parseEngineMode(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .audit_engine => _ = action_config.parseAuditEngine(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .force_request_body_variable, .request_body_access, .response_body_access => _ = action_config.parseBoolean(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .request_body_limit => _ = action_config.parsePositiveUsize(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .request_body_processor => _ = action_config.parseBodyProcessor(control.value) catch
+                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .audit_log_parts,
+                    .rule_remove_by_id,
+                    .rule_remove_by_tag,
+                    .rule_remove_target_by_id,
+                    .rule_remove_target_by_tag,
+                    => {},
+                }
+            }
+            try self.runtime_controls.append(self.allocator, .{
+                .action_index = std.math.add(u32, start, @as(u32, @intCast(offset))) catch return error.TypedIdOverflow,
+                .kind = control.kind,
+                .value = .{ .value = try self.interner.intern(control.value), .macro = action.macro },
+            });
+        }
+    }
+
     fn compileEffectRange(self: *Compiler, rule: Rule, start: u32, count: u32) CompileError!void {
         for (self.actions.items[start..][0..count], 0..) |action, offset| {
             const name = self.interner.values.items[@backingInt(action.name)];
@@ -2057,6 +2131,7 @@ const Compiler = struct {
         try self.compileRuleMetadata();
         try self.compileNondisruptiveEffects();
         try self.compileDisruptiveAndFlow();
+        try self.compileRuntimeControls();
         try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
@@ -2086,6 +2161,7 @@ const Compiler = struct {
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
         const metadata_tags = try duplicateCounted(MetadataText, arena_allocator, self.metadata_tags.items, &owned_bytes, self.limits);
         const nondisruptive_effects = try duplicateCounted(NondisruptiveEffect, arena_allocator, self.nondisruptive_effects.items, &owned_bytes, self.limits);
+        const runtime_controls = try duplicateCounted(RuntimeControl, arena_allocator, self.runtime_controls.items, &owned_bytes, self.limits);
         const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
         const missing_rule_references = try duplicateCounted(MissingRuleReference, arena_allocator, self.missing_rule_references.items, &owned_bytes, self.limits);
         const remote_sources = try duplicateCounted(RemoteSource, arena_allocator, self.remote_sources.items, &owned_bytes, self.limits);
@@ -2118,6 +2194,7 @@ const Compiler = struct {
             .defaults = defaults,
             .metadata_tags = metadata_tags,
             .nondisruptive_effects = nondisruptive_effects,
+            .runtime_controls = runtime_controls,
             .rule_removals = rule_removals,
             .missing_rule_references = missing_rule_references,
             .remote_sources = remote_sources,
@@ -2155,6 +2232,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.defaults = component.defaults;
     plan.metadata_tags = component.metadata_tags;
     plan.nondisruptive_effects = component.nondisruptive_effects;
+    plan.runtime_controls = component.runtime_controls;
     plan.rule_removals = component.rule_removals;
     plan.missing_rule_references = component.missing_rule_references;
     plan.remote_sources = component.remote_sources;
@@ -2187,6 +2265,7 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
         !slicesEqual(MetadataText, first.metadata_tags, second.metadata_tags) or
         !slicesEqual(NondisruptiveEffect, first.nondisruptive_effects, second.nondisruptive_effects) or
+        !slicesEqual(RuntimeControl, first.runtime_controls, second.runtime_controls) or
         !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals) or
         !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references) or
         !slicesEqual(RemoteSource, first.remote_sources, second.remote_sources) or
@@ -2313,6 +2392,8 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         } else hashBool(&hasher, false);
         hashEffectText(&hasher, plan, rule.flow.skip_after_value);
         hashBool(&hasher, rule.flow.multi_match);
+        hashU32(&hasher, rule.controls_start);
+        hashU32(&hasher, rule.controls_count);
         hashOptionalId(&hasher, rule.removed_by);
     }
 
@@ -2336,6 +2417,12 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashEffectText(&hasher, plan, effect.name);
         hashEffectText(&hasher, plan, effect.value);
         hashEffectText(&hasher, plan, effect.auxiliary);
+    }
+    hashU32(&hasher, @intCast(plan.runtime_controls.len));
+    for (plan.runtime_controls) |control| {
+        hashU32(&hasher, control.action_index);
+        hashU8(&hasher, @intCast(@backingInt(control.kind)));
+        hashEffectText(&hasher, plan, control.value);
     }
 
     hashU32(&hasher, @intCast(plan.defaults.len));
@@ -2595,6 +2682,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidRuleMetadata => .invalid_rule_metadata,
         error.InvalidNondisruptiveAction => .invalid_nondisruptive_action,
         error.InvalidDisruptiveAction => .invalid_disruptive_action,
+        error.InvalidRuntimeControl => .invalid_runtime_control,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -3917,6 +4005,58 @@ test "invalid disruptive and flow values have a stable diagnostic" {
         }
     }
     try std.testing.expectEqualStrings("WAF-PLAN-0119", DiagnosticCode.invalid_disruptive_action.id());
+}
+
+test "runtime controls compile into an independently bounded typed range" {
+    const input =
+        \\SecRule ARGS @rx "id:1,ctl:ruleEngine=DetectionOnly,ctl:requestBodyAccess=Off,ctl:requestBodyProcessor=JSON,ctl:requestBodyLimit=1048576,ctl:ruleRemoveTargetById=942100;ARGS:password,ctl:auditEngine=%{TX.audit}"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "controls.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+    const rule = compiled.rules[0];
+    const controls = compiled.runtime_controls[rule.controls_start..][0..rule.controls_count];
+    try std.testing.expectEqual(@as(usize, 6), controls.len);
+    try std.testing.expectEqual(action_config.ControlKind.rule_engine, controls[0].kind);
+    try std.testing.expectEqualStrings("DetectionOnly", compiled.string(controls[0].value.value).?);
+    try std.testing.expectEqual(action_config.ControlKind.request_body_access, controls[1].kind);
+    try std.testing.expectEqual(action_config.ControlKind.request_body_processor, controls[2].kind);
+    try std.testing.expectEqual(action_config.ControlKind.request_body_limit, controls[3].kind);
+    try std.testing.expectEqual(action_config.ControlKind.rule_remove_target_by_id, controls[4].kind);
+    try std.testing.expectEqualStrings("942100;ARGS:password", compiled.string(controls[4].value.value).?);
+    try std.testing.expect(controls[5].value.macro != null);
+}
+
+test "invalid static runtime controls have a stable diagnostic" {
+    const cases = [_][]const u8{
+        "SecRule ARGS @rx \"id:1,ctl:unknown=On\"",
+        "SecRule ARGS @rx \"id:1,ctl:ruleEngine=Enabled\"",
+        "SecRule ARGS @rx \"id:1,ctl:auditEngine=Sometimes\"",
+        "SecRule ARGS @rx \"id:1,ctl:requestBodyAccess=Yes\"",
+        "SecRule ARGS @rx \"id:1,ctl:requestBodyLimit=0\"",
+        "SecRule ARGS @rx \"id:1,ctl:requestBodyProcessor=YAML\"",
+    };
+    for (cases) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-control.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |diagnostic| try std.testing.expectEqual(DiagnosticCode.invalid_runtime_control, diagnostic.code),
+        }
+    }
+    try std.testing.expectEqualStrings("WAF-PLAN-0120", DiagnosticCode.invalid_runtime_control.id());
+}
+
+test "runtime control storage has an independent resource limit" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "control-limits.conf", "SecRule ARGS @rx \"id:1,ctl:requestBodyAccess=On,ctl:responseBodyAccess=Off\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(error.TooManyRuntimeControls, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_runtime_controls = 1 }));
 }
 
 test "structural plan evidence is valid and pinned to compiler ABI" {
