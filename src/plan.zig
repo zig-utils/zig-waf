@@ -7,6 +7,8 @@ pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
 pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
+pub const compiler_abi_version: u32 = 1;
+pub const Fingerprint = [32]u8;
 
 pub const Limits = struct {
     max_documents: usize = 4096,
@@ -262,6 +264,8 @@ pub const Rule = struct {
 pub const Plan = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    compiler_abi: u32,
+    fingerprint: Fingerprint,
     strings: []const StringRange,
     string_bytes: []const u8,
     sources: []const SourceRecord,
@@ -720,6 +724,8 @@ const Compiler = struct {
         plan.* = .{
             .allocator = self.allocator,
             .arena = arena,
+            .compiler_abi = compiler_abi_version,
+            .fingerprint = undefined,
             .strings = strings.ranges,
             .string_bytes = strings.bytes,
             .sources = source_data.records,
@@ -738,9 +744,141 @@ const Compiler = struct {
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
         };
+        plan.fingerprint = computeFingerprint(plan);
         return plan;
     }
 };
+
+fn computeFingerprint(plan: *const Plan) Fingerprint {
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update("zig-waf structural plan\x00");
+    hashU32(&hasher, compiler_abi_version);
+
+    hashU32(&hasher, @intCast(plan.directives.len));
+    for (plan.directives) |directive| {
+        hashString(&hasher, plan.string(directive.name).?);
+        hashU8(&hasher, @intCast(@backingInt(directive.kind)));
+        hashU32(&hasher, directive.arguments_count);
+        hashU32(&hasher, directive.actions_count);
+        hashOptionalId(&hasher, directive.rule);
+    }
+    hashU32(&hasher, @intCast(plan.arguments.len));
+    for (plan.arguments) |argument| {
+        hashString(&hasher, plan.string(argument.raw).?);
+        hashU8(&hasher, @intCast(@backingInt(argument.quote)));
+    }
+    hashU32(&hasher, @intCast(plan.targets.len));
+    for (plan.targets) |target| {
+        hashU8(&hasher, @intCast(@backingInt(target.modifier)));
+        hashString(&hasher, plan.string(target.collection).?);
+        hashOptionalString(&hasher, plan, target.selector);
+    }
+    hashU32(&hasher, @intCast(plan.actions.len));
+    for (plan.actions) |action| {
+        hashString(&hasher, plan.string(action.name).?);
+        hashOptionalString(&hasher, plan, action.value);
+        hashU8(&hasher, @intCast(@backingInt(action.class)));
+    }
+    hashU32(&hasher, @intCast(plan.transformations.len));
+    for (plan.transformations) |transformation| hashString(&hasher, plan.string(transformation.name).?);
+    hashU32(&hasher, @intCast(plan.prefilter_literals.len));
+    for (plan.prefilter_literals) |literal| hashString(&hasher, plan.string(literal).?);
+
+    hashU32(&hasher, @intCast(plan.rules.len));
+    for (plan.rules) |rule| {
+        hashU32(&hasher, @backingInt(rule.directive));
+        hashOptionalU64(&hasher, rule.external_id);
+        hashU8(&hasher, rule.phase);
+        hashOptionalId(&hasher, rule.default);
+        hashU32(&hasher, @backingInt(rule.chain_head));
+        hashOptionalId(&hasher, rule.chain_next);
+        hashU32(&hasher, rule.chain_position);
+        hashU32(&hasher, rule.targets_start);
+        hashU32(&hasher, rule.targets_count);
+        hashString(&hasher, plan.string(rule.operator.name).?);
+        hashString(&hasher, plan.string(rule.operator.parameter).?);
+        hashBool(&hasher, rule.operator.negated);
+        hashBool(&hasher, rule.operator.implicit_regex);
+        if (rule.operator.prefilter) |prefilter| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, @intCast(@backingInt(prefilter.kind)));
+            hashU32(&hasher, prefilter.literals_start);
+            hashU32(&hasher, prefilter.literals_count);
+        } else hashBool(&hasher, false);
+        hashU32(&hasher, rule.actions_start);
+        hashU32(&hasher, rule.actions_count);
+        hashU32(&hasher, rule.transformations_start);
+        hashU32(&hasher, rule.transformations_count);
+    }
+
+    hashU32(&hasher, @intCast(plan.defaults.len));
+    for (plan.defaults) |snapshot| {
+        hashU8(&hasher, snapshot.phase);
+        hashU32(&hasher, snapshot.actions_start);
+        hashU32(&hasher, snapshot.actions_count);
+    }
+    for (plan.phase_rules) |rules| {
+        hashU32(&hasher, @intCast(rules.len));
+        for (rules) |rule| hashU32(&hasher, @backingInt(rule));
+    }
+    hashU32(&hasher, @intCast(plan.markers.len));
+    for (plan.markers) |marker| {
+        hashU32(&hasher, @backingInt(marker.directive));
+        hashString(&hasher, plan.string(marker.name).?);
+    }
+    hashU32(&hasher, @intCast(plan.generic_directives.len));
+    for (plan.generic_directives) |directive| hashU32(&hasher, @backingInt(directive));
+
+    var result: Fingerprint = undefined;
+    hasher.final(&result);
+    return result;
+}
+
+fn hashString(hasher: *std.crypto.hash.Blake3, value: []const u8) void {
+    hashU32(hasher, @intCast(value.len));
+    hasher.update(value);
+}
+
+fn hashOptionalString(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value: ?StringId) void {
+    if (value) |id| {
+        hashBool(hasher, true);
+        hashString(hasher, plan.string(id).?);
+    } else hashBool(hasher, false);
+}
+
+fn hashOptionalId(hasher: *std.crypto.hash.Blake3, value: anytype) void {
+    if (value) |id| {
+        hashBool(hasher, true);
+        hashU32(hasher, @backingInt(id));
+    } else hashBool(hasher, false);
+}
+
+fn hashOptionalU64(hasher: *std.crypto.hash.Blake3, value: ?u64) void {
+    if (value) |number| {
+        hashBool(hasher, true);
+        hashU64(hasher, number);
+    } else hashBool(hasher, false);
+}
+
+fn hashBool(hasher: *std.crypto.hash.Blake3, value: bool) void {
+    hashU8(hasher, @intFromBool(value));
+}
+
+fn hashU8(hasher: *std.crypto.hash.Blake3, value: u8) void {
+    hasher.update(&.{value});
+}
+
+fn hashU32(hasher: *std.crypto.hash.Blake3, value: u32) void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, value, .little);
+    hasher.update(&bytes);
+}
+
+fn hashU64(hasher: *std.crypto.hash.Blake3, value: u64) void {
+    var bytes: [8]u8 = undefined;
+    std.mem.writeInt(u64, &bytes, value, .little);
+    hasher.update(&bytes);
+}
 
 fn explicitRuleId(actions: []const seclang.syntax.Action) CompileError!?u64 {
     for (actions) |action| {
@@ -1200,4 +1338,32 @@ test "source reference limit is independent of document count" {
     defer document.deinit();
     var documents = [_]seclang.parser.Document{document};
     try std.testing.expectError(error.TooManySourceReferences, compile(std.testing.allocator, &registry, &documents, .{ .max_source_references = 1 }));
+}
+
+test "fingerprints are deterministic semantic identities independent of paths" {
+    const input =
+        \\SecDefaultAction "phase:2,pass,t:lowercase"
+        \\SecRule ARGS "@contains attack" "id:100,deny"
+        \\SecMarker END
+    ;
+    var first = try seclang.parser.parseBytes(std.testing.allocator, "/tmp/first/rules.conf", input, .{}, .{});
+    defer first.deinit();
+    var second = try seclang.parser.parseBytes(std.testing.allocator, "/different/root/rules.conf", input, .{}, .{});
+    defer second.deinit();
+    var changed = try seclang.parser.parseBytes(std.testing.allocator, "/tmp/first/rules.conf", "SecRule ARGS \"@contains changed\" id:100", .{}, .{});
+    defer changed.deinit();
+    var first_documents = [_]seclang.parser.Document{first.document};
+    var second_documents = [_]seclang.parser.Document{second.document};
+    var changed_documents = [_]seclang.parser.Document{changed.document};
+    const first_plan = try compile(std.testing.allocator, &first.registry, &first_documents, .{});
+    defer first_plan.deinit();
+    const second_plan = try compile(std.testing.allocator, &second.registry, &second_documents, .{});
+    defer second_plan.deinit();
+    const changed_plan = try compile(std.testing.allocator, &changed.registry, &changed_documents, .{});
+    defer changed_plan.deinit();
+
+    try std.testing.expectEqual(compiler_abi_version, first_plan.compiler_abi);
+    try std.testing.expectEqualSlices(u8, &first_plan.fingerprint, &second_plan.fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, &first_plan.fingerprint, &changed_plan.fingerprint));
+    try std.testing.expect(!std.mem.allEqual(u8, &first_plan.fingerprint, 0));
 }
