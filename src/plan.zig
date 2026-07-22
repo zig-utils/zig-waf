@@ -1994,9 +1994,13 @@ const Compiler = struct {
                             return self.fail(error.InvalidRuntimeControl, rule.source, null);
                         _ = action_config.parseIdRange(target.selector) catch
                             return self.fail(error.InvalidRuntimeControl, rule.source, null);
+                        try self.validateRuntimeTarget(rule, target.target);
                     },
-                    .rule_remove_target_by_tag => _ = action_config.parseTargetControl(control.value) catch
-                        return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                    .rule_remove_target_by_tag => {
+                        const target = action_config.parseTargetControl(control.value) catch
+                            return self.fail(error.InvalidRuntimeControl, rule.source, null);
+                        try self.validateRuntimeTarget(rule, target.target);
+                    },
                     .audit_log_parts => _ = action_config.applyAuditParts(.{}, control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .rule_remove_by_tag,
@@ -2008,6 +2012,21 @@ const Compiler = struct {
                 .kind = control.kind,
                 .value = .{ .value = try self.interner.intern(control.value), .macro = try self.addMacro(control.value) },
             });
+        }
+    }
+
+    fn validateRuntimeTarget(self: *Compiler, rule: Rule, value: []const u8) CompileError!void {
+        const parsed = action_config.parseRuntimeTarget(value) catch
+            return self.fail(error.InvalidRuntimeControl, rule.source, null);
+        switch (parsed) {
+            .exact => {},
+            .regex => |target| {
+                var compiled = regex.Regex.compile(self.allocator, target.pattern) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return self.fail(error.InvalidRuntimeControl, rule.source, null),
+                };
+                compiled.deinit();
+            },
         }
     }
 
@@ -4049,6 +4068,8 @@ test "invalid static runtime controls have a stable diagnostic" {
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetById=20-10;ARGS:x\"",
         "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetByTag=tag-only\"",
         "SecRule ARGS @rx \"id:1,ctl:auditLogParts=BCZ\"",
+        "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetById=1;ARGS://\"",
+        "SecRule ARGS @rx \"id:1,ctl:ruleRemoveTargetById=1;ARGS:/[invalid/\"",
     };
     for (cases) |input| {
         var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-control.conf", input, .{}, .{});

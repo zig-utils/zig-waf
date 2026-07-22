@@ -44,6 +44,7 @@ pub const PhaseCursor = engine.PhaseCursor;
 pub const ControlState = engine.ControlState;
 pub const RuleExclusion = engine.RuleExclusion;
 pub const TargetExclusion = engine.TargetExclusion;
+pub const RegexTargetExclusion = engine.RegexTargetExclusion;
 pub const InterventionCapabilities = engine.InterventionCapabilities;
 
 test {

@@ -79,6 +79,14 @@ pub const TargetControl = struct {
     target: []const u8,
 };
 
+pub const RuntimeTarget = union(enum) {
+    exact: []const u8,
+    regex: struct {
+        collection: []const u8,
+        pattern: []const u8,
+    },
+};
+
 pub const Severity = enum(u3) {
     emergency = 0,
     alert = 1,
@@ -342,6 +350,23 @@ pub fn parseTargetControl(value: []const u8) ParseError!TargetControl {
     return .{ .selector = value[0..separator], .target = value[separator + 1 ..] };
 }
 
+pub fn parseRuntimeTarget(value: []const u8) ParseError!RuntimeTarget {
+    const colon = std.mem.indexOfScalar(u8, value, ':') orelse return .{ .exact = value };
+    if (colon == 0 or colon + 1 == value.len) return error.InvalidVariable;
+    const key = value[colon + 1 ..];
+    if (key[0] != '/' or key.len < 2 or key[key.len - 1] != '/' or closingSlashEscaped(key))
+        return .{ .exact = value };
+    if (key.len == 2) return error.InvalidOperation;
+    return .{ .regex = .{ .collection = value[0..colon], .pattern = key[1 .. key.len - 1] } };
+}
+
+fn closingSlashEscaped(value: []const u8) bool {
+    var backslashes: usize = 0;
+    var index = value.len - 1;
+    while (index != 0 and value[index - 1] == '\\') : (index -= 1) backslashes += 1;
+    return backslashes % 2 == 1;
+}
+
 pub fn applyAuditParts(base: AuditParts, value: []const u8) ParseError!AuditParts {
     if (value.len == 0) return error.MissingValue;
     var result = base;
@@ -463,6 +488,10 @@ test "runtime control names and body values parse without allocation" {
     try std.testing.expectEqualDeep(TargetControl{ .selector = "942100", .target = "ARGS:password" }, try parseTargetControl("942100;ARGS:password"));
     try std.testing.expectError(error.InvalidOperation, parseTargetControl("942100"));
     try std.testing.expectError(error.InvalidOperation, parseTargetControl(";ARGS"));
+    try std.testing.expectEqualDeep(RuntimeTarget{ .exact = "ARGS:user" }, try parseRuntimeTarget("ARGS:user"));
+    try std.testing.expectEqualDeep(RuntimeTarget{ .regex = .{ .collection = "ARGS", .pattern = "^json\\.\\d+$" } }, try parseRuntimeTarget("ARGS:/^json\\.\\d+$/"));
+    try std.testing.expectEqualDeep(RuntimeTarget{ .exact = "ARGS:/user\\/" }, try parseRuntimeTarget("ARGS:/user\\/"));
+    try std.testing.expectError(error.InvalidOperation, parseRuntimeTarget("ARGS://"));
 }
 
 test "audit log parts support absolute and incremental stable syntax" {
