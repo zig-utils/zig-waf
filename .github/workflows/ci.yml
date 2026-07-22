@@ -116,6 +116,12 @@ jobs:
           -Ddirective-corpus=../owasp-crs/rules
           -Ddirective-corpus=../modsecurity
           -Ddirective-corpus=../coraza
+      - name: Ordered CRS directive configuration
+        working-directory: zig-waf
+        run: >-
+          zig build test-crs-configuration
+          -Dcrs-configuration=../owasp-crs/crs-setup.conf.example
+          -Dcrs-configuration=../owasp-crs/rules
       - name: CRS parser benchmark
         working-directory: zig-waf
         run: >-

@@ -138,6 +138,22 @@ pub fn build(b: *std.Build) void {
     const directive_inventory_step = b.step("test-directive-inventory", "Compare the registry with pinned upstream inventories");
     directive_inventory_step.dependOn(&run_directive_inventory.step);
 
+    const crs_configuration_module = b.createModule(.{
+        .root_source_file = b.path("tools/crs_configuration.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    crs_configuration_module.addImport("waf", waf);
+    const crs_configuration = b.addExecutable(.{
+        .name = "crs-configuration",
+        .root_module = crs_configuration_module,
+    });
+    const run_crs_configuration = b.addRunArtifact(crs_configuration);
+    if (b.option([]const []const u8, "crs-configuration", "Ordered CRS configuration root (repeatable)")) |roots|
+        run_crs_configuration.addArgs(roots);
+    const crs_configuration_step = b.step("test-crs-configuration", "Compile CRS as one ordered directive configuration");
+    crs_configuration_step.dependOn(&run_crs_configuration.step);
+
     const parser_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_fuzz.zig"),
         .target = target,
