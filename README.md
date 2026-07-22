@@ -40,6 +40,9 @@ The complete implementation graph is tracked by the
 [WAF roadmap](https://github.com/zig-utils/zig-waf/issues/1).
 The bounded syntax and include contracts are documented in
 [`docs/seclang-parser.md`](docs/seclang-parser.md).
+The typed byte semantics, compatibility profiles, ownership, and security
+constraints for transformations are documented in
+[`docs/transformations.md`](docs/transformations.md).
 
 ## License
 
