@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "issue": "WAF-11",
   "zig": "0.17.0-dev.1441+d5181a9c9",
-  "compilerAbi": 4,
+  "compilerAbi": 5,
   "structuralOnly": true,
   "baselines": [
     {
@@ -28,7 +28,7 @@
     "directives": 925,
     "plans": 58,
     "rules": 761,
-    "planOwnedBytes": 2651638,
+    "planOwnedBytes": 2654638,
     "unexplainedExclusions": 0
   },
   "hostedBenchmark": {

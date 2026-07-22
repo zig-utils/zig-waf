@@ -73,7 +73,7 @@ expressions are source-anchored configuration diagnostics.
 ## Identity and diagnostics
 
 The public 32-byte fingerprint is BLAKE3 over typed semantic values and
-resolved string bytes. It is domain-separated by compiler ABI version 4 and
+resolved string bytes. It is domain-separated by compiler ABI version 5 and
 does not include allocator addresses, native struct padding, filesystem paths,
 or source offsets. Identical ordered configuration at unrelated paths therefore
 has the same public identity. The compiler ABI must change whenever the

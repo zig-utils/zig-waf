@@ -113,10 +113,13 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             return error.InvalidPlanFuzzMacro;
         for (compiled.macro_tokens[program.tokens_start..][0..program.tokens_count]) |token| {
             if (token.source_start + token.source_length > source.len) return error.InvalidPlanFuzzMacro;
-            if (token.kind == .literal and (token.name != null or token.key != null)) return error.InvalidPlanFuzzMacro;
+            if (token.kind == .literal and (token.name != null or token.key != null or token.scalar != null or token.collection != null))
+                return error.InvalidPlanFuzzMacro;
             if (token.kind != .literal and (token.name == null or compiled.string(token.name.?) == null))
                 return error.InvalidPlanFuzzMacro;
             if (token.key) |key| _ = compiled.string(key) orelse return error.InvalidPlanFuzzMacro;
+            if (token.kind == .scalar and token.collection != null) return error.InvalidPlanFuzzMacro;
+            if (token.kind == .collection and token.scalar != null) return error.InvalidPlanFuzzMacro;
         }
     }
     var nonindexed_rules: usize = 0;

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "issue": "WAF-13",
   "zig": "0.17.0-dev.1441+d5181a9c9",
-  "compilerAbi": 4,
+  "compilerAbi": 5,
   "baselines": {
     "modsecurity": {
       "version": "3.0.16",

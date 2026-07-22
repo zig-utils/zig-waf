@@ -2,7 +2,9 @@
 
 const std = @import("std");
 const action_config = @import("action_config.zig");
+const collections = @import("collections.zig");
 const seclang = @import("seclang/root.zig");
+const variables = @import("variables.zig");
 const rule_config = @import("rule_config.zig");
 const remote_rules = @import("remote_rules.zig");
 const regex = @import("regex");
@@ -13,7 +15,7 @@ pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
 pub const MarkerId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 4;
+pub const compiler_abi_version: u32 = 5;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
@@ -356,6 +358,8 @@ pub const MacroToken = struct {
     source_length: u32,
     name: ?StringId = null,
     key: ?StringId = null,
+    scalar: ?variables.Name = null,
+    collection: ?collections.Name = null,
 };
 
 pub const MacroProgram = struct {
@@ -1397,13 +1401,23 @@ const Compiler = struct {
                     .source_length = try typedIndex(close + 1 - marker),
                     .name = try self.interner.intern(expression[0..dot]),
                     .key = try self.interner.intern(expression[dot + 1 ..]),
+                    .collection = collections.Name.parse(expression[0..dot]),
                 });
             } else {
-                try self.appendMacroToken(.{
+                const scalar = variables.Name.parse(expression);
+                const collection = collections.Name.parse(expression);
+                try self.appendMacroToken(if (collection != null and scalar == null) .{
+                    .kind = .collection,
+                    .source_start = try typedIndex(marker),
+                    .source_length = try typedIndex(close + 1 - marker),
+                    .name = try self.interner.intern(expression),
+                    .collection = collection,
+                } else .{
                     .kind = .scalar,
                     .source_start = try typedIndex(marker),
                     .source_length = try typedIndex(close + 1 - marker),
                     .name = try self.interner.intern(expression),
+                    .scalar = scalar,
                 });
             }
             cursor = close + 1;
@@ -2208,6 +2222,14 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashU32(&hasher, token.source_length);
         hashOptionalString(&hasher, plan, token.name);
         hashOptionalString(&hasher, plan, token.key);
+        if (token.scalar) |scalar| {
+            hashBool(&hasher, true);
+            hashU32(&hasher, @intCast(@backingInt(scalar)));
+        } else hashBool(&hasher, false);
+        if (token.collection) |collection| {
+            hashBool(&hasher, true);
+            hashU32(&hasher, @intCast(@backingInt(collection)));
+        } else hashBool(&hasher, false);
     }
 
     var result: Fingerprint = undefined;
@@ -3463,9 +3485,25 @@ test "macro-bearing values compile into immutable deduplicated token programs" {
     try std.testing.expectEqual(MacroTokenKind.literal, tokens[0].kind);
     try std.testing.expectEqual(MacroTokenKind.scalar, tokens[1].kind);
     try std.testing.expectEqualStrings("REQUEST_URI", compiled.string(tokens[1].name.?).?);
+    try std.testing.expectEqual(variables.Name.request_uri, tokens[1].scalar.?);
     try std.testing.expectEqual(MacroTokenKind.collection, tokens[3].kind);
     try std.testing.expectEqualStrings("TX", compiled.string(tokens[3].name.?).?);
     try std.testing.expectEqualStrings("user", compiled.string(tokens[3].key.?).?);
+    try std.testing.expectEqual(collections.Name.tx, tokens[3].collection.?);
+}
+
+test "unkeyed collection macros retain a typed collection descriptor" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "collection-macro.conf", "SecRule ARGS @rx \"id:1,msg:'%{ARGS}'\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+    const program = compiled.macro_programs[@backingInt(compiled.rules[0].metadata.message.?.macro.?)];
+    const token = compiled.macro_tokens[program.tokens_start];
+    try std.testing.expectEqual(MacroTokenKind.collection, token.kind);
+    try std.testing.expectEqual(collections.Name.args, token.collection.?);
+    try std.testing.expect(token.scalar == null);
+    try std.testing.expect(token.key == null);
 }
 
 test "malformed macros diagnose their containing operator or action" {
