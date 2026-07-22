@@ -373,7 +373,7 @@ pub const registry = [_]Entry{
     row(.sec_server_signature, "SecServerSignature", .text, .singular_replace, .core, MC, 13),
     row(.sec_sensor_id, "SecSensorId", .text, .singular_replace, .core, MC, 13),
     row(.sec_status_engine, "SecStatusEngine", .toggle, .singular_replace, .core, M, 13),
-    row(.sec_rule_script, "SecRuleScript", .path, .append, .rule_script, M, 22),
+    row(.sec_rule_script, "SecRuleScript", .path, .append, .rule_script, MC, 22),
 
     row(.sec_request_body_access, "SecRequestBodyAccess", .toggle, .singular_replace, .request_body, MCR, 27),
     row(.sec_request_body_limit, "SecRequestBodyLimit", .unsigned, .singular_replace, .request_body, MCR, 25),
@@ -423,7 +423,7 @@ pub const registry = [_]Entry{
     row(.sec_rule_remove_by_msg, "SecRuleRemoveByMsg", .regex, .append, .rule_updates, MC, 14),
     row(.sec_rule_remove_by_tag, "SecRuleRemoveByTag", .regex, .append, .rule_updates, MC, 14),
     row(.sec_rule_update_target_by_id, "SecRuleUpdateTargetById", .rule_update, .append, .rule_updates, MC, 14),
-    row(.sec_rule_update_target_by_msg, "SecRuleUpdateTargetByMsg", .rule_update, .append, .rule_updates, M, 14),
+    row(.sec_rule_update_target_by_msg, "SecRuleUpdateTargetByMsg", .rule_update, .append, .rule_updates, MC, 14),
     row(.sec_rule_update_target_by_tag, "SecRuleUpdateTargetByTag", .rule_update, .append, .rule_updates, MC, 14),
     row(.sec_rule_update_action_by_id, "SecRuleUpdateActionById", .rule_update, .append, .rule_updates, MC, 14),
     row(.sec_rule_inheritance, "SecRuleInheritance", .toggle, .singular_replace, .rule_updates, M, 14),
@@ -448,7 +448,7 @@ pub const registry = [_]Entry{
     row(.sec_hash_method_rx, "SecHashMethodRx", .hash_parameter, .append, .hashing, MC, 21),
     row(.sec_hash_method_pm, "SecHashMethodPm", .hash_parameter, .append, .hashing, MC, 21),
     row(.sec_unicode_map, "SecUnicodeMap", .unicode_map, .singular_replace, .unicode_map, C, 17),
-    row(.sec_unicode_map_file, "SecUnicodeMapFile", .unicode_map, .singular_replace, .unicode_map, MC, 17),
+    row(.sec_unicode_map_file, "SecUnicodeMapFile", .unicode_map, .singular_replace, .unicode_map, M, 17),
     row(.sec_xml_external_entity, "SecXmlExternalEntity", .toggle, .singular_replace, .xml, M, 28),
     row(.sec_parse_xml_into_args, "SecParseXmlIntoArgs", .toggle, .singular_replace, .xml, M, 28),
 };

@@ -100,6 +100,12 @@ jobs:
           -Dplan-corpus=../owasp-crs/rules
           -Dplan-corpus=../modsecurity
           -Dplan-corpus=../coraza
+      - name: Stable directive inventory
+        working-directory: zig-waf
+        run: >-
+          zig build test-directive-inventory
+          -Dmodsecurity-scanner=../modsecurity/src/parser/seclang-scanner.ll
+          -Dcoraza-directives=../coraza/internal/seclang/directivesmap.gen.go
       - name: Stable directive corpus
         working-directory: zig-waf
         run: >-

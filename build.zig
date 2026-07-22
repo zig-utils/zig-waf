@@ -118,6 +118,24 @@ pub fn build(b: *std.Build) void {
     const directive_corpus_step = b.step("test-directive-corpus", "Validate stable directives beneath corpus roots");
     directive_corpus_step.dependOn(&run_directive_corpus.step);
 
+    const directive_inventory_module = b.createModule(.{
+        .root_source_file = b.path("tools/directive_inventory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    directive_inventory_module.addImport("waf", waf);
+    const directive_inventory = b.addExecutable(.{
+        .name = "directive-inventory",
+        .root_module = directive_inventory_module,
+    });
+    const run_directive_inventory = b.addRunArtifact(directive_inventory);
+    if (b.option([]const u8, "modsecurity-scanner", "Pinned ModSecurity seclang-scanner.ll")) |path|
+        run_directive_inventory.addArg(path);
+    if (b.option([]const u8, "coraza-directives", "Pinned Coraza directivesmap.gen.go")) |path|
+        run_directive_inventory.addArg(path);
+    const directive_inventory_step = b.step("test-directive-inventory", "Compare the registry with pinned upstream inventories");
+    directive_inventory_step.dependOn(&run_directive_inventory.step);
+
     const parser_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_fuzz.zig"),
         .target = target,
