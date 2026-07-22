@@ -1,0 +1,132 @@
+{
+  "schema_version": 1,
+  "baselines": {
+    "modsecurity": "3.0.16",
+    "coraza": "3.7.0",
+    "crs": "4.28.0",
+    "libinjection": "4.0.0",
+    "zig": "0.17.0-dev.1441+d5181a9c9"
+  },
+  "features": [
+    {
+      "id": "build.zig-0.17-pantry",
+      "area": "build",
+      "name": "Zig 0.17-dev resolved and locked by Pantry",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/3",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": ["deps.yaml", "pantry.lock", ".github/workflows/ci.yml"],
+      "notes": "The exact compiler build is locked locally and in CI."
+    },
+    {
+      "id": "build.no-submodules",
+      "area": "build",
+      "name": "No Git submodules",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/5",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [".github/workflows/ci.yml", "dependencies.lock.json"],
+      "notes": "Sibling repositories are locked by commit and checked out directly in CI."
+    },
+    {
+      "id": "api.transaction-lifecycle",
+      "area": "engine",
+      "name": "Five inspection phases plus logging lifecycle",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/7",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": ["src/engine.zig"],
+      "notes": "Connector transitions and limits are implemented; rule execution in each phase remains."
+    },
+    {
+      "id": "api.detection-only",
+      "area": "engine",
+      "name": "Detection-only interventions",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/7",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": ["src/engine.zig"],
+      "notes": "Interventions preserve evidence and are marked non-enforcing; action precedence remains."
+    },
+    {
+      "id": "operator.detect-sqli",
+      "area": "operators",
+      "name": "SQL injection detection",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/20",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": ["src/operators.zig", "https://github.com/zig-utils/zig-injection/issues/1"],
+      "notes": "Native adapter is live; complete libinjection differential parity is not yet claimed."
+    },
+    {
+      "id": "api.c-connector",
+      "area": "connectors",
+      "name": "Versioned C connector ABI",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/33",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": false,
+      "evidence": ["include/zig_waf.h", "src/c_api.zig", "tests/c_api_smoke.c"],
+      "notes": "Opaque ownership, sized structs, lifecycle, feature discovery, and errors are implemented; callbacks and ABI matrix remain."
+    },
+    {
+      "id": "fleet.postgresql-18",
+      "area": "fleet",
+      "name": "Pantry-managed PostgreSQL 18 and native libpq 18",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/51",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": ["deps.yaml", "pantry.lock"],
+      "notes": "Packages are locked; per-project cluster/port isolation is still required."
+    },
+    {
+      "id": "ui.stx-embedded-assets",
+      "area": "ui",
+      "name": "STX development and embedded production assets",
+      "status": "planned",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/61",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": ["console/README.md", "dependencies.lock.json"],
+      "notes": "The workspace and pinned STX source exist; the fingerprinted asset compiler remains."
+    },
+    {
+      "id": "proxy.http1",
+      "area": "proxy",
+      "name": "HTTP/1.1 reverse proxy",
+      "status": "planned",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/41",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [],
+      "notes": "Standalone data-plane implementation has not started."
+    },
+    {
+      "id": "proxy.http2",
+      "area": "proxy",
+      "name": "HTTP/2 reverse proxy through nghttp2",
+      "status": "planned",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/42",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [],
+      "notes": "The adapter is scheduled after HTTP/1.1 framing and backpressure."
+    }
+  ]
+}
