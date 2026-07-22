@@ -310,6 +310,21 @@ pub const Session = struct {
         return false;
     }
 
+    /// Roll back a just-created binding when the caller cannot publish its
+    /// loaded snapshot into transaction-local collection storage.
+    pub fn cancelInitialization(self: *Session, namespace: Namespace) void {
+        for (self.bindings.items, 0..) |binding, index| {
+            if (binding.namespace != namespace or binding.mutations.items.len != 0) continue;
+            _ = self.bindings.swapRemove(index);
+            return;
+        }
+    }
+
+    pub fn discardLastMutation(self: *Session, namespace: Namespace) void {
+        const binding = self.findBinding(namespace) orelse return;
+        if (binding.mutations.items.len != 0) _ = binding.mutations.pop();
+    }
+
     pub fn deinit(self: *Session) void {
         self.bindings.deinit(self.arena.allocator());
         self.arena.deinit();
@@ -517,7 +532,7 @@ fn applyMutations(record: *OwnedRecord, mutations: []const Mutation, limits: Lim
             if (add.name.len == 0 or add.name.len > limits.max_variable_name_bytes) return error.InvalidMutation;
             const index = findValue(record.values.items, add.name);
             const current = if (index) |value_index|
-                std.fmt.parseInt(i64, record.values.items[value_index].value, 10) catch 0
+                parseNumericOrZero(record.values.items[value_index].value)
             else
                 0;
             const next = std.math.add(i64, current, add.delta) catch return error.CapacityExceeded;
@@ -567,6 +582,32 @@ fn findValue(values: []const Value, name: []const u8) ?usize {
         if (std.ascii.eqlIgnoreCase(value.name, name)) return index;
     }
     return null;
+}
+
+/// Compatibility parser for ModSecurity's `std::stoi`-based setvar arithmetic:
+/// leading ASCII whitespace and a sign are accepted, parsing stops after the
+/// decimal prefix, and missing/invalid/out-of-range input becomes zero.
+pub fn parseNumericOrZero(input: []const u8) i64 {
+    var index: usize = 0;
+    while (index < input.len and std.ascii.isWhitespace(input[index])) index += 1;
+    var negative = false;
+    if (index < input.len and (input[index] == '+' or input[index] == '-')) {
+        negative = input[index] == '-';
+        index += 1;
+    }
+    const digit_start = index;
+    const positive_limit: u64 = std.math.maxInt(i64);
+    const limit = positive_limit + @intFromBool(negative);
+    var magnitude: u64 = 0;
+    while (index < input.len and std.ascii.isDigit(input[index])) : (index += 1) {
+        magnitude = std.math.mul(u64, magnitude, 10) catch return 0;
+        magnitude = std.math.add(u64, magnitude, input[index] - '0') catch return 0;
+        if (magnitude > limit) return 0;
+    }
+    if (index == digit_start) return 0;
+    if (!negative) return @intCast(magnitude);
+    if (magnitude == positive_limit + 1) return std.math.minInt(i64);
+    return -@as(i64, @intCast(magnitude));
 }
 
 fn lock(mutex: *std.atomic.Mutex) void {

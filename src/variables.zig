@@ -301,6 +301,7 @@ pub const Origin = enum {
     compatibility,
     engine,
     rule,
+    persistent,
     connector,
 };
 

@@ -3,6 +3,7 @@
 const std = @import("std");
 const collections = @import("collections.zig");
 const macros = @import("macros.zig");
+const persistent = @import("persistent.zig");
 const variables = @import("variables.zig");
 
 pub const Mode = enum {
@@ -18,6 +19,7 @@ pub const Feature = enum(u6) {
     scalar_variables,
     collection_variables,
     runtime_macros,
+    persistent_collections,
     atomic_hot_reload,
 };
 
@@ -76,6 +78,9 @@ pub const Config = struct {
     mode: Mode = .enabled,
     limits: Limits = .{},
     macro_missing_policy: macros.MissingPolicy = .empty,
+    persistent_backend: ?persistent.Backend = null,
+    persistent_limits: persistent.Limits = .{},
+    persistent_failure_policy: persistent.FailurePolicy = .fail_closed,
 };
 
 pub const ClockSample = struct {
@@ -151,8 +156,21 @@ pub const Builder = struct {
         self.config.macro_missing_policy = policy;
     }
 
+    pub fn setPersistentBackend(self: *Builder, backend: persistent.Backend) void {
+        self.config.persistent_backend = backend;
+    }
+
+    pub fn setPersistentLimits(self: *Builder, limits: persistent.Limits) void {
+        self.config.persistent_limits = limits;
+    }
+
+    pub fn setPersistentFailurePolicy(self: *Builder, policy: persistent.FailurePolicy) void {
+        self.config.persistent_failure_policy = policy;
+    }
+
     pub fn build(self: *const Builder) (ConfigError || std.mem.Allocator.Error)!*Waf {
         try self.config.limits.validate();
+        self.config.persistent_limits.validate() catch return error.InvalidLimit;
         const waf = try self.allocator.create(Waf);
         waf.* = .{
             .allocator = self.allocator,
@@ -193,6 +211,10 @@ pub const Waf = struct {
             .waf = self,
             .scalar_variables = variables.Store.init(self.allocator),
             .collection_variables = collections.Store.init(self.allocator, self.config.limits.collection_limits),
+            .persistent_session = if (self.config.persistent_backend) |backend|
+                persistent.Session.init(self.allocator, backend, self.config.persistent_limits) catch unreachable
+            else
+                null,
             .started_real_nanoseconds = started.unix_nanoseconds,
             .started_awake_nanoseconds = started.awake_nanoseconds,
             .sequence = @constCast(&self.transaction_sequence).fetchAdd(1, .monotonic),
@@ -328,7 +350,9 @@ pub const TransactionError = error{
     ClockBeforeUnixEpoch,
     MacroOutputTooLarge,
     CollectionSizeOverflow,
-} || variables.StoreError || collections.StoreError || collections.SelectorError;
+    PersistentBackendNotConfigured,
+    PersistentTimestampOverflow,
+} || variables.StoreError || collections.StoreError || collections.SelectorError || persistent.SessionError;
 
 const Lifecycle = enum {
     created,
@@ -345,6 +369,15 @@ const Lifecycle = enum {
 };
 
 pub const ArgumentOrigin = enum { query, body, path };
+pub const PersistentInitialization = enum { loaded, already_initialized, failed_open };
+
+pub const PersistentFailure = enum {
+    unavailable,
+    timeout,
+    conflict_exhausted,
+    corrupt_data,
+    capacity_exceeded,
+};
 
 /// Isolated per-request mutable state.
 ///
@@ -363,6 +396,8 @@ pub const Transaction = struct {
     pending_intervention: ?Intervention = null,
     scalar_variables: variables.Store,
     collection_variables: collections.Store,
+    persistent_session: ?persistent.Session,
+    last_persistent_failure: ?PersistentFailure = null,
     phase_interrupted: bool = false,
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
@@ -555,6 +590,7 @@ pub const Transaction = struct {
         if (self.lifecycle == .created or self.lifecycle == .connection or self.lifecycle == .logging) {
             return error.InvalidLifecycle;
         }
+        _ = try self.flushPersistentCollections();
         self.phase_interrupted = false;
         self.lifecycle = .logging;
     }
@@ -732,6 +768,115 @@ pub const Transaction = struct {
         try self.collection_variables.set(name, key, value, source);
     }
 
+    pub fn initializePersistentCollection(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        collection_key: []const u8,
+    ) TransactionError!PersistentInitialization {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const availability = self.currentAvailability() orelse return error.InvalidLifecycle;
+        if (@backingInt(availability) < @backingInt(variables.Availability.request_headers)) return error.InvalidLifecycle;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        var snapshot = (session.initialize(namespace, collection_key, try self.persistentNow()) catch |err| {
+            if (try self.handlePersistentFailure(err)) return .failed_open;
+            return err;
+        }) orelse return .already_initialized;
+        defer snapshot.deinit();
+        errdefer session.cancelInitialization(namespace);
+
+        var batch: std.ArrayList(collections.Value) = .empty;
+        defer batch.deinit(self.waf.allocator);
+        try batch.ensureTotalCapacity(self.waf.allocator, snapshot.values.items.len);
+        for (snapshot.values.items) |value| batch.appendAssumeCapacity(.{
+            .collection = namespace.collectionName(),
+            .key = value.name,
+            .value = value.value,
+            .source = .{ .origin = .persistent, .offset = 0, .length = value.value.len },
+        });
+        try self.collection_variables.addBatch(batch.items);
+        return .loaded;
+    }
+
+    pub fn setPersistentCollectionValue(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        name: []const u8,
+        value: []const u8,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        try session.set(namespace, name, value, null);
+        self.collection_variables.set(
+            namespace.collectionName(),
+            name,
+            value,
+            .{ .origin = .rule, .offset = 0, .length = value.len },
+        ) catch |err| {
+            session.discardLastMutation(namespace);
+            return err;
+        };
+    }
+
+    pub fn addPersistentCollectionValue(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        name: []const u8,
+        delta: i64,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        const current = if (self.collection_variables.first(namespace.collectionName(), name)) |value|
+            persistent.parseNumericOrZero(value.value)
+        else
+            0;
+        const next = std.math.add(i64, current, delta) catch return error.CapacityExceeded;
+        var value_buffer: [24]u8 = undefined;
+        const value = std.fmt.bufPrint(&value_buffer, "{d}", .{next}) catch unreachable;
+        try session.add(namespace, name, delta);
+        self.collection_variables.set(
+            namespace.collectionName(),
+            name,
+            value,
+            .{ .origin = .rule, .offset = 0, .length = value.len },
+        ) catch |err| {
+            session.discardLastMutation(namespace);
+            return err;
+        };
+    }
+
+    pub fn removePersistentCollectionValue(self: *Transaction, namespace: persistent.Namespace, name: []const u8) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        try session.remove(namespace, name);
+        _ = try self.collection_variables.remove(namespace.collectionName(), .{ .key = name });
+    }
+
+    pub fn expirePersistentCollectionValue(
+        self: *Transaction,
+        namespace: persistent.Namespace,
+        name: []const u8,
+        ttl_seconds: u32,
+    ) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const session = &(self.persistent_session orelse return error.PersistentBackendNotConfigured);
+        const ttl_ns = std.math.mul(i64, @as(i64, ttl_seconds), std.time.ns_per_s) catch return error.PersistentTimestampOverflow;
+        const expires_at_ns = std.math.add(i64, try self.persistentNow(), ttl_ns) catch return error.PersistentTimestampOverflow;
+        try session.expire(namespace, name, expires_at_ns);
+    }
+
+    pub fn flushPersistentCollections(self: *Transaction) TransactionError!usize {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        const session = &(self.persistent_session orelse return 0);
+        return session.flush(try self.persistentNow()) catch |err| {
+            if (try self.handlePersistentFailure(err)) return 0;
+            return err;
+        };
+    }
+
+    pub fn lastPersistentFailure(self: *const Transaction) ?PersistentFailure {
+        return self.last_persistent_failure;
+    }
+
     pub fn removeCollectionValues(self: *Transaction, name: collections.Name, selector: collections.Selector) TransactionError!usize {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         return try self.collection_variables.remove(name, selector);
@@ -815,6 +960,7 @@ pub const Transaction = struct {
 
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
+        if (self.persistent_session) |*session| session.deinit();
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
@@ -903,6 +1049,25 @@ pub const Transaction = struct {
         const now = self.waf.now();
         const elapsed = @max(@as(i96, 0), now.awake_nanoseconds - self.started_awake_nanoseconds);
         try self.setScalarUnsigned(.duration, @divTrunc(elapsed, std.time.ns_per_ms), .timing, .request_headers);
+    }
+
+    fn persistentNow(self: *const Transaction) TransactionError!i64 {
+        const now = self.waf.now().unix_nanoseconds;
+        if (now < 0 or now > std.math.maxInt(i64)) return error.PersistentTimestampOverflow;
+        return @intCast(now);
+    }
+
+    fn handlePersistentFailure(self: *Transaction, err: persistent.SessionError) TransactionError!bool {
+        const failure: PersistentFailure = switch (err) {
+            error.Unavailable => .unavailable,
+            error.Timeout => .timeout,
+            error.RetryLimitExceeded, error.Conflict => .conflict_exhausted,
+            error.CorruptData => .corrupt_data,
+            error.CapacityExceeded => .capacity_exceeded,
+            else => return err,
+        };
+        self.last_persistent_failure = failure;
+        return self.waf.config.persistent_failure_policy == .fail_open;
     }
 
     fn setFlagIfMissing(
@@ -1055,6 +1220,38 @@ const TestClock = struct {
             .unix_nanoseconds = self.unix_nanoseconds,
             .awake_nanoseconds = self.awake_nanoseconds,
         };
+    }
+};
+
+const UnavailablePersistence = struct {
+    context: u8 = 0,
+
+    fn backend(self: *UnavailablePersistence) persistent.Backend {
+        return .{
+            .context = &self.context,
+            .loadFn = load,
+            .commitFn = commit,
+            .cleanupFn = cleanup,
+        };
+    }
+
+    fn load(
+        _: *anyopaque,
+        _: std.mem.Allocator,
+        _: persistent.Namespace,
+        _: []const u8,
+        _: i64,
+        _: persistent.Limits,
+    ) persistent.BackendError!persistent.Snapshot {
+        return error.Unavailable;
+    }
+
+    fn commit(_: *anyopaque, _: persistent.CommitRequest) persistent.BackendError!u64 {
+        return error.Unavailable;
+    }
+
+    fn cleanup(_: *anyopaque, _: i64, _: persistent.CleanupBudget) persistent.BackendError!persistent.CleanupResult {
+        return error.Unavailable;
     }
 };
 
@@ -1403,6 +1600,82 @@ test "argument cookie and file producers maintain derived collections and sizes"
     try std.testing.expectEqualStrings("42", (try tx.scalar(.files_combined_size)).?.value);
     try std.testing.expectEqualStrings("me.png", (try tx.collectionFirst(.files_names, "avatar")).?.value);
     try std.testing.expectEqualStrings("/tmp/upload-1", (try tx.collectionFirst(.files_tmp_names, "avatar")).?.value);
+}
+
+test "engine initializes mutates flushes and expires persistent collections" {
+    var memory = persistent.InMemoryBackend.init(std.testing.allocator);
+    defer memory.deinit();
+    var clock: TestClock = .{ .unix_nanoseconds = 5 * std.time.ns_per_s, .awake_nanoseconds = 0 };
+    var builder = Builder.init(std.testing.allocator);
+    builder.setPersistentBackend(memory.backend());
+    builder.setClockSource(.{ .context = &clock, .nowFn = TestClock.now });
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var first = waf.newTransaction();
+    try first.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try first.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectEqual(PersistentInitialization.loaded, try first.initializePersistentCollection(.ip, "192.0.2.20"));
+    try std.testing.expectEqual(PersistentInitialization.already_initialized, try first.initializePersistentCollection(.ip, "192.0.2.20"));
+    try first.setPersistentCollectionValue(.ip, "score", "not-a-number");
+    try first.addPersistentCollectionValue(.ip, "score", 2);
+    try first.expirePersistentCollectionValue(.ip, "score", 1);
+    try std.testing.expectEqualStrings("2", (try first.collectionFirst(.ip, "SCORE")).?.value);
+    try first.processLogging();
+    first.deinit();
+
+    var second = waf.newTransaction();
+    try second.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try second.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectEqual(PersistentInitialization.loaded, try second.initializePersistentCollection(.ip, "192.0.2.20"));
+    try std.testing.expectEqualStrings("2", (try second.collectionFirst(.ip, "score")).?.value);
+    second.deinit();
+
+    clock.unix_nanoseconds += std.time.ns_per_s;
+    var expired = waf.newTransaction();
+    try expired.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try expired.processUri("/", "GET", "HTTP/1.1");
+    _ = try expired.initializePersistentCollection(.ip, "192.0.2.20");
+    try std.testing.expect((try expired.collectionFirst(.ip, "score")) == null);
+    expired.deinit();
+}
+
+test "persistent engine APIs reject absent backend explicitly" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectError(error.PersistentBackendNotConfigured, tx.initializePersistentCollection(.ip, "192.0.2.20"));
+}
+
+test "persistent backend failure policy is explicit and observable" {
+    var unavailable: UnavailablePersistence = .{};
+    var open_builder = Builder.init(std.testing.allocator);
+    open_builder.setPersistentBackend(unavailable.backend());
+    open_builder.setPersistentFailurePolicy(.fail_open);
+    const open_waf = try open_builder.build();
+    defer open_waf.deinit() catch unreachable;
+    var open_tx = open_waf.newTransaction();
+    defer open_tx.deinit();
+    try open_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try open_tx.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectEqual(PersistentInitialization.failed_open, try open_tx.initializePersistentCollection(.ip, "192.0.2.20"));
+    try std.testing.expectEqual(PersistentFailure.unavailable, open_tx.lastPersistentFailure().?);
+
+    var closed_builder = Builder.init(std.testing.allocator);
+    closed_builder.setPersistentBackend(unavailable.backend());
+    closed_builder.setPersistentFailurePolicy(.fail_closed);
+    const closed_waf = try closed_builder.build();
+    defer closed_waf.deinit() catch unreachable;
+    var closed_tx = closed_waf.newTransaction();
+    defer closed_tx.deinit();
+    try closed_tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try closed_tx.processUri("/", "GET", "HTTP/1.1");
+    try std.testing.expectError(error.Unavailable, closed_tx.initializePersistentCollection(.ip, "192.0.2.20"));
+    try std.testing.expectEqual(PersistentFailure.unavailable, closed_tx.lastPersistentFailure().?);
 }
 
 test "compiled feature discovery is explicit" {
