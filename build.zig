@@ -143,4 +143,18 @@ pub fn build(b: *std.Build) void {
     const run_collection_benchmark = b.addRunArtifact(collection_benchmark);
     const collection_benchmark_step = b.step("bench-collections", "Benchmark collection targets and runtime macros");
     collection_benchmark_step.dependOn(&run_collection_benchmark.step);
+
+    const persistence_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/persistence.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    persistence_benchmark_module.addImport("waf", waf);
+    const persistence_benchmark = b.addExecutable(.{
+        .name = "persistence-benchmark",
+        .root_module = persistence_benchmark_module,
+    });
+    const run_persistence_benchmark = b.addRunArtifact(persistence_benchmark);
+    const persistence_benchmark_step = b.step("bench-persistence", "Benchmark disabled and initialized persistent collection paths");
+    persistence_benchmark_step.dependOn(&run_persistence_benchmark.step);
 }

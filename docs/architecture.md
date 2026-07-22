@@ -41,3 +41,6 @@ The scalar compatibility and producer contract is documented in
 [Scalar transaction variables](scalar-variables.md).
 The keyed namespace, target, selector, and macro contract is documented in
 [Collection variables](collections.md).
+Cross-request collection storage, mutation, expiry, failure policy, and the
+Pantry-linked LMDB backend are documented in
+[Persistent collections](persistence.md).

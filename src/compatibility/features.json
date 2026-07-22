@@ -128,6 +128,24 @@
       "notes": "Native adapter is live; complete libinjection differential parity is not yet claimed."
     },
     {
+      "id": "engine.persistent-collections",
+      "area": "engine",
+      "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/10",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": false,
+      "evidence": [
+        "src/persistent.zig",
+        "src/persistent_lmdb.zig",
+        "src/engine.zig",
+        "benchmarks/persistence.zig",
+        "docs/persistence.md"
+      ],
+      "notes": "Bounded transaction-local mutation, persistent initialization, expiry-only state, optimistic conflict rebasing, typed fail-open/fail-closed behavior, thread-safe in-memory storage, and Pantry-linked LMDB storage are executable. SecLang text parsing and action-plan wiring consume these APIs in WAF-10 through WAF-15."
+    },
+    {
       "id": "api.c-connector",
       "area": "connectors",
       "name": "Versioned C connector ABI",
