@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "issue": "WAF-11",
   "zig": "0.17.0-dev.1441+d5181a9c9",
-  "compilerAbi": 3,
+  "compilerAbi": 4,
   "structuralOnly": true,
   "baselines": [
     {
@@ -28,10 +28,11 @@
     "directives": 925,
     "plans": 58,
     "rules": 761,
-    "planOwnedBytes": 2419595,
+    "planOwnedBytes": 2557721,
     "unexplainedExclusions": 0
   },
   "hostedBenchmark": {
+    "compilerAbi": 3,
     "fixture": "OWASP CRS REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
     "inputBytes": 98977,
     "directives": 74,

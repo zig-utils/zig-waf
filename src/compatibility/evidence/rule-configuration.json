@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "issue": "WAF-13",
   "zig": "0.17.0-dev.1441+d5181a9c9",
-  "compilerAbi": 3,
+  "compilerAbi": 4,
   "baselines": {
     "modsecurity": {
       "version": "3.0.16",
@@ -86,6 +86,7 @@
     "unexplainedMismatches": 0
   },
   "releaseFastLocalBenchmark": {
+    "compilerAbi": 3,
     "fixture": "OWASP CRS REQUEST-942-APPLICATION-ATTACK-SQLI.conf",
     "inputBytes": 98977,
     "rules": 73,

@@ -1,6 +1,7 @@
 //! Immutable, compact structural execution plans compiled from SecLang syntax.
 
 const std = @import("std");
+const action_config = @import("action_config.zig");
 const seclang = @import("seclang/root.zig");
 const rule_config = @import("rule_config.zig");
 const remote_rules = @import("remote_rules.zig");
@@ -12,7 +13,7 @@ pub const RuleId = enum(u32) { _ };
 pub const DefaultId = enum(u32) { _ };
 pub const MacroProgramId = enum(u32) { _ };
 pub const MarkerId = enum(u32) { _ };
-pub const compiler_abi_version: u32 = 3;
+pub const compiler_abi_version: u32 = 4;
 pub const Fingerprint = [32]u8;
 pub const evidence_json = @embedFile("compatibility/evidence/structural-plan.json");
 
@@ -40,6 +41,7 @@ pub const Limits = struct {
     max_flow_targets: usize = 500_000,
     max_target_expansion: usize = 4_000_000,
     max_action_expansion: usize = 8_000_000,
+    max_metadata_tags: usize = 2_000_000,
     max_configuration_warnings: usize = 1_000_000,
     max_arguments: usize = 4_000_000,
     max_strings: usize = 2_000_000,
@@ -71,6 +73,7 @@ pub const Limits = struct {
             self.max_flow_targets == 0 or
             self.max_target_expansion == 0 or
             self.max_action_expansion == 0 or
+            self.max_metadata_tags == 0 or
             self.max_configuration_warnings == 0 or
             self.max_arguments == 0 or
             self.max_strings == 0 or
@@ -102,6 +105,7 @@ pub const Limits = struct {
             self.max_flow_targets > std.math.maxInt(u32) or
             self.max_target_expansion > std.math.maxInt(u32) or
             self.max_action_expansion > std.math.maxInt(u32) or
+            self.max_metadata_tags > std.math.maxInt(u32) or
             self.max_configuration_warnings > std.math.maxInt(u32) or
             self.max_arguments > std.math.maxInt(u32) or
             self.max_strings > std.math.maxInt(u32))
@@ -136,6 +140,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     TooManyFlowTargets,
     TargetExpansionLimitExceeded,
     ActionExpansionLimitExceeded,
+    TooManyMetadataTags,
     TooManyConfigurationWarnings,
     TooManyArguments,
     TooManyStrings,
@@ -156,6 +161,7 @@ pub const CompileError = std.mem.Allocator.Error || error{
     MissingStaticMarker,
     InvalidRuleTargetUpdate,
     InvalidRuleActionUpdate,
+    InvalidRuleMetadata,
     DanglingChain,
     ChainPhaseMismatch,
     InvalidTransformation,
@@ -176,6 +182,7 @@ pub const DiagnosticCode = enum {
     missing_static_marker,
     invalid_rule_target_update,
     invalid_rule_action_update,
+    invalid_rule_metadata,
     dangling_chain,
     chain_phase_mismatch,
     invalid_transformation,
@@ -200,6 +207,7 @@ pub const DiagnosticCode = enum {
             .missing_static_marker => "WAF-PLAN-0114",
             .invalid_rule_target_update => "WAF-PLAN-0115",
             .invalid_rule_action_update => "WAF-PLAN-0116",
+            .invalid_rule_metadata => "WAF-PLAN-0117",
         };
     }
 
@@ -216,6 +224,7 @@ pub const DiagnosticCode = enum {
             .missing_static_marker => "static skipAfter target has no following SecMarker",
             .invalid_rule_target_update => "rule target update contains invalid target syntax",
             .invalid_rule_action_update => "rule action update contains a forbidden or invalid action",
+            .invalid_rule_metadata => "rule metadata value is missing, malformed, or outside its supported range",
             .dangling_chain => "chain action must be followed by another SecRule in the same document",
             .chain_phase_mismatch => "all members of a rule chain must execute in the same phase",
             .invalid_transformation => "transformation action requires a non-empty name",
@@ -358,6 +367,23 @@ pub const DefaultSnapshot = struct {
     actions_count: u32,
 };
 
+pub const MetadataText = struct {
+    value: StringId,
+    macro: ?MacroProgramId,
+};
+
+pub const RuleMetadata = struct {
+    revision: ?MetadataText = null,
+    message: ?MetadataText = null,
+    log_data: ?MetadataText = null,
+    severity: ?action_config.Severity = null,
+    maturity: ?u4 = null,
+    accuracy: ?u4 = null,
+    version: ?MetadataText = null,
+    tags_start: u32 = 0,
+    tags_count: u32 = 0,
+};
+
 pub const Rule = struct {
     directive: DirectiveId,
     source: seclang.source.Span,
@@ -374,6 +400,7 @@ pub const Rule = struct {
     actions_count: u32,
     transformations_start: u32,
     transformations_count: u32,
+    metadata: RuleMetadata,
     removed_by: ?DirectiveId,
 };
 
@@ -415,6 +442,7 @@ const Component = struct {
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
+    metadata_tags: []const MetadataText,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -460,6 +488,7 @@ pub const Plan = struct {
     macro_programs: []const MacroProgram,
     macro_tokens: []const MacroToken,
     defaults: []const DefaultSnapshot,
+    metadata_tags: []const MetadataText,
     rule_removals: []const RuleRemoval,
     missing_rule_references: []const MissingRuleReference,
     remote_sources: []const RemoteSource,
@@ -762,6 +791,7 @@ const Compiler = struct {
     prefilter_count: usize = 0,
     prefilter_bytes: usize = 0,
     defaults: std.ArrayList(DefaultSnapshot) = .empty,
+    metadata_tags: std.ArrayList(MetadataText) = .empty,
     id_intervals: std.ArrayList(rule_config.IdInterval) = .empty,
     id_requests: std.ArrayList(rule_config.IdInterval) = .empty,
     rule_removal_operations: std.ArrayList(RuleRemovalOperation) = .empty,
@@ -801,6 +831,7 @@ const Compiler = struct {
         self.macro_tokens.deinit(self.allocator);
         self.macro_program_by_source.deinit(self.allocator);
         self.defaults.deinit(self.allocator);
+        self.metadata_tags.deinit(self.allocator);
         self.id_intervals.deinit(self.allocator);
         self.id_requests.deinit(self.allocator);
         self.rule_removal_operations.deinit(self.allocator);
@@ -1154,6 +1185,7 @@ const Compiler = struct {
             .actions_count = action_range.count,
             .transformations_start = transformation_range.start,
             .transformations_count = transformation_range.count,
+            .metadata = .{},
             .removed_by = null,
         });
         if (pending) |previous_id| {
@@ -1584,10 +1616,85 @@ const Compiler = struct {
         }
     }
 
+    fn compileRuleMetadata(self: *Compiler) CompileError!void {
+        for (0..self.rules.items.len) |rule_index| {
+            const rule = self.rules.items[rule_index];
+            var metadata: RuleMetadata = .{ .tags_start = try typedIndex(self.metadata_tags.items.len) };
+            const actions = self.actions.items[rule.actions_start..][0..rule.actions_count];
+            for (actions) |action| {
+                const name = self.interner.values.items[@backingInt(action.name)];
+                if (std.ascii.eqlIgnoreCase(name, "id")) continue;
+                if (std.ascii.eqlIgnoreCase(name, "tag")) {
+                    const text = self.metadataText(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    if (self.metadata_tags.items.len == self.limits.max_metadata_tags)
+                        return error.TooManyMetadataTags;
+                    try self.metadata_tags.append(self.allocator, text);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "rev")) {
+                    metadata.revision = self.metadataText(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "msg")) {
+                    metadata.message = self.metadataText(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "logdata")) {
+                    metadata.log_data = self.metadataText(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "ver") or std.ascii.eqlIgnoreCase(name, "version")) {
+                    metadata.version = self.metadataText(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "severity")) {
+                    const value = self.actionValue(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    metadata.severity = action_config.parseSeverity(value) catch
+                        return self.fail(error.InvalidRuleMetadata, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "maturity")) {
+                    const value = self.actionValue(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    metadata.maturity = action_config.parseQuality(value) catch
+                        return self.fail(error.InvalidRuleMetadata, rule.source, null);
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(name, "accuracy")) {
+                    const value = self.actionValue(action) catch |cause|
+                        return self.fail(cause, rule.source, null);
+                    metadata.accuracy = action_config.parseQuality(value) catch
+                        return self.fail(error.InvalidRuleMetadata, rule.source, null);
+                }
+            }
+            metadata.tags_count = try typedIndex(self.metadata_tags.items.len - metadata.tags_start);
+            self.rules.items[rule_index].metadata = metadata;
+        }
+    }
+
+    fn actionValue(self: *Compiler, action: Action) CompileError![]const u8 {
+        const raw = action.value orelse return error.InvalidRuleMetadata;
+        const value = unquote(self.interner.values.items[@backingInt(raw)]);
+        if (value.len == 0) return error.InvalidRuleMetadata;
+        return value;
+    }
+
+    fn metadataText(self: *Compiler, action: Action) CompileError!MetadataText {
+        const value = try self.actionValue(action);
+        return .{ .value = try self.interner.intern(value), .macro = action.macro };
+    }
+
     fn finish(self: *Compiler, registry: *const seclang.source.Registry) CompileError!*Plan {
         try self.applyRuleRemovals();
         try self.applyRuleTargetUpdates();
         try self.applyRuleActionUpdates();
+        try self.compileRuleMetadata();
         try self.resolveSkipAfterTargets();
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
@@ -1615,6 +1722,7 @@ const Compiler = struct {
         const macro_programs = try duplicateCounted(MacroProgram, arena_allocator, self.macro_programs.items, &owned_bytes, self.limits);
         const macro_tokens = try duplicateCounted(MacroToken, arena_allocator, self.macro_tokens.items, &owned_bytes, self.limits);
         const defaults = try duplicateCounted(DefaultSnapshot, arena_allocator, self.defaults.items, &owned_bytes, self.limits);
+        const metadata_tags = try duplicateCounted(MetadataText, arena_allocator, self.metadata_tags.items, &owned_bytes, self.limits);
         const rule_removals = try duplicateCounted(RuleRemoval, arena_allocator, self.rule_removals.items, &owned_bytes, self.limits);
         const missing_rule_references = try duplicateCounted(MissingRuleReference, arena_allocator, self.missing_rule_references.items, &owned_bytes, self.limits);
         const remote_sources = try duplicateCounted(RemoteSource, arena_allocator, self.remote_sources.items, &owned_bytes, self.limits);
@@ -1645,6 +1753,7 @@ const Compiler = struct {
             .macro_programs = macro_programs,
             .macro_tokens = macro_tokens,
             .defaults = defaults,
+            .metadata_tags = metadata_tags,
             .rule_removals = rule_removals,
             .missing_rule_references = missing_rule_references,
             .remote_sources = remote_sources,
@@ -1680,6 +1789,7 @@ fn attachComponent(plan: *Plan, component: *Component) void {
     plan.macro_programs = component.macro_programs;
     plan.macro_tokens = component.macro_tokens;
     plan.defaults = component.defaults;
+    plan.metadata_tags = component.metadata_tags;
     plan.rule_removals = component.rule_removals;
     plan.missing_rule_references = component.missing_rule_references;
     plan.remote_sources = component.remote_sources;
@@ -1710,6 +1820,7 @@ fn componentsEqual(first: *const Plan, second: *const Plan) bool {
         !slicesEqual(MacroProgram, first.macro_programs, second.macro_programs) or
         !slicesEqual(MacroToken, first.macro_tokens, second.macro_tokens) or
         !slicesEqual(DefaultSnapshot, first.defaults, second.defaults) or
+        !slicesEqual(MetadataText, first.metadata_tags, second.metadata_tags) or
         !slicesEqual(RuleRemoval, first.rule_removals, second.rule_removals) or
         !slicesEqual(MissingRuleReference, first.missing_rule_references, second.missing_rule_references) or
         !slicesEqual(RemoteSource, first.remote_sources, second.remote_sources) or
@@ -1799,7 +1910,31 @@ fn computeFingerprint(plan: *const Plan) Fingerprint {
         hashU32(&hasher, rule.actions_count);
         hashU32(&hasher, rule.transformations_start);
         hashU32(&hasher, rule.transformations_count);
+        hashMetadataText(&hasher, plan, rule.metadata.revision);
+        hashMetadataText(&hasher, plan, rule.metadata.message);
+        hashMetadataText(&hasher, plan, rule.metadata.log_data);
+        if (rule.metadata.severity) |severity| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, @backingInt(severity));
+        } else hashBool(&hasher, false);
+        if (rule.metadata.maturity) |maturity| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, maturity);
+        } else hashBool(&hasher, false);
+        if (rule.metadata.accuracy) |accuracy| {
+            hashBool(&hasher, true);
+            hashU8(&hasher, accuracy);
+        } else hashBool(&hasher, false);
+        hashMetadataText(&hasher, plan, rule.metadata.version);
+        hashU32(&hasher, rule.metadata.tags_start);
+        hashU32(&hasher, rule.metadata.tags_count);
         hashOptionalId(&hasher, rule.removed_by);
+    }
+
+    hashU32(&hasher, @intCast(plan.metadata_tags.len));
+    for (plan.metadata_tags) |tag| {
+        hashString(&hasher, plan.string(tag.value).?);
+        hashOptionalId(&hasher, tag.macro);
     }
 
     hashU32(&hasher, @intCast(plan.defaults.len));
@@ -1888,6 +2023,14 @@ fn hashOptionalString(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value:
     } else hashBool(hasher, false);
 }
 
+fn hashMetadataText(hasher: *std.crypto.hash.Blake3, plan: *const Plan, value: ?MetadataText) void {
+    if (value) |text| {
+        hashBool(hasher, true);
+        hashString(hasher, plan.string(text.value).?);
+        hashOptionalId(hasher, text.macro);
+    } else hashBool(hasher, false);
+}
+
 fn hashOptionalId(hasher: *std.crypto.hash.Blake3, value: anytype) void {
     if (value) |id| {
         hashBool(hasher, true);
@@ -1970,7 +2113,7 @@ fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
 
 fn classifyAction(name: []const u8) ActionClass {
     if (std.ascii.eqlIgnoreCase(name, "t")) return .transformation;
-    if (equalsAny(name, &.{ "id", "msg", "logdata", "tag", "severity", "ver", "rev", "maturity", "accuracy" }))
+    if (equalsAny(name, &.{ "id", "msg", "logdata", "tag", "severity", "ver", "version", "rev", "maturity", "accuracy" }))
         return .metadata;
     if (equalsAny(name, &.{
         "capture",              "setvar",                "setenv",                 "initcol",     "expirevar",
@@ -1998,6 +2141,7 @@ fn sameActionFamily(compiler: *const Compiler, existing: Action, replacement: Ac
     const replacement_name = compiler.interner.values.items[@backingInt(replacement.name)];
     if (equalsAny(existing_name, &.{ "log", "nolog" }) and equalsAny(replacement_name, &.{ "log", "nolog" })) return true;
     if (equalsAny(existing_name, &.{ "auditlog", "noauditlog" }) and equalsAny(replacement_name, &.{ "auditlog", "noauditlog" })) return true;
+    if (equalsAny(existing_name, &.{ "ver", "version" }) and equalsAny(replacement_name, &.{ "ver", "version" })) return true;
     return std.ascii.eqlIgnoreCase(existing_name, replacement_name);
 }
 
@@ -2031,6 +2175,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.MissingStaticMarker => .missing_static_marker,
         error.InvalidRuleTargetUpdate => .invalid_rule_target_update,
         error.InvalidRuleActionUpdate => .invalid_rule_action_update,
+        error.InvalidRuleMetadata => .invalid_rule_metadata,
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
@@ -3045,7 +3190,7 @@ test "component reuse requires exact equality after fingerprint screening" {
 test "plan compilation cleans every injected allocation failure" {
     const input =
         \\SecDefaultAction "phase:2,pass,t:lowercase"
-        \\SecRule ARGS|REQUEST_HEADERS:host "@contains attack" "id:1,msg:'%{REQUEST_URI}',deny,chain"
+        \\SecRule ARGS|REQUEST_HEADERS:host "@contains attack" "id:1,msg:'%{REQUEST_URI}',tag:'allocation',severity:CRITICAL,maturity:9,accuracy:8,ver:'test/1',deny,chain"
         \\SecRule TX:score "@pm one two" "capture,setvar:tx.hit=1"
         \\SecMarker END
     ;
@@ -3129,6 +3274,80 @@ test "macro program and token limits fail distinctly" {
     var documents = [_]seclang.parser.Document{parsed.document};
     try std.testing.expectError(error.TooManyMacroPrograms, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_programs = 1 }));
     try std.testing.expectError(error.TooManyMacroTokens, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_macro_tokens = 1 }));
+}
+
+test "rule metadata is typed normalized and rebuilt after action updates" {
+    const input =
+        \\SecRule ARGS @rx "id:42,rev:'1',msg:'old %{TX.name}',logdata:'%{TX.0}',tag:'first',tag:'second %{TX.kind}',severity:CRITICAL,maturity:9,accuracy:8,ver:'CRS/4'"
+        \\SecRuleUpdateActionById 42 "msg:'new %{TX.name}',tag:'third',severity:NOTICE,version:'CRS/4.1'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "metadata.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+
+    const metadata = compiled.rules[0].metadata;
+    try std.testing.expectEqualStrings("1", compiled.string(metadata.revision.?.value).?);
+    try std.testing.expectEqualStrings("new %{TX.name}", compiled.string(metadata.message.?.value).?);
+    try std.testing.expect(metadata.message.?.macro != null);
+    try std.testing.expectEqualStrings("%{TX.0}", compiled.string(metadata.log_data.?.value).?);
+    try std.testing.expectEqual(action_config.Severity.notice, metadata.severity.?);
+    try std.testing.expectEqual(@as(?u4, 9), metadata.maturity);
+    try std.testing.expectEqual(@as(?u4, 8), metadata.accuracy);
+    try std.testing.expectEqualStrings("CRS/4.1", compiled.string(metadata.version.?.value).?);
+    try std.testing.expectEqual(@as(u32, 3), metadata.tags_count);
+    const tags = compiled.metadata_tags[metadata.tags_start..][0..metadata.tags_count];
+    try std.testing.expectEqualStrings("first", compiled.string(tags[0].value).?);
+    try std.testing.expectEqualStrings("second %{TX.kind}", compiled.string(tags[1].value).?);
+    try std.testing.expect(tags[1].macro != null);
+    try std.testing.expectEqualStrings("third", compiled.string(tags[2].value).?);
+}
+
+test "invalid metadata has a stable diagnostic" {
+    const cases = [_][]const u8{
+        "SecRule ARGS @rx \"id:1,msg\"",
+        "SecRule ARGS @rx \"id:1,severity:8\"",
+        "SecRule ARGS @rx \"id:1,maturity:0\"",
+        "SecRule ARGS @rx \"id:1,accuracy:10\"",
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "invalid-metadata.conf", case, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer outcome.deinit();
+        switch (outcome) {
+            .plan => return error.TestExpectedDiagnostic,
+            .diagnostic => |diagnostic| try std.testing.expectEqual(DiagnosticCode.invalid_rule_metadata, diagnostic.code),
+        }
+    }
+    try std.testing.expectEqualStrings("WAF-PLAN-0117", DiagnosticCode.invalid_rule_metadata.id());
+}
+
+test "repeated singleton metadata uses the last value while tags append" {
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "repeated-metadata.conf",
+        "SecRule ARGS @rx \"id:1,msg:'one',tag:'a',msg:'two',ver:'old',version:'new',tag:'b'\"",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer compiled.deinit();
+    const metadata = compiled.rules[0].metadata;
+    try std.testing.expectEqualStrings("two", compiled.string(metadata.message.?.value).?);
+    try std.testing.expectEqualStrings("new", compiled.string(metadata.version.?.value).?);
+    try std.testing.expectEqual(@as(u32, 2), metadata.tags_count);
+}
+
+test "metadata tag storage has an independent resource limit" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "metadata-limits.conf", "SecRule ARGS @rx \"id:1,tag:'one',tag:'two'\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(error.TooManyMetadataTags, compile(std.testing.allocator, &parsed.registry, &documents, .{ .max_metadata_tags = 1 }));
 }
 
 test "structural plan evidence is valid and pinned to compiler ABI" {

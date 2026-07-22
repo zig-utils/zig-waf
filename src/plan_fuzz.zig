@@ -78,10 +78,17 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
             @backingInt(rule.chain_head) > index or
             rule.targets_start + rule.targets_count > compiled.targets.len or
             rule.actions_start + rule.actions_count > compiled.actions.len or
-            rule.transformations_start + rule.transformations_count > compiled.transformations.len)
+            rule.transformations_start + rule.transformations_count > compiled.transformations.len or
+            rule.metadata.tags_start + rule.metadata.tags_count > compiled.metadata_tags.len)
         {
             return error.InvalidPlanFuzzRange;
         }
+        try validateMetadataText(compiled, rule.metadata.revision);
+        try validateMetadataText(compiled, rule.metadata.message);
+        try validateMetadataText(compiled, rule.metadata.log_data);
+        try validateMetadataText(compiled, rule.metadata.version);
+        for (compiled.metadata_tags[rule.metadata.tags_start..][0..rule.metadata.tags_count]) |tag|
+            try validateMetadataText(compiled, tag);
         if (rule.chain_position == 0 and rule.chain_head != @as(plan.RuleId, @fromBackingInt(@intCast(index))))
             return error.InvalidPlanFuzzChain;
         if (rule.operator.negated and rule.operator.prefilter != null) return error.InvalidPlanFuzzPrefilter;
@@ -131,6 +138,13 @@ fn validate(compiled: *const plan.Plan, directive_count: usize) !void {
         if (@backingInt(reference.directive) >= compiled.directives.len or reference.interval.first > reference.interval.last)
             return error.InvalidPlanFuzzMissingReference;
     }
+}
+
+fn validateMetadataText(compiled: *const plan.Plan, maybe_text: ?plan.MetadataText) !void {
+    const metadata = maybe_text orelse return;
+    _ = compiled.string(metadata.value) orelse return error.InvalidPlanFuzzMetadata;
+    if (metadata.macro) |program| if (@backingInt(program) >= compiled.macro_programs.len)
+        return error.InvalidPlanFuzzMetadata;
 }
 
 test "plan fuzz oracle accepts valid malformed and arbitrary bytes" {
