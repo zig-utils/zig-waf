@@ -1060,6 +1060,64 @@ test "stable union has one canonical case insensitive entry per id" {
     try std.testing.expect(lookup("SecDefinitelyUnknown") == null);
 }
 
+test "every registry row has an executable positive schema fixture" {
+    for (registry) |entry| {
+        const arguments = positiveArguments(entry);
+        const input = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}\n", .{
+            entry.name,
+            if (arguments.len == 0) "" else " ",
+            arguments,
+        });
+        defer std.testing.allocator.free(input);
+        const compiled = try compileTestPlan(input);
+        defer compiled.deinit();
+        switch (validatePlan(compiled, .full())) {
+            .valid => {},
+            .diagnostic => |value| {
+                std.debug.print("positive directive fixture failed for {s}: {s} {s}\n", .{ entry.name, value.code.id(), value.message });
+                return error.InvalidPositiveDirectiveFixture;
+            },
+        }
+    }
+}
+
+fn positiveArguments(entry: Entry) []const u8 {
+    return switch (entry.schema) {
+        .rule => "ARGS @rx",
+        .action => "pass",
+        .default_action => "phase:2,pass",
+        .marker => "END",
+        .text => "value",
+        .toggle => "On",
+        .rule_engine => "DetectionOnly",
+        .connection_engine => "On",
+        .unsigned => "1",
+        .limit_action => "Reject",
+        .mime_type => "application/json",
+        .clear => "",
+        .byte_separator => "&",
+        .cookie_format => "0",
+        .audit_engine => "RelevantOnly",
+        .audit_log_type => "Concurrent",
+        .audit_log_format => "JSON",
+        .audit_parts => "ABIJDEFHZ",
+        .octal_mode => "0640",
+        .upload_keep_files => "RelevantOnly",
+        .remote_fail_action => "Warn",
+        .path => "relative/path",
+        .regex => ".*",
+        .id_ranges => "1-2",
+        .rule_update => switch (entry.id) {
+            .sec_rule_update_target_by_id, .sec_rule_update_action_by_id => "1 ARGS",
+            else => "pattern ARGS",
+        },
+        .remote_rules => "key https://rules.example.test/bundle",
+        .dataset => "name value",
+        .hash_parameter => "value",
+        .unicode_map => if (entry.id == .sec_unicode_map_file) "unicode.mapping 20127" else "unicode.mapping",
+    };
+}
+
 test "capability and secrecy metadata are explicit" {
     const core = CapabilitySet.coreOnly();
     try std.testing.expect(core.has(.core));
