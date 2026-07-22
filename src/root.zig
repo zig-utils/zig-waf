@@ -38,6 +38,8 @@ pub const RuleProjection = engine.RuleProjection;
 pub const LocalEffectOutcome = engine.LocalEffectOutcome;
 pub const MatchIntentId = engine.MatchIntentId;
 pub const MatchIntent = engine.MatchIntent;
+pub const FlowState = engine.FlowState;
+pub const PhaseCursor = engine.PhaseCursor;
 
 test {
     _ = version;

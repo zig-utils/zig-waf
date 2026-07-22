@@ -558,6 +558,7 @@ pub const FlowState = struct {
     skip: u32 = 0,
     skip_after_action: ?u32 = null,
     allow_scope: ?action_config.AllowScope = null,
+    phase: ?Phase = null,
 };
 
 pub const PersistentFailure = enum {
@@ -1154,6 +1155,7 @@ pub const Transaction = struct {
     }
 
     fn commitDecision(self: *Transaction, head: compiled_plan.Rule, intent: *const MatchIntent) void {
+        self.flow_state.phase = self.currentPhase();
         self.flow_state.skip = if (head.flow.skip_after_action == null) head.flow.skip else 0;
         self.flow_state.skip_after_action = head.flow.skip_after_action;
         if (head.disruptive.kind == .allow) {
@@ -2357,6 +2359,60 @@ pub const Transaction = struct {
     }
 };
 
+/// Allocation-free traversal of immutable chain heads for one active phase.
+/// Flow state is read from the transaction after each matched rule commits, so
+/// callers do not need to copy or mutate the compiled plan.
+pub const PhaseCursor = struct {
+    transaction: *Transaction,
+    phase: Phase,
+    index: usize = 0,
+
+    pub fn init(transaction: *Transaction, phase: Phase) TransactionError!PhaseCursor {
+        if (transaction.lifecycle == .deinitialized) return error.Deinitialized;
+        if (transaction.currentPhase() != phase) return error.InvalidLifecycle;
+        if (transaction.compiledPlan() == null) return error.MissingCompiledPlan;
+        return .{ .transaction = transaction, .phase = phase };
+    }
+
+    pub fn next(self: *PhaseCursor) TransactionError!?compiled_plan.RuleId {
+        if (self.transaction.lifecycle == .deinitialized) return error.Deinitialized;
+        if (self.transaction.currentPhase() != self.phase) return error.InvalidLifecycle;
+        if (self.phase != .logging and
+            (self.transaction.transaction_terminated or self.transaction.phase_interrupted or self.allowSuppressesPhase()))
+        {
+            return null;
+        }
+        const plan = self.transaction.compiledPlan() orelse return error.MissingCompiledPlan;
+        const rules = plan.phaseRules(@backingInt(self.phase));
+        if (self.transaction.flow_state.phase == self.phase and self.transaction.flow_state.skip != 0) {
+            var remaining = self.transaction.flow_state.skip;
+            self.transaction.flow_state.skip = 0;
+            while (self.index < rules.len and remaining != 0) {
+                const candidate = plan.rules[@backingInt(rules[self.index])];
+                self.index += 1;
+                if (candidate.removed_by == null) remaining -= 1;
+            }
+        }
+        while (self.index < rules.len) {
+            const rule_id = rules[self.index];
+            self.index += 1;
+            if (plan.rules[@backingInt(rule_id)].removed_by != null) continue;
+            return rule_id;
+        }
+        return null;
+    }
+
+    fn allowSuppressesPhase(self: *const PhaseCursor) bool {
+        const flow = self.transaction.flow_state;
+        const scope = flow.allow_scope orelse return false;
+        return switch (scope) {
+            .transaction => true,
+            .request => self.phase == .request_headers or self.phase == .request_body,
+            .phase => flow.phase == self.phase,
+        };
+    }
+};
+
 fn lock(mutex: *std.atomic.Mutex) void {
     while (!mutex.tryLock()) std.atomic.spinLoopHint();
 }
@@ -3384,6 +3440,58 @@ test "matched decisions commit owned intervention and flow evidence atomically" 
     try std.testing.expect(!detection_tx.isTerminated());
     try std.testing.expectEqual(@as(usize, 2), detection_tx.matchIntentCount());
     try std.testing.expectEqualStrings("1", (try detection_tx.collectionFirst(.tx, "second")).?.value);
+}
+
+test "phase cursor applies skip and phase-scoped allow without allocation" {
+    const input =
+        \\SecRule ARGS @rx "id:1,phase:2,skip:2"
+        \\SecRule ARGS @rx "id:2,phase:2"
+        \\SecRule ARGS @rx "id:3,phase:2"
+        \\SecRule ARGS @rx "id:4,phase:2"
+        \\SecRule ARGS @rx "id:5,phase:3,allow:phase"
+        \\SecRule ARGS @rx "id:6,phase:3"
+        \\SecRule ARGS @rx "id:7,phase:4"
+        \\SecRule ARGS @rx "id:8,phase:5"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "phase-cursor.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.processRequestBody();
+    const context: MatchContext = .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 5 },
+    };
+
+    var request_cursor = try PhaseCursor.init(&tx, .request_body);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try request_cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), context);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(3)), (try request_cursor.next()).?);
+    try std.testing.expect((try request_cursor.next()) == null);
+
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    var response_headers_cursor = try PhaseCursor.init(&tx, .response_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(4)), (try response_headers_cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(4), context);
+    try std.testing.expect((try response_headers_cursor.next()) == null);
+
+    try tx.processResponseBody();
+    var response_body_cursor = try PhaseCursor.init(&tx, .response_body);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(6)), (try response_body_cursor.next()).?);
+    try tx.processLogging();
+    var logging_cursor = try PhaseCursor.init(&tx, .logging);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(7)), (try logging_cursor.next()).?);
 }
 
 test "failed combined effect preflight rolls back persistent session state" {
