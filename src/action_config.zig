@@ -1,4 +1,4 @@
-//! Allocation-free parsers for metadata and non-disruptive SecLang actions.
+//! Allocation-free parsers for typed SecLang action configuration.
 
 const std = @import("std");
 
@@ -10,6 +10,24 @@ pub const ParseError = error{
     InvalidOperation,
     InvalidNumber,
     NumberOutOfRange,
+};
+
+pub const AllowScope = enum {
+    transaction,
+    phase,
+    request,
+};
+
+pub const EngineMode = enum {
+    on,
+    off,
+    detection_only,
+};
+
+pub const AuditEngine = enum {
+    on,
+    off,
+    relevant_only,
 };
 
 pub const Severity = enum(u3) {
@@ -177,6 +195,44 @@ pub fn parsePositiveU32(value: []const u8) ParseError!u32 {
     return @intCast(number);
 }
 
+pub fn parseAllowScope(value: ?[]const u8) ParseError!AllowScope {
+    const raw = value orelse return .transaction;
+    if (raw.len == 0) return .transaction;
+    if (std.ascii.eqlIgnoreCase(raw, "phase")) return .phase;
+    if (std.ascii.eqlIgnoreCase(raw, "request")) return .request;
+    return error.InvalidOperation;
+}
+
+pub fn parseStatus(value: []const u8) ParseError!u16 {
+    const number = parseUnsigned(value) catch return error.InvalidNumber;
+    if (number < 100 or number > 599) return error.NumberOutOfRange;
+    return @intCast(number);
+}
+
+pub fn parseSkip(value: []const u8) ParseError!u32 {
+    return parsePositiveU32(value);
+}
+
+pub fn parseEngineMode(value: []const u8) ParseError!EngineMode {
+    if (std.ascii.eqlIgnoreCase(value, "on")) return .on;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+    if (std.ascii.eqlIgnoreCase(value, "detectiononly")) return .detection_only;
+    return error.InvalidOperation;
+}
+
+pub fn parseAuditEngine(value: []const u8) ParseError!AuditEngine {
+    if (std.ascii.eqlIgnoreCase(value, "on")) return .on;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return .off;
+    if (std.ascii.eqlIgnoreCase(value, "relevantonly")) return .relevant_only;
+    return error.InvalidOperation;
+}
+
+pub fn parseBoolean(value: []const u8) ParseError!bool {
+    if (std.ascii.eqlIgnoreCase(value, "on")) return true;
+    if (std.ascii.eqlIgnoreCase(value, "off")) return false;
+    return error.InvalidOperation;
+}
+
 fn parseVariable(value: []const u8) ParseError!struct { collection: Collection, key: []const u8 } {
     const dot = std.mem.indexOfScalar(u8, value, '.') orelse return error.InvalidVariable;
     if (dot == 0 or dot + 1 == value.len) return error.InvalidVariable;
@@ -232,4 +288,27 @@ test "environment persistent binding expiration and decay grammars are distinct"
     try std.testing.expectError(error.InvalidOperation, parseDeprecation("IP.score=5/60/2"));
     try std.testing.expectEqual(@as(u32, 60), try parsePositiveU32("60"));
     try std.testing.expectError(error.NumberOutOfRange, parsePositiveU32("0"));
+}
+
+test "allow status skip and runtime modes validate without allocation" {
+    try std.testing.expectEqual(AllowScope.transaction, try parseAllowScope(null));
+    try std.testing.expectEqual(AllowScope.transaction, try parseAllowScope(""));
+    try std.testing.expectEqual(AllowScope.phase, try parseAllowScope("PHASE"));
+    try std.testing.expectEqual(AllowScope.request, try parseAllowScope("request"));
+    try std.testing.expectError(error.InvalidOperation, parseAllowScope("response"));
+
+    try std.testing.expectEqual(@as(u16, 100), try parseStatus("100"));
+    try std.testing.expectEqual(@as(u16, 599), try parseStatus("599"));
+    try std.testing.expectError(error.NumberOutOfRange, parseStatus("99"));
+    try std.testing.expectError(error.InvalidNumber, parseStatus("403x"));
+    try std.testing.expectEqual(@as(u32, 2), try parseSkip("2"));
+    try std.testing.expectError(error.NumberOutOfRange, parseSkip("0"));
+
+    try std.testing.expectEqual(EngineMode.detection_only, try parseEngineMode("DetectionOnly"));
+    try std.testing.expectEqual(AuditEngine.relevant_only, try parseAuditEngine("RelevantOnly"));
+    try std.testing.expect(try parseBoolean("ON"));
+    try std.testing.expect(!(try parseBoolean("off")));
+    try std.testing.expectError(error.InvalidOperation, parseEngineMode("enabled"));
+    try std.testing.expectError(error.InvalidOperation, parseAuditEngine("sometimes"));
+    try std.testing.expectError(error.InvalidOperation, parseBoolean("yes"));
 }
