@@ -261,9 +261,46 @@ pub const Rule = struct {
     transformations_count: u32,
 };
 
-pub const Plan = struct {
+const Component = struct {
     allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
+    references: std.atomic.Value(usize) = .init(1),
+    strings: []const StringRange,
+    string_bytes: []const u8,
+    sources: []const SourceRecord,
+    source_bytes: []const u8,
+    source_lines: []const u32,
+    directives: []const Directive,
+    arguments: []const Argument,
+    rules: []const Rule,
+    targets: []const Target,
+    actions: []const Action,
+    transformations: []const Transformation,
+    prefilter_literals: []const StringId,
+    markers: []const Marker,
+    generic_directives: []const DirectiveId,
+    defaults: []const DefaultSnapshot,
+    phase_rules: [5][]const RuleId,
+    owned_bytes: usize,
+
+    fn retain(self: *Component) void {
+        const previous = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(previous > 0 and previous < std.math.maxInt(usize));
+    }
+
+    fn release(self: *Component) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous > 0);
+        if (previous != 1) return;
+        const allocator = self.allocator;
+        self.arena.deinit();
+        allocator.destroy(self);
+    }
+};
+
+pub const Plan = struct {
+    allocator: std.mem.Allocator,
+    component: *Component,
     compiler_abi: u32,
     fingerprint: Fingerprint,
     strings: []const StringRange,
@@ -286,8 +323,12 @@ pub const Plan = struct {
 
     pub fn deinit(self: *Plan) void {
         const allocator = self.allocator;
-        self.arena.deinit();
+        self.component.release();
         allocator.destroy(self);
+    }
+
+    pub fn sharedReferenceCount(self: *const Plan) usize {
+        return self.component.references.load(.acquire);
     }
 
     pub fn string(self: *const Plan, id: StringId) ?[]const u8 {
@@ -350,6 +391,25 @@ pub fn compile(
     limits: Limits,
 ) CompileError!*Plan {
     return compileDetailed(allocator, registry, documents, limits, null);
+}
+
+/// Compile transactionally, then reuse the prior immutable payload only when
+/// every owned field is exactly equivalent. The public fingerprint is a fast
+/// reject, never the sole equality decision.
+pub fn compileWithPrevious(
+    allocator: std.mem.Allocator,
+    registry: *const seclang.source.Registry,
+    documents: []const seclang.parser.Document,
+    limits: Limits,
+    previous: *const Plan,
+) CompileError!*Plan {
+    const candidate = try compile(allocator, registry, documents, limits);
+    if (!componentsEqual(candidate, previous)) return candidate;
+    candidate.component.release();
+    previous.component.retain();
+    attachComponent(candidate, previous.component);
+    candidate.fingerprint = previous.fingerprint;
+    return candidate;
 }
 
 pub fn compileOutcome(
@@ -700,6 +760,9 @@ const Compiler = struct {
         const plan = try self.allocator.create(Plan);
         errdefer self.allocator.destroy(plan);
         plan.* = undefined;
+        const component = try self.allocator.create(Component);
+        errdefer self.allocator.destroy(component);
+        component.* = undefined;
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         errdefer arena.deinit();
         const arena_allocator = arena.allocator();
@@ -721,11 +784,10 @@ const Compiler = struct {
         for (&phase_rules, &self.phase_rules) |*destination, *items| {
             destination.* = try duplicateCounted(RuleId, arena_allocator, items.items, &owned_bytes, self.limits);
         }
-        plan.* = .{
+        component.* = .{
             .allocator = self.allocator,
             .arena = arena,
-            .compiler_abi = compiler_abi_version,
-            .fingerprint = undefined,
+            .references = .init(1),
             .strings = strings.ranges,
             .string_bytes = strings.bytes,
             .sources = source_data.records,
@@ -744,10 +806,68 @@ const Compiler = struct {
             .phase_rules = phase_rules,
             .owned_bytes = owned_bytes,
         };
+        plan.allocator = self.allocator;
+        attachComponent(plan, component);
         plan.fingerprint = computeFingerprint(plan);
         return plan;
     }
 };
+
+fn attachComponent(plan: *Plan, component: *Component) void {
+    plan.component = component;
+    plan.compiler_abi = compiler_abi_version;
+    plan.strings = component.strings;
+    plan.string_bytes = component.string_bytes;
+    plan.sources = component.sources;
+    plan.source_bytes = component.source_bytes;
+    plan.source_lines = component.source_lines;
+    plan.directives = component.directives;
+    plan.arguments = component.arguments;
+    plan.rules = component.rules;
+    plan.targets = component.targets;
+    plan.actions = component.actions;
+    plan.transformations = component.transformations;
+    plan.prefilter_literals = component.prefilter_literals;
+    plan.markers = component.markers;
+    plan.generic_directives = component.generic_directives;
+    plan.defaults = component.defaults;
+    plan.phase_rules = component.phase_rules;
+    plan.owned_bytes = component.owned_bytes;
+}
+
+fn componentsEqual(first: *const Plan, second: *const Plan) bool {
+    if (first.compiler_abi != second.compiler_abi or
+        !std.mem.eql(u8, &first.fingerprint, &second.fingerprint) or
+        first.owned_bytes != second.owned_bytes or
+        !slicesEqual(StringRange, first.strings, second.strings) or
+        !std.mem.eql(u8, first.string_bytes, second.string_bytes) or
+        !slicesEqual(SourceRecord, first.sources, second.sources) or
+        !std.mem.eql(u8, first.source_bytes, second.source_bytes) or
+        !std.mem.eql(u32, first.source_lines, second.source_lines) or
+        !slicesEqual(Directive, first.directives, second.directives) or
+        !slicesEqual(Argument, first.arguments, second.arguments) or
+        !slicesEqual(Rule, first.rules, second.rules) or
+        !slicesEqual(Target, first.targets, second.targets) or
+        !slicesEqual(Action, first.actions, second.actions) or
+        !slicesEqual(Transformation, first.transformations, second.transformations) or
+        !std.mem.eql(StringId, first.prefilter_literals, second.prefilter_literals) or
+        !slicesEqual(Marker, first.markers, second.markers) or
+        !std.mem.eql(DirectiveId, first.generic_directives, second.generic_directives) or
+        !slicesEqual(DefaultSnapshot, first.defaults, second.defaults))
+    {
+        return false;
+    }
+    for (first.phase_rules, second.phase_rules) |first_phase, second_phase| {
+        if (!std.mem.eql(RuleId, first_phase, second_phase)) return false;
+    }
+    return true;
+}
+
+fn slicesEqual(comptime T: type, first: []const T, second: []const T) bool {
+    if (first.len != second.len) return false;
+    for (first, second) |a, b| if (!std.meta.eql(a, b)) return false;
+    return true;
+}
 
 fn computeFingerprint(plan: *const Plan) Fingerprint {
     var hasher = std.crypto.hash.Blake3.init(.{});
@@ -1110,6 +1230,27 @@ fn typedIndex(value: usize) CompileError!u32 {
     return @intCast(value);
 }
 
+const PlanReadWorker = struct {
+    plan: *const Plan,
+    ready: *std.atomic.Value(usize),
+    release: *std.atomic.Value(bool),
+    failures: *std.atomic.Value(usize),
+
+    fn run(self: *PlanReadWorker) void {
+        _ = self.ready.fetchAdd(1, .release);
+        while (!self.release.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..10_000) |_| {
+            if (self.plan.rules.len != 1 or
+                self.plan.phaseRules(2).len != 1 or
+                !std.mem.eql(u8, self.plan.string(self.plan.rules[0].operator.name).?, "contains"))
+            {
+                _ = self.failures.fetchAdd(1, .monotonic);
+                return;
+            }
+        }
+    }
+};
+
 test "compiled plan owns compact strings rules and source locations" {
     var parsed = try seclang.parser.parseBytes(
         std.testing.allocator,
@@ -1366,4 +1507,68 @@ test "fingerprints are deterministic semantic identities independent of paths" {
     try std.testing.expectEqualSlices(u8, &first_plan.fingerprint, &second_plan.fingerprint);
     try std.testing.expect(!std.mem.eql(u8, &first_plan.fingerprint, &changed_plan.fingerprint));
     try std.testing.expect(!std.mem.allEqual(u8, &first_plan.fingerprint, 0));
+}
+
+test "equivalent generations share immutable payloads in either destruction order" {
+    const input = "SecRule ARGS \"@contains attack\" id:1";
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "shared.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+
+    const first = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    const second = try compileWithPrevious(std.testing.allocator, &parsed.registry, &documents, .{}, first);
+    try std.testing.expectEqual(@as(usize, 2), first.sharedReferenceCount());
+    try std.testing.expectEqual(first.rules.ptr, second.rules.ptr);
+    first.deinit();
+    try std.testing.expectEqual(@as(usize, 1), second.sharedReferenceCount());
+    try std.testing.expectEqualStrings("contains", second.string(second.rules[0].operator.name).?);
+    second.deinit();
+
+    const third = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    const fourth = try compileWithPrevious(std.testing.allocator, &parsed.registry, &documents, .{}, third);
+    fourth.deinit();
+    try std.testing.expectEqual(@as(usize, 1), third.sharedReferenceCount());
+    try std.testing.expectEqualStrings("contains", third.string(third.rules[0].operator.name).?);
+    third.deinit();
+}
+
+test "shared payload survives concurrent reads while another generation retires" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "threaded.conf", "SecRule ARGS \"@contains attack\" id:1", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const retiring = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    const active = try compileWithPrevious(std.testing.allocator, &parsed.registry, &documents, .{}, retiring);
+    defer active.deinit();
+
+    var ready = std.atomic.Value(usize).init(0);
+    var release = std.atomic.Value(bool).init(false);
+    var failures = std.atomic.Value(usize).init(0);
+    var workers: [4]PlanReadWorker = undefined;
+    var threads: [workers.len]std.Thread = undefined;
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .plan = active, .ready = &ready, .release = &release, .failures = &failures };
+        thread.* = try std.Thread.spawn(.{}, PlanReadWorker.run, .{worker});
+    }
+    while (ready.load(.acquire) != workers.len) std.atomic.spinLoopHint();
+    retiring.deinit();
+    try std.testing.expectEqual(@as(usize, 1), active.sharedReferenceCount());
+    release.store(true, .release);
+    for (&threads) |*thread| thread.join();
+    try std.testing.expectEqual(@as(usize, 0), failures.load(.acquire));
+}
+
+test "component reuse requires exact equality after fingerprint screening" {
+    var first_parsed = try seclang.parser.parseBytes(std.testing.allocator, "same.conf", "SecAction pass", .{}, .{});
+    defer first_parsed.deinit();
+    var changed_parsed = try seclang.parser.parseBytes(std.testing.allocator, "same.conf", "SecAction deny", .{}, .{});
+    defer changed_parsed.deinit();
+    var first_documents = [_]seclang.parser.Document{first_parsed.document};
+    var changed_documents = [_]seclang.parser.Document{changed_parsed.document};
+    const first = try compile(std.testing.allocator, &first_parsed.registry, &first_documents, .{});
+    defer first.deinit();
+    const changed = try compileWithPrevious(std.testing.allocator, &changed_parsed.registry, &changed_documents, .{}, first);
+    defer changed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), first.sharedReferenceCount());
+    try std.testing.expectEqual(@as(usize, 1), changed.sharedReferenceCount());
+    try std.testing.expect(first.actions.ptr != changed.actions.ptr);
 }
