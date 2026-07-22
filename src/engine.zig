@@ -1,6 +1,7 @@
 //! Core WAF ownership and transaction lifecycle contracts.
 
 const std = @import("std");
+const action_config = @import("action_config.zig");
 const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
 const directives = @import("directives.zig");
@@ -447,6 +448,7 @@ pub const TransactionError = error{
     InvalidRuleReference,
     InvalidMatchContext,
     TooManyCaptures,
+    InvalidEnvironmentName,
     CollectionSizeOverflow,
     PersistentBackendNotConfigured,
     PersistentTimestampOverflow,
@@ -491,6 +493,15 @@ pub const RuleProjection = struct {
     tags_count: u32,
 };
 
+pub const LocalEffectOutcome = struct {
+    projection: RuleProjection,
+    effects_applied: usize,
+    captures_written: usize,
+    log: bool,
+    audit_log: bool,
+    pending_persistent_effects: usize,
+};
+
 pub const PersistentFailure = enum {
     unavailable,
     timeout,
@@ -511,6 +522,74 @@ fn appendProjectedValue(
     values[count.*] = .{ .collection = .rule, .key = key, .value = value, .source = source };
     count.* += 1;
 }
+
+const ShadowLookup = union(enum) { missing, removed, value: []const u8 };
+
+const ShadowMutation = struct {
+    collection: collections.Name,
+    key: []u8,
+    value: ?[]u8,
+    source: collections.Source,
+};
+
+const ShadowBatch = struct {
+    allocator: std.mem.Allocator,
+    items: std.ArrayList(ShadowMutation) = .empty,
+
+    fn deinit(self: *ShadowBatch) void {
+        for (self.items.items) |item| {
+            self.allocator.free(item.key);
+            if (item.value) |value| self.allocator.free(value);
+        }
+        self.items.deinit(self.allocator);
+    }
+
+    fn putOwned(
+        self: *ShadowBatch,
+        collection: collections.Name,
+        key: []u8,
+        value: ?[]u8,
+        source: collections.Source,
+    ) !void {
+        for (self.items.items) |*item| {
+            if (item.collection != collection or !collection.keysEqual(item.key, key)) continue;
+            self.allocator.free(item.key);
+            if (item.value) |prior| self.allocator.free(prior);
+            item.* = .{ .collection = collection, .key = key, .value = value, .source = source };
+            return;
+        }
+        try self.items.append(self.allocator, .{ .collection = collection, .key = key, .value = value, .source = source });
+    }
+
+    fn putCopy(
+        self: *ShadowBatch,
+        collection: collections.Name,
+        key: []const u8,
+        value: ?[]const u8,
+        source: collections.Source,
+    ) !void {
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_value = if (value) |bytes| try self.allocator.dupe(u8, bytes) else null;
+        errdefer if (owned_value) |bytes| self.allocator.free(bytes);
+        try self.putOwned(collection, owned_key, owned_value, source);
+    }
+
+    fn lookup(self: *const ShadowBatch, collection: collections.Name, key: []const u8) ShadowLookup {
+        for (self.items.items) |item| {
+            if (item.collection != collection or !collection.keysEqual(item.key, key)) continue;
+            return if (item.value) |value| .{ .value = value } else .removed;
+        }
+        return .missing;
+    }
+
+    fn first(self: *const ShadowBatch, collection: collections.Name) ?[]const u8 {
+        for (self.items.items) |item| if (item.collection == collection) {
+            if (item.value) |value| return value;
+        };
+        return null;
+    }
+};
 
 /// Isolated per-request mutable state.
 ///
@@ -623,6 +702,112 @@ pub const Transaction = struct {
         }
         try self.collection_variables.replaceKeys(.tx, &capture_keys, values[0..count]);
         return count;
+    }
+
+    /// Preflight and atomically commit RULE metadata, captures, ENV writes,
+    /// and TX setvar effects for one matched rule/member. Persistent effects
+    /// are counted for the persistence commit stage and never substituted by
+    /// local storage.
+    pub fn applyLocalMatchedRule(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        context: MatchContext,
+    ) TransactionError!LocalEffectOutcome {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        try self.validateMatchContext(context);
+        const plan = self.compiledPlan() orelse return error.MissingCompiledPlan;
+        const rule_index: usize = @backingInt(rule_id);
+        if (rule_index >= plan.rules.len) return error.InvalidRuleReference;
+        const selected = plan.rules[rule_index];
+        const head_index: usize = @backingInt(selected.chain_head);
+        if (head_index >= plan.rules.len) return error.InvalidRuleReference;
+        const head = plan.rules[head_index];
+        if (selected.effects_start + selected.effects_count > plan.nondisruptive_effects.len)
+            return error.InvalidRuleReference;
+
+        var batch: ShadowBatch = .{ .allocator = self.waf.allocator };
+        defer batch.deinit();
+        const projection = try self.stageRuleProjection(&batch, rule_id, selected, head, plan);
+        var result: LocalEffectOutcome = .{
+            .projection = projection,
+            .effects_applied = 0,
+            .captures_written = 0,
+            .log = false,
+            .audit_log = false,
+            .pending_persistent_effects = 0,
+        };
+        const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
+        for (plan.nondisruptive_effects[selected.effects_start..][0..selected.effects_count]) |effect| {
+            switch (effect.kind) {
+                .capture => {
+                    result.captures_written = try self.stageCaptures(&batch, context);
+                    result.effects_applied += 1;
+                },
+                .log => {
+                    result.log = true;
+                    result.effects_applied += 1;
+                },
+                .nolog => {
+                    result.log = false;
+                    result.effects_applied += 1;
+                },
+                .auditlog => {
+                    result.audit_log = true;
+                    result.effects_applied += 1;
+                },
+                .noauditlog => {
+                    result.audit_log = false;
+                    result.effects_applied += 1;
+                },
+                .setenv => {
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, plan);
+                    errdefer self.waf.allocator.free(name);
+                    if (!validEnvironmentName(name)) return error.InvalidEnvironmentName;
+                    const value = try self.expandEffectTextStaged(effect.value orelse return error.InvalidRuleReference, &batch, plan);
+                    errdefer self.waf.allocator.free(value);
+                    try batch.putOwned(.env, name, value, source);
+                    result.effects_applied += 1;
+                },
+                .setvar => {
+                    const configured_collection = effect.collection orelse return error.InvalidRuleReference;
+                    if (configured_collection != .tx) {
+                        result.pending_persistent_effects += 1;
+                        continue;
+                    }
+                    const name = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, plan);
+                    errdefer self.waf.allocator.free(name);
+                    if (name.len == 0) return error.InvalidMatchContext;
+                    const operation = effect.operation orelse return error.InvalidRuleReference;
+                    const expanded_operand = if (effect.value) |value|
+                        try self.expandEffectTextStaged(value, &batch, plan)
+                    else
+                        null;
+                    defer if (expanded_operand) |value| self.waf.allocator.free(value);
+                    const next = try self.evaluateSetVar(&batch, name, operation, expanded_operand);
+                    errdefer if (next) |value| self.waf.allocator.free(value);
+                    try batch.putOwned(.tx, name, next, source);
+                    result.effects_applied += 1;
+                },
+                .initcol, .expirevar, .deprecatevar, .setuid, .setsid, .setrsc => result.pending_persistent_effects += 1,
+            }
+        }
+
+        const keys = try self.waf.allocator.alloc(collections.Key, batch.items.items.len);
+        defer self.waf.allocator.free(keys);
+        var value_count: usize = 0;
+        for (batch.items.items, keys) |item, *key| {
+            key.* = .{ .collection = item.collection, .key = item.key };
+            value_count += @intFromBool(item.value != null);
+        }
+        const values = try self.waf.allocator.alloc(collections.Value, value_count);
+        defer self.waf.allocator.free(values);
+        var value_index: usize = 0;
+        for (batch.items.items) |item| if (item.value) |value| {
+            values[value_index] = .{ .collection = item.collection, .key = item.key, .value = value, .source = item.source };
+            value_index += 1;
+        };
+        try self.collection_variables.replaceKeyGroups(keys, values);
+        return result;
     }
 
     pub fn processConnection(
@@ -1252,6 +1437,157 @@ pub const Transaction = struct {
         }
     }
 
+    fn validateMatchContext(self: *const Transaction, context: MatchContext) TransactionError!void {
+        if (context.name.len == 0 or context.name.len > self.waf.config.limits.max_match_name_bytes or
+            context.value.len > self.waf.config.limits.max_match_value_bytes)
+        {
+            return error.InvalidMatchContext;
+        }
+        if (context.captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
+        _ = std.math.add(usize, context.source.offset, context.source.length) catch return error.InvalidMatchContext;
+        for (context.captures) |maybe_range| if (maybe_range) |range| {
+            if (range.start > range.end or range.end > context.value.len) return error.InvalidMatchContext;
+            const offset = std.math.add(usize, context.source.offset, range.start) catch return error.InvalidMatchContext;
+            _ = std.math.add(usize, offset, range.end - range.start) catch return error.InvalidMatchContext;
+        };
+    }
+
+    fn stageRuleProjection(
+        self: *Transaction,
+        batch: *ShadowBatch,
+        rule_id: compiled_plan.RuleId,
+        selected: compiled_plan.Rule,
+        head: compiled_plan.Rule,
+        plan: *const compiled_plan.Plan,
+    ) TransactionError!RuleProjection {
+        _ = self;
+        const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 0 };
+        const rule_keys = [_][]const u8{ "id", "rev", "msg", "logdata", "severity", "maturity", "accuracy", "ver" };
+        for (rule_keys) |key| try batch.putCopy(.rule, key, null, source);
+        var id_buffer: [24]u8 = undefined;
+        var severity_buffer: [3]u8 = undefined;
+        var maturity_buffer: [3]u8 = undefined;
+        var accuracy_buffer: [3]u8 = undefined;
+        if (head.external_id) |external_id| {
+            const value = std.fmt.bufPrint(&id_buffer, "{d}", .{external_id}) catch unreachable;
+            try batch.putCopy(.rule, "id", value, source);
+        }
+        const metadata = head.metadata;
+        if (metadata.revision) |text| try batch.putCopy(.rule, "rev", plan.string(text.value).?, source);
+        if (metadata.message) |text| try batch.putCopy(.rule, "msg", plan.string(text.value).?, source);
+        if (metadata.log_data) |text| try batch.putCopy(.rule, "logdata", plan.string(text.value).?, source);
+        if (metadata.severity) |severity| {
+            const value = std.fmt.bufPrint(&severity_buffer, "{d}", .{@backingInt(severity)}) catch unreachable;
+            try batch.putCopy(.rule, "severity", value, source);
+        }
+        if (metadata.maturity) |maturity| {
+            const value = std.fmt.bufPrint(&maturity_buffer, "{d}", .{maturity}) catch unreachable;
+            try batch.putCopy(.rule, "maturity", value, source);
+        }
+        if (metadata.accuracy) |accuracy| {
+            const value = std.fmt.bufPrint(&accuracy_buffer, "{d}", .{accuracy}) catch unreachable;
+            try batch.putCopy(.rule, "accuracy", value, source);
+        }
+        if (metadata.version) |text| try batch.putCopy(.rule, "ver", plan.string(text.value).?, source);
+        return .{
+            .rule = rule_id,
+            .chain_head = selected.chain_head,
+            .external_id = head.external_id,
+            .severity = if (metadata.severity) |severity| @backingInt(severity) else null,
+            .tags_count = metadata.tags_count,
+        };
+    }
+
+    fn stageCaptures(self: *Transaction, batch: *ShadowBatch, context: MatchContext) TransactionError!usize {
+        try self.validateMatchContext(context);
+        const empty_source: collections.Source = .{ .origin = context.source.origin, .offset = context.source.offset, .length = 0 };
+        for (capture_keys) |key| try batch.putCopy(.tx, key, null, empty_source);
+        var count: usize = 0;
+        for (context.captures, 0..) |maybe_range, capture_index| {
+            const range = maybe_range orelse continue;
+            const offset = context.source.offset + range.start;
+            const length = range.end - range.start;
+            try batch.putCopy(
+                .tx,
+                capture_keys[capture_index],
+                context.value[range.start..range.end],
+                .{ .origin = context.source.origin, .offset = offset, .length = length },
+            );
+            count += 1;
+        }
+        return count;
+    }
+
+    fn expandEffectTextStaged(
+        self: *Transaction,
+        text: compiled_plan.EffectText,
+        batch: *const ShadowBatch,
+        plan: *const compiled_plan.Plan,
+    ) TransactionError![]u8 {
+        const source = plan.string(text.value) orelse return error.InvalidRuleReference;
+        const program_id = text.macro orelse return self.waf.allocator.dupe(u8, source);
+        const program_index: usize = @backingInt(program_id);
+        if (program_index >= plan.macro_programs.len) return error.InvalidRuleReference;
+        const program = plan.macro_programs[program_index];
+        if (program.tokens_start + program.tokens_count > plan.macro_tokens.len) return error.InvalidRuleReference;
+        try self.updateDuration();
+        var output: std.ArrayList(u8) = .empty;
+        errdefer output.deinit(self.waf.allocator);
+        for (plan.macro_tokens[program.tokens_start..][0..program.tokens_count]) |token| {
+            if (token.source_start + token.source_length > source.len) return error.InvalidRuleReference;
+            const raw = source[token.source_start..][0..token.source_length];
+            const value = switch (token.kind) {
+                .literal => raw,
+                .scalar => if (token.scalar) |name|
+                    resolveMacroScalar(self, name) orelse missingPlanMacro(raw, self.waf.config.macro_missing_policy)
+                else
+                    missingPlanMacro(raw, self.waf.config.macro_missing_policy),
+                .collection => if (token.collection) |name| blk: {
+                    const key = if (token.key) |key_id| plan.string(key_id) else null;
+                    if (key) |selected_key| switch (batch.lookup(name, selected_key)) {
+                        .value => |staged| break :blk staged,
+                        .removed => break :blk missingPlanMacro(raw, self.waf.config.macro_missing_policy),
+                        .missing => {},
+                    } else if (batch.first(name)) |staged| break :blk staged;
+                    break :blk resolveMacroCollection(self, name, key) orelse
+                        missingPlanMacro(raw, self.waf.config.macro_missing_policy);
+                } else missingPlanMacro(raw, self.waf.config.macro_missing_policy),
+            };
+            if (value.len > self.waf.config.limits.max_scalar_value_bytes -| output.items.len)
+                return error.MacroOutputTooLarge;
+            try output.appendSlice(self.waf.allocator, value);
+        }
+        return output.toOwnedSlice(self.waf.allocator);
+    }
+
+    fn evaluateSetVar(
+        self: *Transaction,
+        batch: *const ShadowBatch,
+        name: []const u8,
+        operation: action_config.SetVarOperation,
+        operand: ?[]const u8,
+    ) TransactionError!?[]u8 {
+        return switch (operation) {
+            .set_one => try self.waf.allocator.dupe(u8, "1"),
+            .set => try self.waf.allocator.dupe(u8, operand orelse ""),
+            .remove => null,
+            .add, .subtract => blk: {
+                const current_text = switch (batch.lookup(.tx, name)) {
+                    .value => |value| value,
+                    .removed => "",
+                    .missing => if (self.collection_variables.first(.tx, name)) |value| value.value else "",
+                };
+                const current = persistent.parseNumericOrZero(current_text);
+                const delta = persistent.parseNumericOrZero(operand orelse "");
+                const next = if (operation == .add)
+                    std.math.add(i64, current, delta) catch return error.CapacityExceeded
+                else
+                    std.math.sub(i64, current, delta) catch return error.CapacityExceeded;
+                break :blk try std.fmt.allocPrint(self.waf.allocator, "{d}", .{next});
+            },
+        };
+    }
+
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
         if (self.persistent_session) |*session| session.deinit();
@@ -1439,6 +1775,14 @@ fn validToken(token: []const u8) bool {
             '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}' => true,
             else => false,
         }) return false;
+    }
+    return true;
+}
+
+fn validEnvironmentName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (byte == 0 or byte == '=' or byte == '\r' or byte == '\n') return false;
     }
     return true;
 }
@@ -2142,6 +2486,87 @@ test "compiled effect text expands typed scalar keyed and unkeyed macros" {
     const preserved = try expression_tx.expandEffectText(effect.value.?, std.testing.allocator);
     defer std.testing.allocator.free(preserved);
     try std.testing.expectEqualStrings("/macro-TX.user-ARGS-TX.missing", preserved);
+}
+
+test "local matched-rule effects preflight sequential shadow state and commit atomically" {
+    const input =
+        \\SecDefaultAction "phase:2,log,auditlog,pass"
+        \\SecRule ARGS @rx "id:42,msg:'rule message',severity:CRITICAL,capture,nolog,setvar:'tx.a=1',setvar:'tx.b=+2',setvar:'tx.c=%{TX.a}',setvar:'tx.a=+%{TX.b}',setvar:'!tx.old',setvar:'tx.rule_msg=%{RULE.msg}',setenv:'ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST=%{TX.a}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "local-effects.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const source: collections.Source = .{ .origin = .request_body, .offset = 50, .length = 5 };
+    try tx.setCollectionValue(.tx, "b", "3", source);
+    try tx.setCollectionValue(.tx, "old", "stale", source);
+    try tx.setCollectionValue(.tx, "9", "stale-capture", source);
+    const captures = [_]?CaptureRange{ .{ .start = 0, .end = 5 }, null, .{ .start = 1, .end = 3 } };
+    try std.testing.expect(std.c.getenv("ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST") == null);
+    const outcome = try tx.applyLocalMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = source,
+        .captures = &captures,
+    });
+    try std.testing.expectEqual(@as(usize, 11), outcome.effects_applied);
+    try std.testing.expectEqual(@as(usize, 2), outcome.captures_written);
+    try std.testing.expect(!outcome.log);
+    try std.testing.expect(outcome.audit_log);
+    try std.testing.expectEqual(@as(usize, 0), outcome.pending_persistent_effects);
+    try std.testing.expectEqualStrings("6", (try tx.collectionFirst(.tx, "a")).?.value);
+    try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "b")).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.tx, "c")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.tx, "old")) == null);
+    try std.testing.expectEqualStrings("rule message", (try tx.collectionFirst(.tx, "rule_msg")).?.value);
+    try std.testing.expectEqualStrings("6", (try tx.collectionFirst(.env, "ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST")).?.value);
+    try std.testing.expectEqualStrings("rule message", (try tx.collectionFirst(.rule, "msg")).?.value);
+    try std.testing.expectEqualStrings("value", (try tx.collectionFirst(.tx, "0")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.tx, "1")) == null);
+    try std.testing.expectEqualStrings("al", (try tx.collectionFirst(.tx, "2")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.tx, "9")) == null);
+    try std.testing.expect(std.c.getenv("ZIG_WAF_TEST_ENV_SHOULD_NOT_EXIST") == null);
+}
+
+test "failed local effect preflight preserves RULE ENV and TX state" {
+    const input =
+        \\SecRule ARGS @rx "id:7,msg:'new',setenv:'SHOULD_NOT_COMMIT=changed',setvar:'tx.maximum=+1'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "failed-local-effects.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.20", 1234, "192.0.2.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    const source: collections.Source = .{ .origin = .rule, .offset = 0, .length = 1 };
+    try tx.setCollectionValue(.rule, "msg", "old", source);
+    try tx.setCollectionValue(.tx, "maximum", "9223372036854775807", source);
+    try std.testing.expectError(error.CapacityExceeded, tx.applyLocalMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:value",
+        .value = "value",
+        .source = source,
+    }));
+    try std.testing.expectEqualStrings("old", (try tx.collectionFirst(.rule, "msg")).?.value);
+    try std.testing.expectEqualStrings("9223372036854775807", (try tx.collectionFirst(.tx, "maximum")).?.value);
+    try std.testing.expect((try tx.collectionFirst(.env, "SHOULD_NOT_COMMIT")) == null);
 }
 
 test "compiled feature discovery is explicit" {

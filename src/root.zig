@@ -32,6 +32,7 @@ pub const ClockSource = engine.ClockSource;
 pub const MatchContext = engine.MatchContext;
 pub const CaptureRange = engine.CaptureRange;
 pub const RuleProjection = engine.RuleProjection;
+pub const LocalEffectOutcome = engine.LocalEffectOutcome;
 
 test {
     _ = version;
