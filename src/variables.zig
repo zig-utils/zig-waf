@@ -364,6 +364,34 @@ const Entry = struct {
 pub const StoreError = std.mem.Allocator.Error || error{
     ScalarValueTooLarge,
     ScalarStorageLimitExceeded,
+    DuplicateScalarBatch,
+    TooManyScalarUpdates,
+};
+
+pub const SetValue = struct {
+    name: Name,
+    value: []const u8,
+    origin: Origin,
+    available_from: Availability,
+};
+
+const PreparedUpdate = struct {
+    name: Name,
+    value: OwnedValue = .{},
+    origin: Origin,
+    available_from: Availability,
+};
+
+pub const PreparedBatch = struct {
+    allocator: std.mem.Allocator,
+    updates: []PreparedUpdate,
+    final_total_bytes: usize,
+
+    pub fn deinit(self: *PreparedBatch) void {
+        for (self.updates) |*update| update.value.deinit(self.allocator);
+        self.allocator.free(self.updates);
+        self.* = undefined;
+    }
 };
 
 pub const Store = struct {
@@ -411,6 +439,65 @@ pub const Store = struct {
         var buffer: [32]u8 = undefined;
         const rendered = std.fmt.bufPrint(&buffer, "{d}", .{number}) catch unreachable;
         try self.set(name, rendered, origin, available_from, max_value_bytes, max_total_bytes);
+    }
+
+    /// Allocate and validate a unique scalar update set without changing the
+    /// visible store. `commitPreparedBatch` cannot fail after this succeeds.
+    pub fn prepareBatch(
+        self: *const Store,
+        values: []const SetValue,
+        max_value_bytes: usize,
+        max_total_bytes: usize,
+    ) StoreError!PreparedBatch {
+        if (values.len > self.entries.len) return error.TooManyScalarUpdates;
+        var final_total_bytes = self.total_bytes;
+        for (values, 0..) |value, index| {
+            if (value.value.len > max_value_bytes) return error.ScalarValueTooLarge;
+            for (values[0..index]) |prior| {
+                if (prior.name == value.name) return error.DuplicateScalarBatch;
+            }
+            const entry = &self.entries[@backingInt(value.name)];
+            const previous_len = if (entry.present) entry.value.len else 0;
+            final_total_bytes -= previous_len;
+            if (final_total_bytes > max_total_bytes or value.value.len > max_total_bytes - final_total_bytes)
+                return error.ScalarStorageLimitExceeded;
+            final_total_bytes += value.value.len;
+        }
+
+        const updates = try self.allocator.alloc(PreparedUpdate, values.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (updates[0..initialized]) |*update| update.value.deinit(self.allocator);
+            self.allocator.free(updates);
+        }
+        for (values, updates) |value, *update| {
+            update.* = .{
+                .name = value.name,
+                .origin = value.origin,
+                .available_from = value.available_from,
+            };
+            try update.value.assign(self.allocator, value.value);
+            initialized += 1;
+        }
+        return .{
+            .allocator = self.allocator,
+            .updates = updates,
+            .final_total_bytes = final_total_bytes,
+        };
+    }
+
+    pub fn commitPreparedBatch(self: *Store, prepared: *PreparedBatch) void {
+        std.debug.assert(prepared.allocator.ptr == self.allocator.ptr);
+        for (prepared.updates) |*update| {
+            const entry = &self.entries[@backingInt(update.name)];
+            entry.value.deinit(self.allocator);
+            entry.value = update.value;
+            update.value = .{};
+            entry.origin = update.origin;
+            entry.available_from = update.available_from;
+            entry.present = true;
+        }
+        self.total_bytes = prepared.final_total_bytes;
     }
 
     pub fn get(self: *const Store, name: Name, current: Availability) ?View {
@@ -464,6 +551,53 @@ test "scalar store bounds individual and aggregate values" {
         error.ScalarStorageLimitExceeded,
         store.set(.request_protocol, "HTTP/1.1", .request_target, .request_headers, 8, 8),
     );
+}
+
+test "prepared scalar batch commits without a fallible second phase" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try store.set(.session_id, "old", .rule, .request_headers, 1024, 4096);
+    var long_user: [inline_value_capacity + 1]u8 = @splat('u');
+    var prepared = try store.prepareBatch(&.{
+        .{ .name = .session_id, .value = "new", .origin = .rule, .available_from = .request_headers },
+        .{ .name = .user_id, .value = &long_user, .origin = .rule, .available_from = .request_headers },
+    }, 1024, 4096);
+    defer prepared.deinit();
+    long_user[0] = 'x';
+    try std.testing.expectEqualStrings("old", store.get(.session_id, .request_headers).?.value);
+    try std.testing.expect(store.get(.user_id, .request_headers) == null);
+    store.commitPreparedBatch(&prepared);
+    try std.testing.expectEqualStrings("new", store.get(.session_id, .request_headers).?.value);
+    try std.testing.expectEqual(@as(u8, 'u'), store.get(.user_id, .request_headers).?.value[0]);
+}
+
+test "prepared scalar batch rejects duplicates and preserves state on allocation failure" {
+    var store = Store.init(std.testing.allocator);
+    defer store.deinit();
+    try std.testing.expectError(error.DuplicateScalarBatch, store.prepareBatch(&.{
+        .{ .name = .session_id, .value = "one", .origin = .rule, .available_from = .request_headers },
+        .{ .name = .session_id, .value = "two", .origin = .rule, .available_from = .request_headers },
+    }, 1024, 4096));
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn run(allocator: std.mem.Allocator) !void {
+            var failing = Store.init(allocator);
+            defer failing.deinit();
+            try failing.set(.session_id, "old", .rule, .request_headers, 1024, 4096);
+            var long_user: [inline_value_capacity + 1]u8 = @splat('u');
+            var prepared = failing.prepareBatch(&.{
+                .{ .name = .session_id, .value = "new", .origin = .rule, .available_from = .request_headers },
+                .{ .name = .user_id, .value = &long_user, .origin = .rule, .available_from = .request_headers },
+            }, 1024, 4096) catch |err| {
+                try std.testing.expectEqualStrings("old", failing.get(.session_id, .request_headers).?.value);
+                try std.testing.expect(failing.get(.user_id, .request_headers) == null);
+                return err;
+            };
+            defer prepared.deinit();
+            failing.commitPreparedBatch(&prepared);
+            try std.testing.expectEqualStrings("new", failing.get(.session_id, .request_headers).?.value);
+        }
+    }.run, .{});
 }
 
 test "stable scalar union round trips without duplicate SecLang names" {
