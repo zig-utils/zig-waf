@@ -918,9 +918,29 @@ pub const Executor = struct {
     fn htmlEntityDecodeCoraza(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOfScalar(u8, input, '&') orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
-        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        var output_len = first;
         var index = first;
+        while (index < input.len) {
+            if (input[index] != '&') {
+                output_len = std.math.add(usize, output_len, 1) catch return error.OutputTooLarge;
+                index += 1;
+                continue;
+            }
+            const decoded = decodeCorazaHtmlEntity(input[index..]);
+            if (decoded) |entity| {
+                output_len = std.math.add(usize, output_len, utf8Length(entity.value.first)) catch return error.OutputTooLarge;
+                if (entity.value.second) |second|
+                    output_len = std.math.add(usize, output_len, utf8Length(second)) catch return error.OutputTooLarge;
+                index += entity.consumed;
+            } else {
+                output_len = std.math.add(usize, output_len, 1) catch return error.OutputTooLarge;
+                index += 1;
+            }
+        }
+
+        const generated = try self.writable(output_len);
+        generated.buffer.appendSliceAssumeCapacity(input[0..first]);
+        index = first;
         while (index < input.len) {
             if (input[index] != '&') {
                 generated.buffer.appendAssumeCapacity(input[index]);
@@ -1124,9 +1144,7 @@ pub const Executor = struct {
 
     fn base64Decode(self: *Executor, input: []const u8, extended: bool) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const base_capacity = std.math.mul(usize, input.len / 4, 3) catch return error.OutputTooLarge;
-        const capacity = std.math.add(usize, base_capacity, 2) catch return error.OutputTooLarge;
-        const generated = try self.writable(capacity);
+        const generated = try self.writable(input.len);
         var accumulator: u32 = 0;
         var sextets: u3 = 0;
         var padding: u3 = 0;
@@ -1317,8 +1335,12 @@ pub const Executor = struct {
             }
         }
         if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const capacity = std.math.mul(usize, input.len, 3) catch return error.OutputTooLarge;
-        const generated = try self.writable(capacity);
+        var output_len: usize = 0;
+        for (input) |byte| {
+            const encoded_len: usize = if (byte == ' ' or isUrlUnescaped(byte)) 1 else 3;
+            output_len = std.math.add(usize, output_len, encoded_len) catch return error.OutputTooLarge;
+        }
+        const generated = try self.writable(output_len);
         const digits = "0123456789abcdef";
         for (input) |byte| {
             if (byte == ' ') {
@@ -1602,6 +1624,10 @@ fn appendCodePoint(buffer: *std.ArrayList(u8), code_point: u21) ApplyError!void 
     var encoded: [4]u8 = undefined;
     const length = std.unicode.utf8Encode(code_point, &encoded) catch unreachable;
     buffer.appendSliceAssumeCapacity(encoded[0..length]);
+}
+
+fn utf8Length(code_point: u21) usize {
+    return std.unicode.utf8CodepointSequenceLength(code_point) catch unreachable;
 }
 
 const html_numeric_replacements = [_]u21{
@@ -2041,6 +2067,14 @@ test "HTML entity decoding preserves Coraza HTML5 and Unicode semantics" {
     try std.testing.expect(!short_numeric.changed);
     const unknown = try executor.apply(.html_entity_decode, "&zzzzzz;");
     try std.testing.expectEqual(Storage.borrowed, unknown.storage);
+
+    var bounded = try Executor.initWithProfile(std.testing.allocator, .{
+        .max_output_bytes = 2,
+        .max_cumulative_output_bytes = 2,
+    }, .coraza);
+    defer bounded.deinit();
+    try std.testing.expectEqualStrings("á", (try bounded.apply(.html_entity_decode, "&aacute;")).bytes);
+    try std.testing.expectError(error.OutputTooLarge, bounded.apply(.html_entity_decode, "&euro;"));
 }
 
 test "UTF-8 to Unicode profiles preserve valid and hostile byte semantics" {
@@ -2291,13 +2325,16 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectError(error.InvalidLimits, Executor.init(std.testing.allocator, .{ .max_input_bytes = 0 }));
     var executor = try Executor.init(std.testing.allocator, .{
         .max_input_bytes = 3,
-        .max_output_bytes = 1,
-        .max_cumulative_output_bytes = 1,
+        .max_output_bytes = 3,
+        .max_cumulative_output_bytes = 3,
     });
     defer executor.deinit();
     try std.testing.expectError(error.InputTooLarge, executor.apply(.lowercase, "four"));
-    try std.testing.expectError(error.OutputTooLarge, executor.apply(.uppercase, "ab"));
-    try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!"));
+    try std.testing.expectEqualStrings("AB", (try executor.apply(.uppercase, "ab")).bytes);
+    try std.testing.expectEqualStrings("a+b", (try executor.apply(.url_encode, "a b")).bytes);
+    try std.testing.expectEqualStrings("a", (try executor.apply(.base64_decode, "YQ")).bytes);
+    try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!!"));
+    try std.testing.expectError(error.OutputTooLarge, executor.apply(.base64_encode, "abc"));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {
