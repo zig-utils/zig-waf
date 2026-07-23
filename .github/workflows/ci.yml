@@ -107,6 +107,13 @@ jobs:
           -Dmodsecurity-scanner=../modsecurity/src/parser/seclang-scanner.ll
           -Dmodsecurity-parser=../modsecurity/src/parser/seclang-parser.yy
           -Dcoraza-directives=../coraza/internal/seclang/directivesmap.gen.go
+      - name: Stable transformation inventory
+        working-directory: zig-waf
+        run: >-
+          zig build test-transformation-inventory
+          -Dmodsecurity-transformation-scanner=../modsecurity/src/parser/seclang-scanner.ll
+          -Dmodsecurity-transformation-parser=../modsecurity/src/parser/seclang-parser.yy
+          -Dcoraza-transformations=../coraza/internal/transformations/transformations.go
       - name: Stable directive corpus
         working-directory: zig-waf
         run: >-
