@@ -22,6 +22,7 @@ pub const selectors = @import("selectors.zig");
 pub const seclang = @import("seclang/root.zig");
 pub const variables = @import("variables.zig");
 pub const transformations = @import("transformations.zig");
+pub const transformation_fuzz = @import("transformation_fuzz.zig");
 
 pub const Waf = engine.Waf;
 pub const Runtime = engine.Runtime;
@@ -70,4 +71,5 @@ test {
     _ = selectors;
     _ = seclang;
     _ = variables;
+    _ = transformation_fuzz;
 }

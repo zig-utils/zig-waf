@@ -242,6 +242,23 @@ pub fn build(b: *std.Build) void {
     const action_fuzz_step = b.step("fuzz-actions", "Run deterministic SecLang action runtime fuzz cases");
     action_fuzz_step.dependOn(&run_action_fuzz.step);
 
+    const transformation_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/transformation_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformation_fuzz_module.addImport("waf", waf);
+    const transformation_fuzz = b.addExecutable(.{
+        .name = "transformation-fuzz",
+        .root_module = transformation_fuzz_module,
+    });
+    const run_transformation_fuzz = b.addRunArtifact(transformation_fuzz);
+    const transformation_fuzz_iterations = b.option(usize, "transformation-fuzz-iterations", "Deterministic transformation fuzz case count") orelse 10_000;
+    const transformation_fuzz_seed = b.option(u64, "transformation-fuzz-seed", "Deterministic transformation fuzz seed") orelse 16_045_690_984_503_098_046;
+    run_transformation_fuzz.addArgs(&.{ b.fmt("{d}", .{transformation_fuzz_iterations}), b.fmt("{d}", .{transformation_fuzz_seed}) });
+    const transformation_fuzz_step = b.step("fuzz-transformations", "Run deterministic transformation and pipeline fuzz cases");
+    transformation_fuzz_step.dependOn(&run_transformation_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,

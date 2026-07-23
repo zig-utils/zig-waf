@@ -611,9 +611,10 @@ pub const Executor = struct {
         self.cache_bytes = 0;
     }
 
-    fn writable(self: *Executor, capacity: usize) ApplyError!Scratch {
+    fn writable(self: *Executor, capacity: usize, input: []const u8) ApplyError!Scratch {
         if (capacity > self.limits.max_output_bytes) return error.OutputTooLarge;
-        const slot = self.next_buffer;
+        var slot = self.next_buffer;
+        if (sliceInBuffer(&self.buffers[slot], input)) slot = (slot + 1) % self.buffers.len;
         const buffer = &self.buffers[slot];
         buffer.clearRetainingCapacity();
         try buffer.ensureTotalCapacity(self.allocator, capacity);
@@ -624,12 +625,28 @@ pub const Executor = struct {
         };
     }
 
-    fn finish(generated: Scratch, input: []const u8, changed: bool) Result {
-        if (std.mem.eql(u8, generated.buffer.items, input)) {
+    fn finish(self: *const Executor, generated: Scratch, input: []const u8, changed: bool) Result {
+        if (std.mem.eql(u8, generated.buffer.items, input) and !self.isScratchSlice(input)) {
             generated.buffer.clearRetainingCapacity();
             return .{ .bytes = input, .changed = changed, .storage = .borrowed };
         }
         return .{ .bytes = generated.buffer.items, .changed = changed, .storage = generated.storage };
+    }
+
+    fn isScratchSlice(self: *const Executor, input: []const u8) bool {
+        for (&self.buffers) |*buffer| {
+            if (sliceInBuffer(buffer, input)) return true;
+        }
+        return false;
+    }
+
+    fn sliceInBuffer(buffer: *const std.ArrayList(u8), input: []const u8) bool {
+        if (input.len == 0 or buffer.items.len == 0) return false;
+        const input_start = @intFromPtr(input.ptr);
+        const buffer_start = @intFromPtr(buffer.items.ptr);
+        if (input_start < buffer_start) return false;
+        const offset = input_start - buffer_start;
+        return offset <= buffer.items.len and input.len <= buffer.items.len - offset;
     }
 
     fn mapAsciiCase(self: *Executor, input: []const u8, uppercase: bool) ApplyError!Result {
@@ -642,9 +659,9 @@ pub const Executor = struct {
             }
         }
         if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         for (input) |byte| generated.buffer.appendAssumeCapacity(if (uppercase) std.ascii.toUpper(byte) else std.ascii.toLower(byte));
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn cmdLine(self: *Executor, input: []const u8) ApplyError!Result {
@@ -657,7 +674,7 @@ pub const Executor = struct {
         }
         if (!needs_transform) return .{ .bytes = input, .changed = false, .storage = .borrowed };
 
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         var space = false;
         for (input) |byte| {
             switch (byte) {
@@ -678,7 +695,7 @@ pub const Executor = struct {
             }
         }
         const changed = if (self.profile == .coraza) true else generated.buffer.items.len != input.len;
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn normalisePath(self: *Executor, input: []const u8, windows: bool) ApplyError!Result {
@@ -686,7 +703,7 @@ pub const Executor = struct {
         const rooted = pathByte(input[0], windows) == '/';
         const trailing = pathByte(input[input.len - 1], windows) == '/';
         const reserve = std.math.add(usize, input.len, @intFromBool(self.profile == .coraza and rooted and trailing)) catch return error.OutputTooLarge;
-        const generated = try self.writable(reserve);
+        const generated = try self.writable(reserve, input);
         if (rooted) generated.buffer.appendAssumeCapacity('/');
 
         var index: usize = @intFromBool(rooted);
@@ -716,21 +733,21 @@ pub const Executor = struct {
             .modsecurity => !std.mem.eql(u8, generated.buffer.items, input),
             .coraza => generated.buffer.items.len == 0 or trailing or !equalsMappedPath(generated.buffer.items, input, windows),
         };
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn digest(self: *Executor, input: []const u8, comptime Hash: type) ApplyError!Result {
-        const generated = try self.writable(Hash.digest_length);
+        const generated = try self.writable(Hash.digest_length, input);
         var output: [Hash.digest_length]u8 = undefined;
         Hash.hash(input, &output, .{});
         generated.buffer.appendSliceAssumeCapacity(&output);
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn cssDecode(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOfScalar(u8, input, '\\') orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var changed = self.profile == .coraza;
         var index = first;
@@ -775,13 +792,13 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn escapeSeqDecode(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOfScalar(u8, input, '\\') orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var changed = false;
         var index = first;
@@ -815,13 +832,13 @@ pub const Executor = struct {
             }
             changed = true;
         }
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn jsDecode(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOfScalar(u8, input, '\\') orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var changed = false;
         var index = first;
@@ -850,7 +867,7 @@ pub const Executor = struct {
                 while (digits < 3 and index + 1 + digits < input.len and isOctal(input[index + 1 + digits])) : (digits += 1) {}
                 if (digits == 3 and input[index + 1] > '3') digits = 2;
                 var decoded: u8 = 0;
-                for (input[index + 1 .. index + 1 + digits]) |digit| decoded = decoded * 8 + digit - '0';
+                for (input[index + 1 .. index + 1 + digits]) |digit| decoded = decoded * 8 + (digit - '0');
                 generated.buffer.appendAssumeCapacity(decoded);
                 index += 1 + digits;
                 changed = true;
@@ -863,7 +880,7 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn htmlEntityDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -876,7 +893,7 @@ pub const Executor = struct {
     fn htmlEntityDecodeModSecurity(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOfScalar(u8, input, '&') orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var index = first;
         while (index < input.len) {
@@ -936,7 +953,7 @@ pub const Executor = struct {
             generated.buffer.appendAssumeCapacity(input[index]);
             index += 1;
         }
-        return finish(generated, input, generated.buffer.items.len != input.len);
+        return self.finish(generated, input, generated.buffer.items.len != input.len);
     }
 
     fn htmlEntityDecodeCoraza(self: *Executor, input: []const u8) ApplyError!Result {
@@ -962,7 +979,7 @@ pub const Executor = struct {
             }
         }
 
-        const generated = try self.writable(output_len);
+        const generated = try self.writable(output_len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         index = first;
         while (index < input.len) {
@@ -981,13 +998,13 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, generated.buffer.items.len != input.len);
+        return self.finish(generated, input, generated.buffer.items.len != input.len);
     }
 
     fn removeComments(self: *Executor, input: []const u8) ApplyError!Result {
         if (findCommentStart(input, true) == null)
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         var index: usize = 0;
         var in_comment = false;
         while (index < input.len) {
@@ -1019,13 +1036,13 @@ pub const Executor = struct {
             }
         }
         if (in_comment) generated.buffer.appendAssumeCapacity(' ');
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn removeCommentsChar(self: *Executor, input: []const u8) ApplyError!Result {
         const first = findCommentMarker(input) orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len - 1);
+        const generated = try self.writable(input.len - 1, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var index = first;
         while (index < input.len) {
@@ -1044,13 +1061,13 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn replaceComments(self: *Executor, input: []const u8) ApplyError!Result {
         const first = std.mem.indexOf(u8, input, "/*") orelse
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len - 1);
+        const generated = try self.writable(input.len - 1, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first]);
         var index = first;
         var in_comment = false;
@@ -1070,7 +1087,7 @@ pub const Executor = struct {
             }
         }
         if (in_comment) generated.buffer.appendAssumeCapacity(' ');
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn compressWhitespace(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1082,7 +1099,7 @@ pub const Executor = struct {
             }
         }
         if (first == null) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first.?]);
         var in_whitespace = false;
         for (input[first.?..]) |byte| {
@@ -1095,7 +1112,7 @@ pub const Executor = struct {
                 generated.buffer.appendAssumeCapacity(byte);
             }
         }
-        return finish(generated, input, generated.buffer.items.len != input.len);
+        return self.finish(generated, input, generated.buffer.items.len != input.len);
     }
 
     fn removeBytes(self: *Executor, input: []const u8, comptime predicate: fn (u8) bool) ApplyError!Result {
@@ -1107,18 +1124,18 @@ pub const Executor = struct {
             }
         }
         if (first == null) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len - 1);
+        const generated = try self.writable(input.len - 1, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first.?]);
         for (input[first.? + 1 ..]) |byte| if (!predicate(byte)) generated.buffer.appendAssumeCapacity(byte);
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn replaceNulls(self: *Executor, input: []const u8) ApplyError!Result {
         if (std.mem.indexOfScalar(u8, input, 0) == null)
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         for (input) |byte| generated.buffer.appendAssumeCapacity(if (byte == 0) ' ' else byte);
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn hexDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1128,14 +1145,14 @@ pub const Executor = struct {
         } else if (input.len == 0) {
             return .{ .bytes = input, .changed = false, .storage = .borrowed };
         }
-        const generated = try self.writable(input.len / 2);
+        const generated = try self.writable(input.len / 2, input);
         var index: usize = 0;
         while (index + 1 < input.len) : (index += 2) {
             const high = if (self.profile == .coraza) hexNibble(input[index]).? else modSecurityHexNibble(input[index]);
             const low = if (self.profile == .coraza) hexNibble(input[index + 1]).? else modSecurityHexNibble(input[index + 1]);
             generated.buffer.appendAssumeCapacity(high *% 16 +% low);
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn base64Encode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1143,7 +1160,7 @@ pub const Executor = struct {
             return .{ .bytes = input, .changed = self.profile == .coraza, .storage = .borrowed };
         const groups = std.math.add(usize, input.len, 2) catch return error.OutputTooLarge;
         const capacity = std.math.mul(usize, groups / 3, 4) catch return error.OutputTooLarge;
-        const generated = try self.writable(capacity);
+        const generated = try self.writable(capacity, input);
         const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         var index: usize = 0;
         while (index + 3 <= input.len) : (index += 3) {
@@ -1163,12 +1180,12 @@ pub const Executor = struct {
             generated.buffer.appendAssumeCapacity(if (remaining == 2) alphabet[@intCast((bits >> 6) & 0x3f)] else '=');
             generated.buffer.appendAssumeCapacity('=');
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn base64Decode(self: *Executor, input: []const u8, extended: bool) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         var accumulator: u32 = 0;
         var sextets: u3 = 0;
         var padding: u3 = 0;
@@ -1235,20 +1252,20 @@ pub const Executor = struct {
             },
             else => {},
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn hexEncode(self: *Executor, input: []const u8) ApplyError!Result {
         if (input.len == 0)
             return .{ .bytes = input, .changed = self.profile == .coraza, .storage = .borrowed };
         const capacity = std.math.mul(usize, input.len, 2) catch return error.OutputTooLarge;
-        const generated = try self.writable(capacity);
+        const generated = try self.writable(capacity, input);
         const digits = "0123456789abcdef";
         for (input) |byte| {
             generated.buffer.appendAssumeCapacity(digits[byte >> 4]);
             generated.buffer.appendAssumeCapacity(digits[byte & 0x0f]);
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn sqlHexDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1266,7 +1283,7 @@ pub const Executor = struct {
         }
         if (first == null) return .{ .bytes = input, .changed = false, .storage = .borrowed };
 
-        const generated = try self.writable(input.len - 2);
+        const generated = try self.writable(input.len - 2, input);
         generated.buffer.appendSliceAssumeCapacity(input[0..first.?]);
         index = first.?;
         while (index < input.len) {
@@ -1286,7 +1303,7 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn urlDecode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1317,7 +1334,7 @@ pub const Executor = struct {
         }
         if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
 
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         index = 0;
         while (index < input.len) {
             if (unicode and isValidUrlUnicodeEscape(input, index)) {
@@ -1347,7 +1364,7 @@ pub const Executor = struct {
                 index += 1;
             }
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn urlEncode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1364,7 +1381,7 @@ pub const Executor = struct {
             const encoded_len: usize = if (byte == ' ' or isUrlUnescaped(byte)) 1 else 3;
             output_len = std.math.add(usize, output_len, encoded_len) catch return error.OutputTooLarge;
         }
-        const generated = try self.writable(output_len);
+        const generated = try self.writable(output_len, input);
         const digits = "0123456789abcdef";
         for (input) |byte| {
             if (byte == ' ') {
@@ -1377,7 +1394,7 @@ pub const Executor = struct {
                 generated.buffer.appendAssumeCapacity(digits[byte & 0x0f]);
             }
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn utf8ToUnicode(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1399,7 +1416,7 @@ pub const Executor = struct {
         }
         if (!changed) return .{ .bytes = input, .changed = false, .storage = .borrowed };
 
-        const generated = try self.writable(output_len);
+        const generated = try self.writable(output_len, input);
         index = 0;
         while (index < input.len) {
             const step = strictUtf8Step(input[index..]);
@@ -1410,7 +1427,7 @@ pub const Executor = struct {
             }
             index += step.consumed;
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn utf8ToUnicodeModSecurity(self: *Executor, input: []const u8) ApplyError!Result {
@@ -1427,7 +1444,7 @@ pub const Executor = struct {
         }
         if (!requires_output) return .{ .bytes = input, .changed = changed, .storage = .borrowed };
 
-        const generated = try self.writable(output_len);
+        const generated = try self.writable(output_len, input);
         index = 0;
         while (index < input.len) {
             const step = modSecurityUtf8Step(input, index);
@@ -1436,34 +1453,34 @@ pub const Executor = struct {
             for (0..step.suffix_copies) |_| generated.buffer.appendAssumeCapacity(input[index]);
             index += step.consumed;
         }
-        return finish(generated, input, changed);
+        return self.finish(generated, input, changed);
     }
 
     fn parity(self: *Executor, input: []const u8, even: bool) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         for (input) |byte| {
             const seven = byte & 0x7f;
             const odd_ones = @popCount(seven) % 2 == 1;
             const high: u8 = if (if (even) odd_ones else !odd_ones) 0x80 else 0;
             generated.buffer.appendAssumeCapacity(seven | high);
         }
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn parityZero(self: *Executor, input: []const u8) ApplyError!Result {
         if (input.len == 0) return .{ .bytes = input, .changed = false, .storage = .borrowed };
-        const generated = try self.writable(input.len);
+        const generated = try self.writable(input.len, input);
         for (input) |byte| generated.buffer.appendAssumeCapacity(byte & 0x7f);
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 
     fn length(self: *Executor, input: []const u8) ApplyError!Result {
         var storage: [32]u8 = undefined;
         const rendered = std.fmt.bufPrint(&storage, "{d}", .{input.len}) catch unreachable;
-        const generated = try self.writable(rendered.len);
+        const generated = try self.writable(rendered.len, input);
         generated.buffer.appendSliceAssumeCapacity(rendered);
-        return finish(generated, input, true);
+        return self.finish(generated, input, true);
     }
 };
 
@@ -2058,6 +2075,7 @@ test "JavaScript decoding handles Unicode hex octal and escaped literals" {
     );
     try std.testing.expectEqualStrings("A!~", (try executor.apply(.js_decode, "\\u0041\\uff01\\uFF5e")).bytes);
     try std.testing.expectEqualStrings("?7", (try executor.apply(.js_decode, "\\777")).bytes);
+    try std.testing.expectEqualSlices(u8, &.{0xff}, (try executor.apply(.js_decode, "\\377")).bytes);
     try std.testing.expectEqualStrings("uUxxg", (try executor.apply(.js_decode, "\\u\\U\\x\\xg")).bytes);
 
     const trailing = try executor.apply(.js_decode, "\\");
@@ -2269,6 +2287,18 @@ test "ordered pipelines retain storage and stage multi-match checkpoints" {
     try std.testing.expectEqualStrings("1", upstream_changed.checkpoints[1].bytes);
     const without_multi_match = try executor.applyPipeline(&pipeline, " %41+ ", false);
     try std.testing.expectEqual(@as(usize, 0), without_multi_match.checkpoints.len);
+}
+
+test "equal generated steps preserve scratch rotation without aliasing" {
+    var executor = try Executor.init(std.testing.allocator, .{});
+    defer executor.deinit();
+    const pipeline = [_]Kind{ .uppercase, .parity_zero_7bit, .hex_encode };
+    const result = try executor.applyPipeline(&pipeline, "a", true);
+    try std.testing.expectEqualStrings("41", result.bytes);
+    try std.testing.expectEqual(@as(usize, 4), result.checkpoints.len);
+    try std.testing.expectEqualStrings("A", result.checkpoints[1].bytes);
+    try std.testing.expectEqualStrings("A", result.checkpoints[2].bytes);
+    try std.testing.expectEqualStrings("41", result.checkpoints[3].bytes);
 }
 
 test "pipeline failures publish no partial checkpoint storage" {
