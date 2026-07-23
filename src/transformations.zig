@@ -269,7 +269,31 @@ pub const ApplyError = std.mem.Allocator.Error || error{
     TooManyPipelineSteps,
     CumulativeOutputTooLarge,
     InvalidInput,
+    /// A frozen WAF-22 plugin callback failed. Built-ins never emit this tag.
+    PluginFailure,
 };
+
+pub const FailureKind = enum {
+    configuration,
+    allocation,
+    invalid_input,
+    input_limit,
+    output_limit,
+    work_limit,
+    plugin,
+};
+
+pub fn failureKind(err: ApplyError) FailureKind {
+    return switch (err) {
+        error.InvalidLimits => .configuration,
+        error.OutOfMemory => .allocation,
+        error.InvalidInput => .invalid_input,
+        error.InputTooLarge => .input_limit,
+        error.OutputTooLarge => .output_limit,
+        error.TooManyPipelineSteps, error.CumulativeOutputTooLarge => .work_limit,
+        error.PluginFailure => .plugin,
+    };
+}
 
 /// Reusable bounded scratch for one request worker/transaction. Executor-backed
 /// result bytes remain valid until that same scratch slot is reused (at least
@@ -2335,6 +2359,17 @@ test "executor validates deterministic input and output limits" {
     try std.testing.expectEqualStrings("a", (try executor.apply(.base64_decode, "YQ")).bytes);
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.url_encode, "!!"));
     try std.testing.expectError(error.OutputTooLarge, executor.apply(.base64_encode, "abc"));
+}
+
+test "transformation failures retain stable policy classes" {
+    try std.testing.expectEqual(FailureKind.configuration, failureKind(error.InvalidLimits));
+    try std.testing.expectEqual(FailureKind.allocation, failureKind(error.OutOfMemory));
+    try std.testing.expectEqual(FailureKind.invalid_input, failureKind(error.InvalidInput));
+    try std.testing.expectEqual(FailureKind.input_limit, failureKind(error.InputTooLarge));
+    try std.testing.expectEqual(FailureKind.output_limit, failureKind(error.OutputTooLarge));
+    try std.testing.expectEqual(FailureKind.work_limit, failureKind(error.TooManyPipelineSteps));
+    try std.testing.expectEqual(FailureKind.work_limit, failureKind(error.CumulativeOutputTooLarge));
+    try std.testing.expectEqual(FailureKind.plugin, failureKind(error.PluginFailure));
 }
 
 test "executor scratch ownership is exhaustive-allocation-failure safe" {

@@ -36,8 +36,11 @@ to byte inequality.
 The `Limits` contract defines input, output, pipeline-step, cumulative-output,
 cache-entry, and cache-storage bounds. Ordered execution enforces the step and
 cumulative bounds before returning checkpoints or an operator-visible value.
-Expansion sizes use checked arithmetic. Allocation failure, invalid strict
-input, and limit exhaustion are distinct errors. Tolerant compatibility
+The output limit applies to generated storage; unchanged and sliced results may
+borrow their already input-bounded bytes. Expansions use exact preflight sizing
+and checked arithmetic before scratch capacity is acquired. Allocation failure,
+invalid strict input, input/output/work limit exhaustion, and plugin failure are
+distinct errors with a stable `FailureKind` policy class. Tolerant compatibility
 decoders preserve their specified malformed bytes instead of turning malformed
 input into an engine error.
 
@@ -66,6 +69,35 @@ Coraza-profile HTML entity decoding uses the complete Go 1.25 HTML5 inventory,
 including legacy names without semicolons and paired code points. The generated
 table is SHA-256 pinned and retains the Go Authors' BSD notice. ModSecurity
 mode preserves its smaller byte-oriented named and numeric entity behavior.
+
+## Plugin boundary
+
+WAF-16 publishes only the closed built-in `Kind` union above. Unknown names
+remain plan-publication errors; neither the compiler nor executor performs a
+plugin lookup or runtime string fallback. The native Zig and versioned C
+registration APIs and actual callback dispatch are scoped to
+[WAF-22](https://github.com/zig-utils/zig-waf/issues/23), with these fixed
+ownership rules:
+
+- Registration is builder-only and finishes before rule parsing. Publishing a
+  `Waf` freezes copied descriptors into an immutable registry snapshot and
+  gives accepted plugins dense typed slots. In-flight transactions retain the
+  old snapshot across hot reload.
+- Native Zig and C descriptors normalize into the same internal slot contract.
+  Compiled plans retain a slot plus registry generation/fingerprint, never an
+  arbitrary callback pointer or request-time name.
+- A callback borrows its input only for the call and cannot retain executor
+  scratch, transaction, or builder addresses. Callback output is copied into
+  the transaction executor's bounded storage before it becomes operator-visible.
+- Plugin state owned by the immutable `Waf` must be thread-safe. Mutable
+  per-request state belongs to the `Transaction`; registration and ruleset
+  mutation are forbidden on the request path.
+- Callback allocation, output/work-limit, and plugin failures stay distinct.
+  `PluginFailure` is reserved now so WAF-22 cannot collapse a plugin defect into
+  tolerant malformed-input behavior or silently bypass a rule.
+- A missing, ABI-incompatible, duplicate, or unavailable plugin rejects the
+  ruleset before publication. Reduced builds never convert plugin steps into
+  no-ops.
 
 ## Cryptographic warning
 
