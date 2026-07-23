@@ -148,6 +148,26 @@ pub fn build(b: *std.Build) void {
     const directive_inventory_step = b.step("test-directive-inventory", "Compare the registry with pinned upstream inventories");
     directive_inventory_step.dependOn(&run_directive_inventory.step);
 
+    const transformation_inventory_module = b.createModule(.{
+        .root_source_file = b.path("tools/transformation_inventory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformation_inventory_module.addImport("waf", waf);
+    const transformation_inventory = b.addExecutable(.{
+        .name = "transformation-inventory",
+        .root_module = transformation_inventory_module,
+    });
+    const run_transformation_inventory = b.addRunArtifact(transformation_inventory);
+    if (b.option([]const u8, "modsecurity-transformation-scanner", "Pinned ModSecurity seclang-scanner.ll")) |path|
+        run_transformation_inventory.addArg(path);
+    if (b.option([]const u8, "modsecurity-transformation-parser", "Pinned ModSecurity seclang-parser.yy")) |path|
+        run_transformation_inventory.addArg(path);
+    if (b.option([]const u8, "coraza-transformations", "Pinned Coraza transformations.go")) |path|
+        run_transformation_inventory.addArg(path);
+    const transformation_inventory_step = b.step("test-transformation-inventory", "Compare the typed transformation registry with pinned upstream inventories");
+    transformation_inventory_step.dependOn(&run_transformation_inventory.step);
+
     const crs_configuration_module = b.createModule(.{
         .root_source_file = b.path("tools/crs_configuration.zig"),
         .target = target,
