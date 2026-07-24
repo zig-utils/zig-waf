@@ -11,6 +11,7 @@ pub const engine = @import("engine.zig");
 pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
+pub const operator_fuzz = @import("operator_fuzz.zig");
 pub const plan = @import("plan.zig");
 pub const plan_fuzz = @import("plan_fuzz.zig");
 pub const rule_config = @import("rule_config.zig");
@@ -61,6 +62,7 @@ test {
     _ = flow_evidence;
     _ = macros;
     _ = operators;
+    _ = operator_fuzz;
     _ = plan;
     _ = plan_fuzz;
     _ = rule_config;

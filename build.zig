@@ -279,6 +279,23 @@ pub fn build(b: *std.Build) void {
     const transformation_fuzz_step = b.step("fuzz-transformations", "Run deterministic transformation and pipeline fuzz cases");
     transformation_fuzz_step.dependOn(&run_transformation_fuzz.step);
 
+    const operator_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/operator_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    operator_fuzz_module.addImport("waf", waf);
+    const operator_fuzz = b.addExecutable(.{
+        .name = "operator-fuzz",
+        .root_module = operator_fuzz_module,
+    });
+    const run_operator_fuzz = b.addRunArtifact(operator_fuzz);
+    const operator_fuzz_iterations = b.option(usize, "operator-fuzz-iterations", "Deterministic operator fuzz case count") orelse 10_000;
+    const operator_fuzz_seed = b.option(u64, "operator-fuzz-seed", "Deterministic operator fuzz seed") orelse 11_400_714_819_323_198_485;
+    run_operator_fuzz.addArgs(&.{ b.fmt("{d}", .{operator_fuzz_iterations}), b.fmt("{d}", .{operator_fuzz_seed}) });
+    const operator_fuzz_step = b.step("fuzz-operators", "Run deterministic scalar and regex operator fuzz cases");
+    operator_fuzz_step.dependOn(&run_operator_fuzz.step);
+
     const ownership_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ownership.zig"),
         .target = target,
@@ -451,6 +468,7 @@ pub fn build(b: *std.Build) void {
         plan_fuzz,
         action_fuzz,
         transformation_fuzz,
+        operator_fuzz,
         ownership_benchmark,
         lifecycle_benchmark,
         scalar_benchmark,
