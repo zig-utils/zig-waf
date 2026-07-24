@@ -181,7 +181,7 @@ fn referencedStringBytes(plan: *const waf.plan.Plan) usize {
         total += plan.string(action.raw).?.len + plan.string(action.name).?.len;
         if (action.value) |value| total += plan.string(value).?.len;
     }
-    for (plan.transformations) |transformation| total += plan.string(transformation.name).?.len;
+    for (plan.transformations) |transformation| total += transformation.kind.canonicalName().len;
     for (plan.prefilter_literals) |literal| total += plan.string(literal).?.len;
     return total;
 }
