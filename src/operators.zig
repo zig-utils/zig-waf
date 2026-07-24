@@ -583,6 +583,85 @@ pub fn compileIpMatchFromFileBytes(allocator: std.mem.Allocator, bytes: []const 
     return IpMatcher.buildFromFileBytes(allocator, bytes, limits);
 }
 
+/// `@validateUtf8Encoding`: matches when the input is not valid UTF-8, mirroring
+/// Coraza `!utf8.ValidString`.
+pub fn validateUtf8Encoding(input: []const u8) bool {
+    return !std.unicode.utf8ValidateSlice(input);
+}
+
+/// `@validateUrlEncoding`: matches when the input contains a `%` that is not
+/// followed by two hexadecimal digits, or is truncated. An empty input never
+/// matches. Mirrors the pinned Coraza `validateURLEncodingInternal`.
+pub fn validateUrlEncoding(input: []const u8) bool {
+    if (input.len == 0) return false;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%') {
+            if (i + 2 >= input.len) return true; // not enough bytes
+            if (!isHexDigit(input[i + 1]) or !isHexDigit(input[i + 2])) return true; // non-hex
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    return false;
+}
+
+fn isHexDigit(byte: u8) bool {
+    return (byte >= '0' and byte <= '9') or (byte >= 'a' and byte <= 'f') or (byte >= 'A' and byte <= 'F');
+}
+
+/// A ruleset-owned compiled `@validateByteRange` operator. The comma-separated
+/// argument lists allowed bytes as `start-end` ranges or single values; the
+/// operator matches when the input contains any byte outside the allowed set.
+/// An empty argument matches unconditionally, mirroring Coraza.
+pub const ByteRangeOperator = struct {
+    valid: [256]bool,
+    always_match: bool,
+
+    pub const CompileError = error{InvalidByteRange};
+
+    pub fn compile(argument: []const u8) CompileError!ByteRangeOperator {
+        if (argument.len == 0) return .{ .valid = @splat(false), .always_match = true };
+        var valid: [256]bool = @splat(false);
+        var it = std.mem.splitScalar(u8, argument, ',');
+        while (it.next()) |token_raw| {
+            const token = std.mem.trim(u8, token_raw, " \t\r\n");
+            if (std.mem.indexOfScalar(u8, token, '-')) |dash| {
+                const start = parseByte(token[0..dash]) orelse return error.InvalidByteRange;
+                const end = parseByte(token[dash + 1 ..]) orelse return error.InvalidByteRange;
+                var byte: usize = start;
+                while (byte <= end) : (byte += 1) valid[byte] = true;
+            } else {
+                const byte = parseByte(token) orelse return error.InvalidByteRange;
+                valid[byte] = true;
+            }
+        }
+        return .{ .valid = valid, .always_match = false };
+    }
+
+    /// Whether the input contains a byte outside the allowed set.
+    pub fn matches(self: *const ByteRangeOperator, input: []const u8) bool {
+        if (self.always_match) return true;
+        if (input.len == 0) return false;
+        for (input) |byte| {
+            if (!self.valid[byte]) return true;
+        }
+        return false;
+    }
+
+    fn parseByte(text: []const u8) ?usize {
+        if (text.len == 0) return null;
+        var value: usize = 0;
+        for (text) |digit| {
+            if (digit < '0' or digit > '9') return null;
+            value = value * 10 + (digit - '0');
+            if (value > 255) return null;
+        }
+        return value;
+    }
+};
+
 /// The compiled multi-pattern and IP-set operators. Unlike the scalar `Kind`
 /// union these carry a compiled automaton or subnet set, so they resolve to a
 /// constructor rather than the allocation-free `evaluate` dispatch.
@@ -829,6 +908,46 @@ test "ipMatchFromFile parses one subnet per line" {
     try std.testing.expect(matcher.matches("10.1.2.3"));
     try std.testing.expect(matcher.matches("2001:db8::1"));
     try std.testing.expect(!matcher.matches("192.168.1.1"));
+}
+
+test "validateUtf8Encoding matches only invalid UTF-8" {
+    try std.testing.expect(!validateUtf8Encoding("valid ascii"));
+    try std.testing.expect(!validateUtf8Encoding("caf\xc3\xa9"));
+    try std.testing.expect(!validateUtf8Encoding(""));
+    try std.testing.expect(validateUtf8Encoding("\xff"));
+    try std.testing.expect(validateUtf8Encoding("bad\xc3end"));
+}
+
+test "validateUrlEncoding matches malformed percent sequences" {
+    try std.testing.expect(!validateUrlEncoding(""));
+    try std.testing.expect(!validateUrlEncoding("no percent here"));
+    try std.testing.expect(!validateUrlEncoding("valid%20space%2Fslash"));
+    try std.testing.expect(validateUrlEncoding("bad%zz"));
+    try std.testing.expect(validateUrlEncoding("truncated%4"));
+    try std.testing.expect(validateUrlEncoding("end%"));
+}
+
+test "validateByteRange flags bytes outside the allowed set" {
+    var full = try ByteRangeOperator.compile("0-255");
+    try std.testing.expect(!full.matches("abcdefghi"));
+    try std.testing.expect(!full.matches(""));
+
+    var ascii = try ByteRangeOperator.compile("32-126");
+    try std.testing.expect(!ascii.matches("Hello World"));
+    try std.testing.expect(ascii.matches("tab\there"));
+    try std.testing.expect(ascii.matches("high\xff"));
+
+    var singles = try ByteRangeOperator.compile("65,66,67");
+    try std.testing.expect(!singles.matches("ABC"));
+    try std.testing.expect(singles.matches("ABCD"));
+
+    // An empty argument matches unconditionally.
+    var empty = try ByteRangeOperator.compile("");
+    try std.testing.expect(empty.matches("anything"));
+    try std.testing.expect(empty.matches(""));
+
+    try std.testing.expectError(error.InvalidByteRange, ByteRangeOperator.compile("300"));
+    try std.testing.expectError(error.InvalidByteRange, ByteRangeOperator.compile("a-z"));
 }
 
 test "matcher operator names and aliases resolve case-insensitively" {
