@@ -1786,10 +1786,33 @@ pub const Transaction = struct {
         try self.setFlagIfMissing(.reqbody_processor_error, false, .request_body, .request_body);
         try self.setFlagIfMissing(.inbound_data_error, false, .request_body, .request_body);
         if (self.request_body_buffer) |*buffer| {
-            try self.setScalar(.request_body, buffer.inMemory(), .parser, .request_body);
+            const body = buffer.inMemory();
+            try self.setScalar(.request_body, body, .parser, .request_body);
+            if (self.scalar_variables.get(.reqbody_processor, .request_body)) |processor| {
+                if (std.mem.eql(u8, processor.value, "URLENCODED")) try self.parseBodyArguments(body);
+            }
         }
         self.phase_interrupted = false;
         self.lifecycle = .request_body;
+    }
+
+    /// Populate ARGS_POST from a urlencoded request body, reusing the pinned
+    /// query decoding and the configured SecArgumentSeparator.
+    fn parseBodyArguments(self: *Transaction, body: []const u8) TransactionError!void {
+        if (body.len == 0) return;
+        const scratch = try self.waf.allocator.alloc(u8, body.len);
+        defer self.waf.allocator.free(scratch);
+        var it = request.parseQuery(body, self.argumentSeparator());
+        while (it.next()) |pair| {
+            const key = request.queryUnescape(scratch, pair.key);
+            const value = request.queryUnescape(scratch[key.len..], pair.value);
+            const source: collections.Source = .{
+                .origin = .request_body,
+                .offset = @intFromPtr(pair.key.ptr) - @intFromPtr(body.ptr),
+                .length = pair.key.len + 1 + pair.value.len,
+            };
+            try self.addArgument(.body, key, value, source);
+        }
     }
 
     pub fn addResponseHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
@@ -3529,6 +3552,10 @@ test "request body is buffered and exposed as REQUEST_BODY" {
 
     try std.testing.expectEqualStrings("name=alice&city=paris", (try tx.scalar(.request_body)).?.value);
     try std.testing.expectEqualStrings("21", (try tx.scalar(.request_body_length)).?.value);
+    // The urlencoded body processor populates ARGS_POST from the buffered body.
+    try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "name")).?.value);
+    try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args_post, "city")).?.value);
+    try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args, "city")).?.value);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
