@@ -893,6 +893,8 @@ pub const Transaction = struct {
     /// Lazily initialized on the first body chunk; buffers the request body in
     /// memory up to the request-body limit and exposes it as REQUEST_BODY.
     request_body_buffer: ?request_buffer.Buffer = null,
+    /// The response-body counterpart, exposed as RESPONSE_BODY.
+    response_body_buffer: ?request_buffer.Buffer = null,
     pending_intervention: ?Intervention = null,
     scalar_variables: variables.Store,
     collection_variables: collections.Store,
@@ -1924,6 +1926,18 @@ pub const Transaction = struct {
         if (chunk.len > self.waf.config.limits.max_response_body_bytes - self.response_body_bytes) {
             return error.ResponseBodyLimitExceeded;
         }
+        if (self.control_state.response_body_access) {
+            if (self.response_body_buffer == null) {
+                self.response_body_buffer = request_buffer.Buffer.init(self.waf.allocator, .{
+                    .in_memory_limit = self.waf.config.limits.max_response_body_bytes,
+                    .total_limit = self.waf.config.limits.max_response_body_bytes,
+                }, .reject, null) catch return error.ResponseBodyLimitExceeded;
+            }
+            self.response_body_buffer.?.write(chunk) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.ResponseBodyLimitExceeded,
+            };
+        }
         const next_body_bytes = self.response_body_bytes + chunk.len;
         try self.setScalarUnsigned(.response_content_length, next_body_bytes, .response, .response_body);
         self.response_body_bytes = next_body_bytes;
@@ -1938,6 +1952,9 @@ pub const Transaction = struct {
         try self.setFlagIfMissing(.outbound_data_error, false, .response, .response_body);
         try self.setFlagIfMissing(.res_body_error, false, .response, .response_body);
         try self.setFlagIfMissing(.res_body_processor_error, false, .response, .response_body);
+        if (self.response_body_buffer) |*buffer| {
+            try self.setScalar(.response_body, buffer.inMemory(), .parser, .response_body);
+        }
         self.phase_interrupted = false;
         self.lifecycle = .response_body;
     }
@@ -2838,6 +2855,7 @@ pub const Transaction = struct {
         self.rule_exclusion_bytes = 0;
         self.transformation_executor.deinit();
         if (self.request_body_buffer) |*buffer| buffer.deinit();
+        if (self.response_body_buffer) |*buffer| buffer.deinit();
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
@@ -3622,6 +3640,25 @@ test "request body is buffered and exposed as REQUEST_BODY" {
     try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "name")).?.value);
     try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args_post, "city")).?.value);
     try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args, "city")).?.value);
+}
+
+test "response body is buffered and exposed as RESPONSE_BODY" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.processRequestBody();
+    try tx.addResponseHeader("content-type", "text/html");
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    try tx.writeResponseBody("<html>");
+    try tx.writeResponseBody("<body>ok</body></html>");
+    try tx.processResponseBody();
+
+    try std.testing.expectEqualStrings("<html><body>ok</body></html>", (try tx.scalar(.response_body)).?.value);
 }
 
 test "JSON request body flattens into ARGS_POST" {
