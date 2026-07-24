@@ -128,6 +128,24 @@
       "notes": "Native adapter is live; complete libinjection differential parity is not yet claimed."
     },
     {
+      "id": "operator.scalar-operators",
+      "area": "operators",
+      "name": "Numeric, string, and regex scalar operators",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/18",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/operators.zig",
+        "tests/operator_evidence.zig",
+        "tests/fixtures/operators/coraza",
+        "benchmarks/operators.zig",
+        "docs/operators.md"
+      ],
+      "notes": "eq/ge/gt/le/lt, beginsWith/endsWith/contains/strmatch/within/streq/containsWord, and rx/rxGlobal/rsub resolve case-insensitively to a typed union. Numeric parsing preserves the ModSecurity std::stoi and Coraza strconv.Atoi profiles; rx exposes capture fields 0..9, bounded compile and runtime errors, empty-pattern always-match, and optional per-worker LRU memoization. rsub preserves the pinned ModSecurity 3.0.16 always-true stub. Evidence covers the 118-case Coraza operator corpus and ReleaseFast benchmarks. Engine rule-evaluation wiring and detectSQLi/detectXSS parity remain separate issues."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",

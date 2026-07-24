@@ -47,3 +47,6 @@ Pantry-linked LMDB backend are documented in
 The stable transformation union, ownership, bounded pipelines, caching, and
 ModSecurity/Coraza profile byte semantics are documented in
 [Transformation contracts](transformations.md).
+The stable scalar and regex operator union, numeric parsing profiles, captures,
+memoization, and bounded regex errors are documented in
+[Operator contracts](operators.md).
