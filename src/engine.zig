@@ -10,6 +10,7 @@ const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
 const request_buffer = @import("request_buffer.zig");
+const multipart = @import("multipart.zig");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
 const transformations = @import("transformations.zig");
@@ -1814,6 +1815,8 @@ pub const Transaction = struct {
                     try self.parseBodyArguments(body);
                 } else if (std.mem.eql(u8, name, "JSON")) {
                     try self.parseJsonBody(.request, body);
+                } else if (std.mem.eql(u8, name, "MULTIPART")) {
+                    try self.parseMultipartBody(body);
                 }
             }
         }
@@ -1912,6 +1915,65 @@ pub const Transaction = struct {
             // RESPONSE_ARGS is a plain map keyed by flattened path (no ARGS
             // aggregate), matching Coraza's ResponseArgs().SetIndex.
             .response => try self.collection_variables.set(.response_args, name, value, .{ .origin = .response, .offset = 0, .length = value.len }),
+        }
+    }
+
+    /// Parse a multipart/form-data body, pinned to ModSecurity's multipart
+    /// processor: fields populate ARGS_POST; file parts populate FILES,
+    /// FILES_NAMES, FILES_SIZES and the FILES_COMBINED_SIZE running total;
+    /// every part's raw header lines go to MULTIPART_PART_HEADERS keyed by the
+    /// part name; and Content-Disposition name/filename params are mirrored into
+    /// MULTIPART_NAME/MULTIPART_FILENAME. Parts without a name are skipped for
+    /// ARGS/FILES. A missing boundary or an unterminated part raises
+    /// MULTIPART_STRICT_ERROR.
+    fn parseMultipartBody(self: *Transaction, body: []const u8) TransactionError!void {
+        const content_type = self.collection_variables.first(.request_headers, "content-type") orelse {
+            try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+            return;
+        };
+        const boundary = multipart.boundaryFromContentType(content_type.value) orelse {
+            try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+            return;
+        };
+        var reader = multipart.Reader.init(self.waf.allocator, body, boundary) catch {
+            try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+            return;
+        };
+        defer reader.deinit();
+
+        const source: collections.Source = .{ .origin = .request_body, .offset = 0, .length = 0 };
+        var combined_size: u64 = 0;
+        while (reader.next()) |part| {
+            if (part.incomplete) try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+            const part_name = part.name();
+
+            // MULTIPART_NAME / MULTIPART_FILENAME mirror the disposition params.
+            if (part_name) |value| try self.collection_variables.set(.multipart_name, value, value, source);
+            if (part.filename()) |value| try self.collection_variables.set(.multipart_filename, value, value, source);
+
+            // MULTIPART_PART_HEADERS records every raw header line, keyed by the
+            // part name (empty when the part has no Content-Disposition name).
+            const header_key = part_name orelse "";
+            var lines = part.rawHeaderLines();
+            while (lines.next()) |line| {
+                try self.collection_variables.add(.multipart_part_headers, header_key, line, source);
+            }
+
+            // ModSecurity skips parts without a Content-Disposition name for the
+            // ARGS/FILES collections.
+            const name = part_name orelse continue;
+            if (part.filename()) |filename| {
+                const size = part.body.len;
+                combined_size += size;
+                try self.collection_variables.add(.files, name, filename, source);
+                try self.collection_variables.add(.files_names, name, name, source);
+                var size_buffer: [24]u8 = undefined;
+                const size_text = std.fmt.bufPrint(&size_buffer, "{d}", .{size}) catch unreachable;
+                try self.collection_variables.add(.files_sizes, name, size_text, source);
+                try self.setScalarUnsigned(.files_combined_size, combined_size, .parser, .request_body);
+            } else {
+                try self.addArgument(.body, name, part.body, source);
+            }
         }
     }
 
@@ -3866,6 +3928,46 @@ test "ctl:requestBodyProcessor overrides the Content-Type-derived processor" {
     try std.testing.expectEqualStrings("JSON", (try tx.scalar(.reqbody_processor)).?.value);
     try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "json.name")).?.value);
     try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.args_post, "json.tags")).?.value);
+}
+
+test "a multipart body populates ARGS_POST and the FILES collections" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/upload", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "multipart/form-data; boundary=X");
+    try tx.processRequestHeaders();
+    const body =
+        "--X\r\n" ++
+        "Content-Disposition: form-data; name=\"field\"\r\n\r\n" ++
+        "hello\r\n" ++
+        "--X\r\n" ++
+        "Content-Disposition: form-data; name=\"upload\"; filename=\"a.txt\"\r\n" ++
+        "Content-Type: text/plain\r\n\r\n" ++
+        "file-body\r\n" ++
+        "--X--\r\n";
+    try tx.writeRequestBody(body);
+    try tx.processRequestBody();
+
+    try std.testing.expectEqualStrings("MULTIPART", (try tx.scalar(.reqbody_processor)).?.value);
+    // A field becomes an ARGS_POST argument.
+    try std.testing.expectEqualStrings("hello", (try tx.collectionFirst(.args_post, "field")).?.value);
+    // A file part fills FILES (client filename), FILES_NAMES (field), and sizes.
+    try std.testing.expectEqualStrings("a.txt", (try tx.collectionFirst(.files, "upload")).?.value);
+    try std.testing.expectEqualStrings("upload", (try tx.collectionFirst(.files_names, "upload")).?.value);
+    try std.testing.expectEqualStrings("9", (try tx.collectionFirst(.files_sizes, "upload")).?.value);
+    try std.testing.expectEqualStrings("9", (try tx.scalar(.files_combined_size)).?.value);
+    // MULTIPART_NAME / MULTIPART_FILENAME mirror the disposition parameters.
+    try std.testing.expectEqualStrings("upload", (try tx.collectionFirst(.multipart_name, "upload")).?.value);
+    try std.testing.expectEqualStrings("a.txt", (try tx.collectionFirst(.multipart_filename, "a.txt")).?.value);
+    // Raw part header lines are recorded verbatim, keyed by the part name.
+    try std.testing.expectEqualStrings(
+        "Content-Disposition: form-data; name=\"field\"",
+        (try tx.collectionFirst(.multipart_part_headers, "field")).?.value,
+    );
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
