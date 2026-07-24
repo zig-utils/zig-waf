@@ -662,6 +662,7 @@ pub const ControlState = struct {
     request_body_limit: usize,
     request_body_processor: ?action_config.BodyProcessor = null,
     response_body_access: bool = true,
+    response_body_processor: ?action_config.BodyProcessor = null,
 };
 
 pub const RuleExclusion = union(enum) {
@@ -1447,6 +1448,12 @@ pub const Transaction = struct {
                         staged.response_body_access = action_config.parseBoolean(expanded) catch
                             return error.InvalidActionValue;
                     },
+                    .response_body_processor => {
+                        const phase = self.currentPhase() orelse return error.InvalidLifecycle;
+                        if (@backingInt(phase) > @backingInt(Phase.response_headers)) return error.ControlTooLate;
+                        staged.response_body_processor = action_config.parseBodyProcessor(expanded) catch
+                            return error.InvalidActionValue;
+                    },
                     .rule_remove_by_id => {
                         if (self.rule_exclusions.items.len + self.target_exclusions.items.len + self.regex_target_exclusions.items.len +
                             staged_exclusions.items.len + staged_target_exclusions.items.len + staged_regex_target_exclusions.items.len ==
@@ -1794,7 +1801,7 @@ pub const Transaction = struct {
                 if (std.mem.eql(u8, processor.value, "URLENCODED")) {
                     try self.parseBodyArguments(body);
                 } else if (std.mem.eql(u8, processor.value, "JSON")) {
-                    try self.parseJsonBody(body);
+                    try self.parseJsonBody(.request, body);
                 }
             }
         }
@@ -1825,19 +1832,27 @@ pub const Transaction = struct {
     /// rooted at `json` with array indices and per-array length entries,
     /// matching the pinned Coraza JSON body processor. Invalid JSON sets the
     /// request-body processor error flag.
-    fn parseJsonBody(self: *Transaction, body: []const u8) TransactionError!void {
+    /// Which body's collections a JSON flatten populates: ARGS_POST for the
+    /// request, RESPONSE_ARGS for the response, matching the pinned Coraza JSON
+    /// body processor's request/response split.
+    const BodyTarget = enum { request, response };
+
+    fn parseJsonBody(self: *Transaction, target: BodyTarget, body: []const u8) TransactionError!void {
         var parsed = std.json.parseFromSlice(std.json.Value, self.waf.allocator, body, .{}) catch {
-            try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body);
+            switch (target) {
+                .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
+                .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
+            }
             return;
         };
         defer parsed.deinit();
         var key: std.ArrayList(u8) = .empty;
         defer key.deinit(self.waf.allocator);
         try key.appendSlice(self.waf.allocator, "json");
-        try self.flattenJson(&key, parsed.value);
+        try self.flattenJson(target, &key, parsed.value);
     }
 
-    fn flattenJson(self: *Transaction, key: *std.ArrayList(u8), value: std.json.Value) TransactionError!void {
+    fn flattenJson(self: *Transaction, target: BodyTarget, key: *std.ArrayList(u8), value: std.json.Value) TransactionError!void {
         const gpa = self.waf.allocator;
         switch (value) {
             .object => |object| {
@@ -1846,7 +1861,7 @@ pub const Transaction = struct {
                     const base = key.items.len;
                     try key.append(gpa, '.');
                     try key.appendSlice(gpa, entry.key_ptr.*);
-                    try self.flattenJson(key, entry.value_ptr.*);
+                    try self.flattenJson(target, key, entry.value_ptr.*);
                     key.shrinkRetainingCapacity(base);
                 }
             },
@@ -1856,31 +1871,36 @@ pub const Transaction = struct {
                     try key.append(gpa, '.');
                     var idx_buf: [24]u8 = undefined;
                     try key.appendSlice(gpa, std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable);
-                    try self.flattenJson(key, item);
+                    try self.flattenJson(target, key, item);
                     key.shrinkRetainingCapacity(base);
                 }
                 if (array.items.len > 0) {
                     var buf: [24]u8 = undefined;
-                    try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{array.items.len}) catch unreachable);
+                    try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{array.items.len}) catch unreachable);
                 }
             },
-            .string => |string| try self.addJsonArg(key.items, string),
-            .null => try self.addJsonArg(key.items, ""),
-            .bool => |boolean| try self.addJsonArg(key.items, if (boolean) "true" else "false"),
+            .string => |string| try self.addJsonArg(target, key.items, string),
+            .null => try self.addJsonArg(target, key.items, ""),
+            .bool => |boolean| try self.addJsonArg(target, key.items, if (boolean) "true" else "false"),
             .integer => |integer| {
                 var buf: [24]u8 = undefined;
-                try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{integer}) catch unreachable);
+                try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{integer}) catch unreachable);
             },
             .float => |float| {
                 var buf: [32]u8 = undefined;
-                try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable);
+                try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable);
             },
-            .number_string => |raw| try self.addJsonArg(key.items, raw),
+            .number_string => |raw| try self.addJsonArg(target, key.items, raw),
         }
     }
 
-    fn addJsonArg(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
-        try self.addArgument(.body, name, value, .{ .origin = .request_body, .offset = 0, .length = value.len });
+    fn addJsonArg(self: *Transaction, target: BodyTarget, name: []const u8, value: []const u8) TransactionError!void {
+        switch (target) {
+            .request => try self.addArgument(.body, name, value, .{ .origin = .request_body, .offset = 0, .length = value.len }),
+            // RESPONSE_ARGS is a plain map keyed by flattened path (no ARGS
+            // aggregate), matching Coraza's ResponseArgs().SetIndex.
+            .response => try self.collection_variables.set(.response_args, name, value, .{ .origin = .response, .offset = 0, .length = value.len }),
+        }
     }
 
     pub fn addResponseHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
@@ -1953,7 +1973,31 @@ pub const Transaction = struct {
         try self.setFlagIfMissing(.res_body_error, false, .response, .response_body);
         try self.setFlagIfMissing(.res_body_processor_error, false, .response, .response_body);
         if (self.response_body_buffer) |*buffer| {
-            try self.setScalar(.response_body, buffer.inMemory(), .parser, .response_body);
+            const body = buffer.inMemory();
+            try self.setScalar(.response_body, body, .parser, .response_body);
+            // The response body processor is opt-in via ctl:responseBodyProcessor
+            // (no Content-Type auto-detection, matching Coraza). Prefer the ctl
+            // override; a connector may instead publish RES_BODY_PROCESSOR
+            // directly. JSON flattens into RESPONSE_ARGS with the same dotted
+            // keys as the request side.
+            const processor: ?[]const u8 = blk: {
+                if (self.control_state.response_body_processor) |bp| {
+                    // canonicalName is a static literal, so publishing it does not
+                    // alias the scalar store being written.
+                    const name = bp.canonicalName();
+                    try self.setScalar(.res_body_processor, name, .parser, .response_body);
+                    break :blk name;
+                }
+                // A connector may have published RES_BODY_PROCESSOR directly; use
+                // it as-is without rewriting (that would alias its own storage).
+                if (self.scalar_variables.get(.res_body_processor, .response_body)) |existing| break :blk existing.value;
+                break :blk null;
+            };
+            if (processor) |name| {
+                if (std.mem.eql(u8, name, "JSON")) {
+                    try self.parseJsonBody(.response, body);
+                }
+            }
         }
         self.phase_interrupted = false;
         self.lifecycle = .response_body;
@@ -3683,6 +3727,92 @@ test "JSON request body flattens into ARGS_POST" {
     try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.args_post, "json.tags")).?.value);
     try std.testing.expectEqualStrings("30", (try tx.collectionFirst(.args_post, "json.age")).?.value);
     try std.testing.expectEqualStrings("true", (try tx.collectionFirst(.args_post, "json.admin")).?.value);
+}
+
+test "ctl:responseBodyProcessor flattens a JSON response body into RESPONSE_ARGS" {
+    // The response body processor is opt-in via ctl at the response-headers
+    // phase (Coraza has no Content-Type auto-detection for responses).
+    const input =
+        \\SecRule RESPONSE_HEADERS:Content-Type "@rx json" "id:1,phase:3,ctl:responseBodyProcessor=JSON,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "response-json.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.processRequestBody();
+    try tx.addResponseHeader("content-type", "application/json");
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+
+    var cursor = try PhaseCursor.init(&tx, .response_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "RESPONSE_HEADERS:Content-Type",
+        .value = "application/json",
+        .source = .{ .origin = .response_header, .offset = 0, .length = 16 },
+    });
+    try std.testing.expectEqual(action_config.BodyProcessor.json, tx.controlState().response_body_processor.?);
+
+    try tx.writeResponseBody(
+        \\{"name":"alice","tags":["a","b"],"age":30,"admin":true}
+    );
+    try tx.processResponseBody();
+
+    try std.testing.expectEqualStrings("JSON", (try tx.scalar(.res_body_processor)).?.value);
+    try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.response_args, "json.name")).?.value);
+    try std.testing.expectEqualStrings("a", (try tx.collectionFirst(.response_args, "json.tags.0")).?.value);
+    try std.testing.expectEqualStrings("b", (try tx.collectionFirst(.response_args, "json.tags.1")).?.value);
+    // The array's own key carries its length, matching the request side.
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.response_args, "json.tags")).?.value);
+    try std.testing.expectEqualStrings("30", (try tx.collectionFirst(.response_args, "json.age")).?.value);
+    try std.testing.expectEqualStrings("true", (try tx.collectionFirst(.response_args, "json.admin")).?.value);
+    // RESPONSE_ARGS is a plain map — ARGS_POST is untouched by the response body.
+    try std.testing.expect((try tx.collectionFirst(.args_post, "json.name")) == null);
+}
+
+test "an invalid JSON response body raises RES_BODY_PROCESSOR_ERROR" {
+    const input =
+        \\SecRule RESPONSE_HEADERS:Content-Type "@rx json" "id:1,phase:3,ctl:responseBodyProcessor=JSON,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "response-json-bad.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.processRequestBody();
+    try tx.addResponseHeader("content-type", "application/json");
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+
+    var cursor = try PhaseCursor.init(&tx, .response_headers);
+    _ = (try cursor.next()).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "RESPONSE_HEADERS:Content-Type",
+        .value = "application/json",
+        .source = .{ .origin = .response_header, .offset = 0, .length = 16 },
+    });
+
+    try tx.writeResponseBody("{not valid json");
+    try tx.processResponseBody();
+
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.res_body_processor_error)).?.value);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {

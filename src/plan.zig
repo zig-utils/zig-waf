@@ -1991,7 +1991,7 @@ const Compiler = struct {
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .request_body_limit => _ = action_config.parsePositiveUsize(control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
-                    .request_body_processor => _ = action_config.parseBodyProcessor(control.value) catch
+                    .request_body_processor, .response_body_processor => _ = action_config.parseBodyProcessor(control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),
                     .rule_remove_by_id => _ = action_config.parseIdRange(control.value) catch
                         return self.fail(error.InvalidRuntimeControl, rule.source, null),

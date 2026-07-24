@@ -47,6 +47,7 @@ pub const ControlKind = enum {
     request_body_limit,
     request_body_processor,
     response_body_access,
+    response_body_processor,
     rule_engine,
     rule_remove_by_id,
     rule_remove_by_tag,
@@ -58,6 +59,16 @@ pub const BodyProcessor = enum {
     json,
     xml,
     urlencoded,
+
+    /// The uppercase name published in REQBODY_PROCESSOR / RES_BODY_PROCESSOR,
+    /// matching the ModSecurity/Coraza processor identifiers.
+    pub fn canonicalName(self: BodyProcessor) []const u8 {
+        return switch (self) {
+            .json => "JSON",
+            .xml => "XML",
+            .urlencoded => "URLENCODED",
+        };
+    }
 };
 
 pub const Control = struct {
@@ -301,6 +312,7 @@ pub fn parseControl(value: []const u8) ParseError!Control {
         .{ .name = "requestBodyLimit", .kind = .request_body_limit },
         .{ .name = "requestBodyProcessor", .kind = .request_body_processor },
         .{ .name = "responseBodyAccess", .kind = .response_body_access },
+        .{ .name = "responseBodyProcessor", .kind = .response_body_processor },
         .{ .name = "ruleEngine", .kind = .rule_engine },
         .{ .name = "ruleRemoveById", .kind = .rule_remove_by_id },
         .{ .name = "ruleRemoveByTag", .kind = .rule_remove_by_tag },
