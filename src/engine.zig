@@ -1789,7 +1789,11 @@ pub const Transaction = struct {
             const body = buffer.inMemory();
             try self.setScalar(.request_body, body, .parser, .request_body);
             if (self.scalar_variables.get(.reqbody_processor, .request_body)) |processor| {
-                if (std.mem.eql(u8, processor.value, "URLENCODED")) try self.parseBodyArguments(body);
+                if (std.mem.eql(u8, processor.value, "URLENCODED")) {
+                    try self.parseBodyArguments(body);
+                } else if (std.mem.eql(u8, processor.value, "JSON")) {
+                    try self.parseJsonBody(body);
+                }
             }
         }
         self.phase_interrupted = false;
@@ -1813,6 +1817,68 @@ pub const Transaction = struct {
             };
             try self.addArgument(.body, key, value, source);
         }
+    }
+
+    /// Parse a JSON request body into ARGS_POST, flattening it into dotted keys
+    /// rooted at `json` with array indices and per-array length entries,
+    /// matching the pinned Coraza JSON body processor. Invalid JSON sets the
+    /// request-body processor error flag.
+    fn parseJsonBody(self: *Transaction, body: []const u8) TransactionError!void {
+        var parsed = std.json.parseFromSlice(std.json.Value, self.waf.allocator, body, .{}) catch {
+            try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body);
+            return;
+        };
+        defer parsed.deinit();
+        var key: std.ArrayList(u8) = .empty;
+        defer key.deinit(self.waf.allocator);
+        try key.appendSlice(self.waf.allocator, "json");
+        try self.flattenJson(&key, parsed.value);
+    }
+
+    fn flattenJson(self: *Transaction, key: *std.ArrayList(u8), value: std.json.Value) TransactionError!void {
+        const gpa = self.waf.allocator;
+        switch (value) {
+            .object => |object| {
+                var it = object.iterator();
+                while (it.next()) |entry| {
+                    const base = key.items.len;
+                    try key.append(gpa, '.');
+                    try key.appendSlice(gpa, entry.key_ptr.*);
+                    try self.flattenJson(key, entry.value_ptr.*);
+                    key.shrinkRetainingCapacity(base);
+                }
+            },
+            .array => |array| {
+                for (array.items, 0..) |item, index| {
+                    const base = key.items.len;
+                    try key.append(gpa, '.');
+                    var idx_buf: [24]u8 = undefined;
+                    try key.appendSlice(gpa, std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable);
+                    try self.flattenJson(key, item);
+                    key.shrinkRetainingCapacity(base);
+                }
+                if (array.items.len > 0) {
+                    var buf: [24]u8 = undefined;
+                    try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{array.items.len}) catch unreachable);
+                }
+            },
+            .string => |string| try self.addJsonArg(key.items, string),
+            .null => try self.addJsonArg(key.items, ""),
+            .bool => |boolean| try self.addJsonArg(key.items, if (boolean) "true" else "false"),
+            .integer => |integer| {
+                var buf: [24]u8 = undefined;
+                try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{integer}) catch unreachable);
+            },
+            .float => |float| {
+                var buf: [32]u8 = undefined;
+                try self.addJsonArg(key.items, std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable);
+            },
+            .number_string => |raw| try self.addJsonArg(key.items, raw),
+        }
+    }
+
+    fn addJsonArg(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
+        try self.addArgument(.body, name, value, .{ .origin = .request_body, .offset = 0, .length = value.len });
     }
 
     pub fn addResponseHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
@@ -3556,6 +3622,30 @@ test "request body is buffered and exposed as REQUEST_BODY" {
     try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "name")).?.value);
     try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args_post, "city")).?.value);
     try std.testing.expectEqualStrings("paris", (try tx.collectionFirst(.args, "city")).?.value);
+}
+
+test "JSON request body flattens into ARGS_POST" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "application/json");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody(
+        \\{"name":"alice","tags":["a","b"],"age":30,"admin":true}
+    );
+    try tx.processRequestBody();
+
+    try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "json.name")).?.value);
+    try std.testing.expectEqualStrings("a", (try tx.collectionFirst(.args_post, "json.tags.0")).?.value);
+    try std.testing.expectEqualStrings("b", (try tx.collectionFirst(.args_post, "json.tags.1")).?.value);
+    // The array's own key carries its length.
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.args_post, "json.tags")).?.value);
+    try std.testing.expectEqualStrings("30", (try tx.collectionFirst(.args_post, "json.age")).?.value);
+    try std.testing.expectEqualStrings("true", (try tx.collectionFirst(.args_post, "json.admin")).?.value);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
