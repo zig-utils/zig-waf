@@ -87,6 +87,19 @@ pub const AuditRecord = struct {
     request_length: i64 = 0,
 };
 
+/// The audit-log output formats.
+pub const Format = enum { serial, json, legacy_json, ocsf };
+
+/// Serialize `record` in `format`, appending to `out`.
+pub fn write(out: *std.ArrayList(u8), allocator: std.mem.Allocator, record: AuditRecord, parts: Parts, format: Format) !void {
+    switch (format) {
+        .serial => try writeSerial(out, allocator, record, parts),
+        .json => try writeJson(out, allocator, record, parts),
+        .legacy_json => try writeLegacyJson(out, allocator, record, parts),
+        .ocsf => try writeOcsf(out, allocator, record, parts),
+    }
+}
+
 const months = [_][]const u8{
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",

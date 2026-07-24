@@ -11,6 +11,7 @@ const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
 const request_buffer = @import("request_buffer.zig");
 const multipart = @import("multipart.zig");
+const audit = @import("audit.zig");
 const xml = @import("xml");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
@@ -2125,6 +2126,100 @@ pub const Transaction = struct {
         self.lifecycle = .logging;
     }
 
+    /// Serialize this transaction's audit record in `format`, honoring the
+    /// active SecAuditLogParts selection. The returned bytes are owned by the
+    /// caller (freed with `allocator`); all intermediate snapshot state lives in
+    /// a temporary arena.
+    pub fn serializeAuditLog(self: *Transaction, allocator: std.mem.Allocator, format: audit.Format) TransactionError![]u8 {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        const record = try self.buildAuditRecord(scratch);
+        const parts: audit.Parts = .{ .bits = self.control_state.audit_parts.bits };
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        audit.write(&out, allocator, record, parts, format) catch return error.OutOfMemory;
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// Snapshot the audit-relevant facts into an AuditRecord, borrowing scalar
+    /// and collection bytes (stable for the transaction's lifetime) and
+    /// allocating the header and message slices into `arena`.
+    fn buildAuditRecord(self: *Transaction, arena: std.mem.Allocator) TransactionError!audit.AuditRecord {
+        const epoch_seconds: i64 = @intCast(@divTrunc(self.waf.now().unix_nanoseconds, std.time.ns_per_s));
+        const unique_id = self.auditScalar(.unique_id) orelse "";
+        return .{
+            .boundary = if (unique_id.len != 0) unique_id else "zigwaf",
+            .timestamp = epoch_seconds,
+            .unique_id = unique_id,
+            .client_ip = self.auditScalar(.remote_addr) orelse "",
+            .client_port = self.auditNumber(u16, .remote_port),
+            .server_ip = self.auditScalar(.server_addr) orelse "",
+            .server_port = self.auditNumber(u16, .server_port),
+            .method = self.auditScalar(.request_method) orelse "",
+            .uri = self.auditScalar(.request_uri) orelse "",
+            .http_version = self.auditHttpVersion(),
+            .request_headers = try self.collectHeaders(arena, .request_headers),
+            .request_body = self.auditScalar(.request_body),
+            .response_status = self.auditNumber(u16, .response_status),
+            .response_headers = try self.collectHeaders(arena, .response_headers),
+            .response_body = self.auditScalar(.response_body),
+            .messages = try self.collectAuditMessages(arena, unique_id),
+            .is_interrupted = self.pending_intervention != null,
+            .rule_engine = @tagName(self.control_state.rule_engine),
+        };
+    }
+
+    fn auditScalar(self: *Transaction, name: variables.Name) ?[]const u8 {
+        const view = (self.scalar(name) catch return null) orelse return null;
+        return view.value;
+    }
+
+    fn auditNumber(self: *Transaction, comptime T: type, name: variables.Name) T {
+        const value = self.auditScalar(name) orelse return 0;
+        return std.fmt.parseInt(T, value, 10) catch 0;
+    }
+
+    /// The HTTP version without the "HTTP/" prefix (ModSecurity's m_httpVersion).
+    fn auditHttpVersion(self: *Transaction) []const u8 {
+        const protocol = self.auditScalar(.request_protocol) orelse return "1.1";
+        return if (std.mem.startsWith(u8, protocol, "HTTP/")) protocol["HTTP/".len..] else protocol;
+    }
+
+    fn collectHeaders(self: *Transaction, arena: std.mem.Allocator, name: collections.Name) TransactionError![]audit.Header {
+        var list: std.ArrayList(audit.Header) = .empty;
+        var iterator = (self.collection(name, .all) catch return &.{}) orelse return &.{};
+        while (iterator.next() catch return list.toOwnedSlice(arena)) |view| {
+            try list.append(arena, .{ .name = view.key, .value = view.value });
+        }
+        return list.toOwnedSlice(arena);
+    }
+
+    /// Format one audit message per matched rule flagged for audit logging,
+    /// pinned to ModSecurity's RuleMessage::log layout.
+    fn collectAuditMessages(self: *Transaction, arena: std.mem.Allocator, unique_id: []const u8) TransactionError![][]const u8 {
+        var list: std.ArrayList([]const u8) = .empty;
+        for (self.match_intents.items) |intent| {
+            if (!intent.audit_log) continue;
+            var message: std.ArrayList(u8) = .empty;
+            const disruptive = intent.disruptive != .pass and intent.disruptive != .allow;
+            if (disruptive) {
+                try auditAppend(&message, arena, "ModSecurity: Access denied with code {d}. ", .{intent.disruptive_status});
+            } else {
+                try message.appendSlice(arena, "ModSecurity: Warning. ");
+            }
+            if (intent.external_id) |id| try auditAppend(&message, arena, "[id \"{d}\"] ", .{id});
+            if (intent.message) |text| try auditAppend(&message, arena, "[msg \"{s}\"] ", .{text});
+            if (intent.log_data) |data| try auditAppend(&message, arena, "[data \"{s}\"] ", .{data});
+            if (intent.severity) |severity| try auditAppend(&message, arena, "[severity \"{d}\"] ", .{severity});
+            for (intent.tags) |tag| try auditAppend(&message, arena, "[tag \"{s}\"] ", .{tag});
+            try auditAppend(&message, arena, "[unique_id \"{s}\"]", .{unique_id});
+            try list.append(arena, try message.toOwnedSlice(arena));
+        }
+        return list.toOwnedSlice(arena);
+    }
+
     pub fn intervention(self: *const Transaction) TransactionError!?Intervention {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         return self.pending_intervention;
@@ -3256,6 +3351,12 @@ fn validAddress(address: []const u8) bool {
     return !containsLineBreak(address) and std.mem.indexOfScalar(u8, address, 0) == null;
 }
 
+/// Append a formatted fragment to an audit-message buffer using `arena`.
+fn auditAppend(list: *std.ArrayList(u8), arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
+    const rendered = try std.fmt.allocPrint(arena, fmt, args);
+    try list.appendSlice(arena, rendered);
+}
+
 fn validProtocol(protocol: []const u8) bool {
     return std.mem.eql(u8, protocol, "HTTP/1.0") or
         std.mem.eql(u8, protocol, "HTTP/1.1") or
@@ -4042,6 +4143,62 @@ test "an XML body populates XML://@* and XML:/* with decoded content" {
     }
     try std.testing.expect(saw_amp);
     try std.testing.expect(saw_cdata);
+}
+
+test "serializeAuditLog snapshots the transaction into the serial and JSON formats" {
+    const input =
+        \\SecRule REQUEST_METHOD "@streq NONE" "id:942100,phase:1,msg:'SQLi detected',logdata:'evidence here',severity:2,auditlog,ctl:auditLogParts=ABFHZ,deny,status:403"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "audit.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var clock: TestClock = .{ .unix_nanoseconds = 1626354855 * std.time.ns_per_s, .awake_nanoseconds = 0 };
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setClockSource(.{ .context = &clock, .nowFn = TestClock.now });
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.10", 44321, "198.51.100.5", 443);
+    try tx.processUri("/login", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("host", "example.com");
+    try tx.processRequestHeaders();
+
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "REQUEST_METHOD",
+        .value = "POST",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 4 },
+    });
+    try tx.addResponseHeader("content-type", "text/html");
+    try tx.processResponseHeaders(403, "HTTP/1.1");
+    try tx.processLogging();
+
+    const serial = try tx.serializeAuditLog(std.testing.allocator, .serial);
+    defer std.testing.allocator.free(serial);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "-A--\n[15/Jul/2021:13:14:15 +0000] zigwaf-") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "192.0.2.10 44321 198.51.100.5 443") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "POST /login HTTP/1.1") != null);
+    // Headers keep the casing the connector supplied.
+    try std.testing.expect(std.mem.indexOf(u8, serial, "host: example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "content-type: text/html") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "ModSecurity: Access denied with code 403. [id \"942100\"] [msg \"SQLi detected\"] [data \"evidence here\"] [severity \"2\"]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, serial, "-Z--\n\n"));
+
+    const json = try tx.serializeAuditLog(std.testing.allocator, .json);
+    defer std.testing.allocator.free(json);
+    const doc = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{});
+    defer doc.deinit();
+    const tx_obj = doc.value.object.get("transaction").?.object;
+    try std.testing.expectEqual(@as(i64, 44321), tx_obj.get("client_port").?.integer);
+    try std.testing.expect(tx_obj.get("is_interrupted").?.bool);
+    try std.testing.expectEqual(@as(i64, 403), tx_obj.get("response").?.object.get("status").?.integer);
+    const messages = doc.value.object.get("messages").?.array;
+    try std.testing.expect(std.mem.indexOf(u8, messages.items[0].object.get("message").?.string, "942100") != null);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
