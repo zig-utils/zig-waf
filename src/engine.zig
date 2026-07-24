@@ -908,6 +908,10 @@ pub const Transaction = struct {
     persistent_failed_open: u8 = 0,
     match_intents: std.ArrayList(MatchIntent) = .empty,
     match_intent_bytes: usize = 0,
+    /// Header names whose values are masked in the audit log (ModSecurity
+    /// sanitiseRequestHeader / sanitiseResponseHeader). Names are owned copies.
+    sanitise_request_headers: std.ArrayList([]const u8) = .empty,
+    sanitise_response_headers: std.ArrayList([]const u8) = .empty,
     flow_state: FlowState = .{},
     control_state: ControlState,
     rule_exclusions: std.ArrayList(RuleExclusion) = .empty,
@@ -2160,15 +2164,35 @@ pub const Transaction = struct {
             .method = self.auditScalar(.request_method) orelse "",
             .uri = self.auditScalar(.request_uri) orelse "",
             .http_version = self.auditHttpVersion(),
-            .request_headers = try self.collectHeaders(arena, .request_headers),
+            .request_headers = try self.collectHeaders(arena, .request_headers, self.sanitise_request_headers.items),
             .request_body = self.auditScalar(.request_body),
             .response_status = self.auditNumber(u16, .response_status),
-            .response_headers = try self.collectHeaders(arena, .response_headers),
+            .response_headers = try self.collectHeaders(arena, .response_headers, self.sanitise_response_headers.items),
             .response_body = self.auditScalar(.response_body),
             .messages = try self.collectAuditMessages(arena, unique_id),
             .is_interrupted = self.pending_intervention != null,
             .rule_engine = @tagName(self.control_state.rule_engine),
         };
+    }
+
+    /// Register a request header whose value is masked in the audit log,
+    /// implementing ModSecurity's sanitiseRequestHeader.
+    pub fn sanitiseRequestHeader(self: *Transaction, name: []const u8) TransactionError!void {
+        try self.appendSanitiseTarget(&self.sanitise_request_headers, name);
+    }
+
+    /// Register a response header whose value is masked in the audit log,
+    /// implementing ModSecurity's sanitiseResponseHeader.
+    pub fn sanitiseResponseHeader(self: *Transaction, name: []const u8) TransactionError!void {
+        try self.appendSanitiseTarget(&self.sanitise_response_headers, name);
+    }
+
+    fn appendSanitiseTarget(self: *Transaction, list: *std.ArrayList([]const u8), name: []const u8) TransactionError!void {
+        if (self.lifecycle == .deinitialized) return error.Deinitialized;
+        if (list.items.len >= self.waf.config.limits.max_header_count) return error.CapacityExceeded;
+        const owned = try self.waf.allocator.dupe(u8, name);
+        errdefer self.waf.allocator.free(owned);
+        try list.append(self.waf.allocator, owned);
     }
 
     fn auditScalar(self: *Transaction, name: variables.Name) ?[]const u8 {
@@ -2187,11 +2211,22 @@ pub const Transaction = struct {
         return if (std.mem.startsWith(u8, protocol, "HTTP/")) protocol["HTTP/".len..] else protocol;
     }
 
-    fn collectHeaders(self: *Transaction, arena: std.mem.Allocator, name: collections.Name) TransactionError![]audit.Header {
+    fn collectHeaders(
+        self: *Transaction,
+        arena: std.mem.Allocator,
+        name: collections.Name,
+        sanitise: []const []const u8,
+    ) TransactionError![]audit.Header {
         var list: std.ArrayList(audit.Header) = .empty;
         var iterator = (self.collection(name, .all) catch return &.{}) orelse return &.{};
         while (iterator.next() catch return list.toOwnedSlice(arena)) |view| {
-            try list.append(arena, .{ .name = view.key, .value = view.value });
+            // Mask the value with same-length '*' when the header is sanitised,
+            // matching ModSecurity's sanitise* actions.
+            const value = if (sanitiseMatches(sanitise, view.key))
+                try maskAudit(arena, view.value)
+            else
+                view.value;
+            try list.append(arena, .{ .name = view.key, .value = value });
         }
         return list.toOwnedSlice(arena);
     }
@@ -3104,6 +3139,8 @@ pub const Transaction = struct {
         deinitTargetExclusions(self.waf.allocator, &self.target_exclusions);
         deinitRegexTargetExclusions(self.waf.allocator, &self.regex_target_exclusions);
         self.rule_exclusion_bytes = 0;
+        deinitSanitiseTargets(self.waf.allocator, &self.sanitise_request_headers);
+        deinitSanitiseTargets(self.waf.allocator, &self.sanitise_response_headers);
         self.transformation_executor.deinit();
         if (self.request_body_buffer) |*buffer| buffer.deinit();
         if (self.response_body_buffer) |*buffer| buffer.deinit();
@@ -3355,6 +3392,25 @@ fn validAddress(address: []const u8) bool {
 fn auditAppend(list: *std.ArrayList(u8), arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
     const rendered = try std.fmt.allocPrint(arena, fmt, args);
     try list.appendSlice(arena, rendered);
+}
+
+fn deinitSanitiseTargets(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |name| allocator.free(name);
+    list.deinit(allocator);
+}
+
+fn sanitiseMatches(sanitise: []const []const u8, name: []const u8) bool {
+    for (sanitise) |target| {
+        if (std.ascii.eqlIgnoreCase(target, name)) return true;
+    }
+    return false;
+}
+
+/// A same-length run of '*', ModSecurity's audit sanitisation mask.
+fn maskAudit(arena: std.mem.Allocator, value: []const u8) std.mem.Allocator.Error![]const u8 {
+    const masked = try arena.alloc(u8, value.len);
+    @memset(masked, '*');
+    return masked;
 }
 
 fn validProtocol(protocol: []const u8) bool {
@@ -4199,6 +4255,50 @@ test "serializeAuditLog snapshots the transaction into the serial and JSON forma
     try std.testing.expectEqual(@as(i64, 403), tx_obj.get("response").?.object.get("status").?.integer);
     const messages = doc.value.object.get("messages").?.array;
     try std.testing.expect(std.mem.indexOf(u8, messages.items[0].object.get("message").?.string, "942100") != null);
+}
+
+test "sanitiseRequestHeader and sanitiseResponseHeader mask values in the audit log" {
+    const input =
+        \\SecRule REQUEST_METHOD "@streq NONE" "id:1,phase:1,ctl:auditLogParts=ABFHZ,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sanitise.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.10", 44321, "198.51.100.5", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.addRequestHeader("authorization", "Bearer secret-token");
+    try tx.addRequestHeader("accept", "text/html");
+    try tx.processRequestHeaders();
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    _ = (try cursor.next()).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "REQUEST_METHOD",
+        .value = "GET",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 3 },
+    });
+    try tx.sanitiseRequestHeader("Authorization");
+    try tx.addResponseHeader("set-cookie", "session=abc123");
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    try tx.sanitiseResponseHeader("Set-Cookie");
+    try tx.processLogging();
+
+    const serial = try tx.serializeAuditLog(std.testing.allocator, .serial);
+    defer std.testing.allocator.free(serial);
+    // The sanitised values are masked with same-length '*'; secrets never leak.
+    try std.testing.expect(std.mem.indexOf(u8, serial, "authorization: *******************") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "secret-token") == null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "set-cookie: **************") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "session=abc123") == null);
+    // A non-sanitised header is untouched.
+    try std.testing.expect(std.mem.indexOf(u8, serial, "accept: text/html") != null);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
