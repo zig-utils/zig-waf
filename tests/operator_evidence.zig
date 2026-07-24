@@ -29,6 +29,8 @@ const ip_corpus = corpus("ipMatch");
 const byte_range_corpus = corpus("validateByteRange");
 const utf8_corpus = corpus("validateUtf8Encoding");
 const url_encoding_corpus = corpus("validateUrlEncoding");
+const sqli_corpus = corpus("detectSQLi");
+const xss_corpus = corpus("detectXSS");
 
 /// Every retained fixture file, for digest pinning.
 const all_files = [_]Corpus{
@@ -37,7 +39,8 @@ const all_files = [_]Corpus{
     corpus("gt"),                   corpus("le"),                  corpus("lt"),
     corpus("streq"),                corpus("strmatch"),            corpus("within"),
     corpus("pm"),                   corpus("ipMatch"),             corpus("validateByteRange"),
-    corpus("validateUtf8Encoding"), corpus("validateUrlEncoding"),
+    corpus("validateUtf8Encoding"), corpus("validateUrlEncoding"), corpus("detectSQLi"),
+    corpus("detectXSS"),
 };
 
 fn corpus(comptime name: []const u8) Corpus {
@@ -49,7 +52,7 @@ fn corpus(comptime name: []const u8) Corpus {
 
 const Fixture = struct {
     input: []const u8,
-    param: []const u8,
+    param: []const u8 = "",
     ret: i64,
     name: []const u8,
     type: []const u8,
@@ -208,6 +211,31 @@ test "retained Coraza validation corpora match the validators" {
         try expectMatch(fixture, operators.validateUrlEncoding(input), "validateUrlEncoding");
     }
     try std.testing.expectEqual(@as(usize, 15), url_count);
+}
+
+test "retained Coraza detector corpora match the libinjection detectors" {
+    var sqli = try std.json.parseFromSlice([]Fixture, std.testing.allocator, sqli_corpus.source, .{});
+    defer sqli.deinit();
+    var sqli_count: usize = 0;
+    for (sqli.value) |fixture| {
+        sqli_count += 1;
+        const input = try decodeFixture(std.testing.allocator, fixture.input);
+        defer std.testing.allocator.free(input);
+        var op = operators.SqlInjection{};
+        try expectMatch(fixture, op.evaluate(input).matched, "detectSQLi");
+    }
+    try std.testing.expectEqual(@as(usize, 5), sqli_count);
+
+    var xss = try std.json.parseFromSlice([]Fixture, std.testing.allocator, xss_corpus.source, .{});
+    defer xss.deinit();
+    var xss_count: usize = 0;
+    for (xss.value) |fixture| {
+        xss_count += 1;
+        const input = try decodeFixture(std.testing.allocator, fixture.input);
+        defer std.testing.allocator.free(input);
+        try expectMatch(fixture, operators.detectXss(input), "detectXSS");
+    }
+    try std.testing.expectEqual(@as(usize, 3), xss_count);
 }
 
 fn expectMatch(fixture: Fixture, actual: bool, name: []const u8) !void {

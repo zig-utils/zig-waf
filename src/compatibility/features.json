@@ -116,16 +116,21 @@
       "notes": "The 37-namespace registry, bounded owned storage, repeated/map mutations, source offsets, phase gates, exact and zig-regex selectors, exclusions, counts, explicit matcher errors, and configured baseline macro semantics are executable. HTTP/body/XML producers and persistent backends remain in their linked downstream issues."
     },
     {
-      "id": "operator.detect-sqli",
+      "id": "operator.detect-sqli-xss",
       "area": "operators",
-      "name": "SQL injection detection",
-      "status": "partial",
+      "name": "libinjection SQLi and XSS detection",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/20",
       "modsecurity": true,
       "coraza": true,
       "crs_required": true,
-      "evidence": ["src/operators.zig", "https://github.com/zig-utils/zig-injection/issues/1"],
-      "notes": "Native adapter is live; complete libinjection differential parity is not yet claimed."
+      "evidence": [
+        "src/operators.zig",
+        "tests/operator_evidence.zig",
+        "tests/fixtures/operators/coraza/detectSQLi.json",
+        "tests/fixtures/operators/coraza/detectXSS.json"
+      ],
+      "notes": "@detectSQLi and @detectXSS use the full libinjection port in zig-injection (a byte-exact translation of libinjection-go v0.3.2 validated against the pinned 54-case SQLi and 118-case folding corpora and the libinjection XSS differential vectors). They pass the retained Coraza detectSQLi and detectXSS corpora. Allocation-free with reusable per-worker scratch."
     },
     {
       "id": "operator.scalar-operators",

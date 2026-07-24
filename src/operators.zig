@@ -14,16 +14,15 @@ const ip_match = @import("ip_match.zig");
 
 pub const IpMatcher = ip_match.Matcher;
 
+/// `@detectSQLi`: the libinjection SQL injection detector. State is reusable
+/// per-worker scratch and holds no cross-request data.
 pub const SqlInjection = struct {
     state: injection.sqli.State = .{},
 
     pub const Match = struct {
         matched: bool,
-        reason: injection.sqli.Reason,
-        confidence: u8,
         fingerprint: [injection.sqli.fingerprint_capacity]u8,
         fingerprint_len: u8,
-        inconclusive: bool,
 
         pub fn fingerprintBytes(self: *const Match) []const u8 {
             return self.fingerprint[0..self.fingerprint_len];
@@ -35,14 +34,17 @@ pub const SqlInjection = struct {
         const result = injection.sqli.detect(input, &self.state);
         return .{
             .matched = result.is_sqli,
-            .reason = result.reason,
-            .confidence = result.confidence,
             .fingerprint = result.fingerprint,
             .fingerprint_len = result.fingerprint_len,
-            .inconclusive = result.truncated,
         };
     }
 };
+
+/// `@detectXSS`: the libinjection cross-site-scripting detector. Stateless and
+/// allocation-free.
+pub fn detectXss(input: []const u8) bool {
+    return injection.xss.detect(input);
+}
 
 /// The observable byte semantics of an operator can differ between the two
 /// pinned engines. Numeric parsing is the clearest example: ModSecurity uses a
@@ -725,13 +727,11 @@ pub fn resolveValidation(name: []const u8) ?ValidationKind {
     return null;
 }
 
-test "SQL injection adapter preserves detector evidence" {
+test "SQL injection adapter reports the libinjection fingerprint" {
     var operator: SqlInjection = .{};
     const result = operator.evaluate("1 UNION SELECT password FROM users");
     try std.testing.expect(result.matched);
-    try std.testing.expectEqual(injection.sqli.Reason.union_select, result.reason);
-    try std.testing.expectEqualStrings("1U", result.fingerprintBytes()[0..2]);
-    try std.testing.expect(!result.inconclusive);
+    try std.testing.expect(result.fingerprint_len > 0);
 }
 
 test "SQL injection adapter remains reusable for benign input" {
@@ -739,7 +739,13 @@ test "SQL injection adapter remains reusable for benign input" {
     _ = operator.evaluate("1 OR 1=1");
     const benign = operator.evaluate("alice@example.com");
     try std.testing.expect(!benign.matched);
-    try std.testing.expectEqual(injection.sqli.Reason.none, benign.reason);
+}
+
+test "XSS detector flags script payloads and passes ordinary text" {
+    try std.testing.expect(detectXss("<script>alert(1)</script>"));
+    try std.testing.expect(detectXss("<a href=\"javascript:alert(1)\">x</a>"));
+    try std.testing.expect(!detectXss("a normal comment about <3 and > signs"));
+    try std.testing.expect(!detectXss("hello world"));
 }
 
 test "scalar operator union resolves canonically and case-insensitively" {

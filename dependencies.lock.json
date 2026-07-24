@@ -3,7 +3,7 @@
   "repositories": {
     "zig-injection": {
       "repository": "zig-utils/zig-injection",
-      "commit": "239232e62d366da676bff58ec6d30fd3db391735",
+      "commit": "593add5ddb933f723b7b545359f7ba49f582c993",
       "localPath": "../zig-injection"
     },
     "zig-regex": {
