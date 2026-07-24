@@ -1245,6 +1245,20 @@ pub const Transaction = struct {
                         try scalar_batch.putOwned(bindingScalar(namespace), key, .rule, .request_headers);
                         result.effects_applied += 1;
                     },
+                    .sanitize_request_header, .sanitize_response_header => {
+                        const header = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(header);
+                        if (header.len == 0) return error.InvalidActionValue;
+                        // Sanitisation registration is fail-safe: it only ever
+                        // masks more, never leaks, so registering directly (not
+                        // staged) is safe even if a later effect rolls back.
+                        const list = if (effect.kind == .sanitize_request_header)
+                            &self.sanitise_request_headers
+                        else
+                            &self.sanitise_response_headers;
+                        try self.registerSanitiseTarget(list, header);
+                        result.effects_applied += 1;
+                    },
                     .expirevar => {
                         if (!include_persistent) {
                             result.pending_persistent_effects += 1;
@@ -2189,10 +2203,22 @@ pub const Transaction = struct {
 
     fn appendSanitiseTarget(self: *Transaction, list: *std.ArrayList([]const u8), name: []const u8) TransactionError!void {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
-        if (list.items.len >= self.waf.config.limits.max_header_count) return error.CapacityExceeded;
         const owned = try self.waf.allocator.dupe(u8, name);
-        errdefer self.waf.allocator.free(owned);
-        try list.append(self.waf.allocator, owned);
+        // registerSanitiseTarget takes ownership and frees on failure.
+        try self.registerSanitiseTarget(list, owned);
+    }
+
+    /// Append an already-owned header name to a sanitise list, taking ownership
+    /// (freeing it if the bound is exceeded).
+    fn registerSanitiseTarget(self: *Transaction, list: *std.ArrayList([]const u8), owned_name: []const u8) TransactionError!void {
+        if (list.items.len >= self.waf.config.limits.max_header_count) {
+            self.waf.allocator.free(owned_name);
+            return error.CapacityExceeded;
+        }
+        list.append(self.waf.allocator, owned_name) catch |err| {
+            self.waf.allocator.free(owned_name);
+            return err;
+        };
     }
 
     fn auditScalar(self: *Transaction, name: variables.Name) ?[]const u8 {
@@ -4299,6 +4325,44 @@ test "sanitiseRequestHeader and sanitiseResponseHeader mask values in the audit 
     try std.testing.expect(std.mem.indexOf(u8, serial, "session=abc123") == null);
     // A non-sanitised header is untouched.
     try std.testing.expect(std.mem.indexOf(u8, serial, "accept: text/html") != null);
+}
+
+test "the sanitizeRequestHeader and sanitizeResponseHeader actions mask via seclang" {
+    const input =
+        \\SecRule REQUEST_METHOD "@streq NONE" "id:1,phase:1,ctl:auditLogParts=ABFHZ,sanitizeRequestHeader:Authorization,sanitizeResponseHeader:Set-Cookie,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sanitize-actions.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.10", 44321, "198.51.100.5", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.addRequestHeader("authorization", "Bearer topsecret");
+    try tx.processRequestHeaders();
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    _ = (try cursor.next()).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "REQUEST_METHOD",
+        .value = "GET",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 3 },
+    });
+    try tx.addResponseHeader("set-cookie", "sid=xyz");
+    try tx.processResponseHeaders(200, "HTTP/1.1");
+    try tx.processLogging();
+
+    const serial = try tx.serializeAuditLog(std.testing.allocator, .serial);
+    defer std.testing.allocator.free(serial);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "authorization: *") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "topsecret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "set-cookie: *") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "sid=xyz") == null);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {

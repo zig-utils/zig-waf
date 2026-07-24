@@ -428,6 +428,8 @@ pub const EffectKind = enum {
     setuid,
     setsid,
     setrsc,
+    sanitize_request_header,
+    sanitize_response_header,
 };
 
 /// Typed request-path descriptor. Field meanings are selected by `kind`:
@@ -2121,8 +2123,20 @@ const Compiler = struct {
                 try self.appendBindingEffect(rule, action, action_index, .setsid, .session);
             } else if (std.ascii.eqlIgnoreCase(name, "setrsc")) {
                 try self.appendBindingEffect(rule, action, action_index, .setrsc, .resource);
+            } else if (std.ascii.eqlIgnoreCase(name, "sanitizeRequestHeader")) {
+                try self.appendSanitiseEffect(rule, action, action_index, .sanitize_request_header);
+            } else if (std.ascii.eqlIgnoreCase(name, "sanitizeResponseHeader")) {
+                try self.appendSanitiseEffect(rule, action, action_index, .sanitize_response_header);
             }
         }
+    }
+
+    /// sanitizeRequestHeader / sanitizeResponseHeader take the header name to
+    /// mask in the audit log (macros allowed).
+    fn appendSanitiseEffect(self: *Compiler, rule: Rule, action: Action, action_index: u32, kind: EffectKind) CompileError!void {
+        const raw = self.actionValue(action) catch return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+        if (raw.len == 0) return self.fail(error.InvalidNondisruptiveAction, rule.source, null);
+        try self.appendEffect(.{ .action_index = action_index, .kind = kind, .name = try self.effectText(raw) });
     }
 
     fn appendFlagEffect(self: *Compiler, rule: Rule, action: Action, action_index: u32, kind: EffectKind) CompileError!void {
