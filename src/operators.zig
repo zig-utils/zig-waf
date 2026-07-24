@@ -701,6 +701,30 @@ pub fn resolveMatcher(name: []const u8) ?MatcherKind {
     return null;
 }
 
+/// The stable validation operators. `validate_byte_range` compiles an allowed
+/// byte set; the other two are stateless byte-string checks.
+pub const ValidationKind = enum {
+    validate_byte_range,
+    validate_utf8_encoding,
+    validate_url_encoding,
+};
+
+const ValidationSpec = struct { kind: ValidationKind, name: []const u8 };
+
+pub const validation_specs = [_]ValidationSpec{
+    .{ .kind = .validate_byte_range, .name = "validateByteRange" },
+    .{ .kind = .validate_utf8_encoding, .name = "validateUtf8Encoding" },
+    .{ .kind = .validate_url_encoding, .name = "validateUrlEncoding" },
+};
+
+/// Case-insensitive resolution of a validation operator name.
+pub fn resolveValidation(name: []const u8) ?ValidationKind {
+    for (validation_specs) |spec| {
+        if (std.ascii.eqlIgnoreCase(name, spec.name)) return spec.kind;
+    }
+    return null;
+}
+
 test "SQL injection adapter preserves detector evidence" {
     var operator: SqlInjection = .{};
     const result = operator.evaluate("1 UNION SELECT password FROM users");
@@ -958,6 +982,13 @@ test "matcher operator names and aliases resolve case-insensitively" {
     try std.testing.expectEqual(MatcherKind.ip_match_from_file, resolveMatcher("ipMatchF").?);
     try std.testing.expectEqual(MatcherKind.ip_match_from_dataset, resolveMatcher("ipMatchFromDataset").?);
     try std.testing.expect(resolveMatcher("notAMatcher") == null);
+}
+
+test "validation operator names resolve case-insensitively" {
+    try std.testing.expectEqual(ValidationKind.validate_byte_range, resolveValidation("validateByteRange").?);
+    try std.testing.expectEqual(ValidationKind.validate_utf8_encoding, resolveValidation("VALIDATEUTF8ENCODING").?);
+    try std.testing.expectEqual(ValidationKind.validate_url_encoding, resolveValidation("validateUrlEncoding").?);
+    try std.testing.expect(resolveValidation("validateSchema") == null);
 }
 
 test "case-insensitive rx flag folds ASCII case" {
