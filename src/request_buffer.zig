@@ -212,6 +212,37 @@ test "disk exhaustion surfaces as a distinct error" {
     try std.testing.expectError(error.DiskExhausted, buffer.write("abcdef"));
 }
 
+test "random write sequences never leak or exceed the total limit" {
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE1234);
+    const random = prng.random();
+    var chunk: [128]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 3000) : (iteration += 1) {
+        const policy: Policy = if (iteration % 2 == 0) .reject else .process_partial;
+        const in_memory = random.uintLessThan(usize, 64) + 1;
+        const total = random.uintLessThan(usize, 256) + 1;
+        var mem_sink = MemorySink{ .allocator = std.testing.allocator };
+        defer mem_sink.deinit();
+        var buffer = try Buffer.init(std.testing.allocator, .{ .in_memory_limit = in_memory, .total_limit = total }, policy, mem_sink.sink());
+        defer buffer.deinit();
+
+        var writes: usize = 0;
+        while (writes < 20) : (writes += 1) {
+            const len = random.uintLessThan(usize, chunk.len + 1);
+            random.bytes(chunk[0..len]);
+            buffer.write(chunk[0..len]) catch |err| switch (err) {
+                error.BodyLimitRejected => break, // reject policy terminates the body
+                else => return err,
+            };
+        }
+        // The invariant: total accepted bytes never exceed the total limit, and
+        // the in-memory portion never exceeds the in-memory limit.
+        try std.testing.expect(buffer.total_bytes <= total);
+        try std.testing.expect(buffer.inMemory().len <= in_memory);
+        try std.testing.expectEqual(buffer.total_bytes, buffer.inMemory().len + mem_sink.written);
+    }
+}
+
 test "a zero total limit is rejected" {
     try std.testing.expectError(error.InvalidLimits, Buffer.init(std.testing.allocator, .{ .total_limit = 0 }, .reject, null));
     // in_memory_limit above total_limit is valid — the total cap triggers first.
