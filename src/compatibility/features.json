@@ -167,6 +167,22 @@
       "notes": "pm/pmFromFile/pmFromDataset compile to an ASCII case-insensitive Aho-Corasick automaton with O(1)-per-byte membership, bounded state counts, empty-pattern always-match, and a non-overlapping capture iterator. ipMatch/ipMatchFromFile/ipMatchFromDataset parse IPv4 and zero-compressed IPv6 CIDR subnets with the pinned bare-address /32 and /128 defaults, unparseable-token skipping, and Go net.To4 IPv4-mapped normalization. Evidence replays the retained Coraza pm (15) and ipMatch (3623) corpora with fuzz and ReleaseFast benchmarks. Dataset registry and reload wiring land with the engine dataset subsystem."
     },
     {
+      "id": "engine.request-parsing",
+      "area": "engine",
+      "name": "Query-string argument and cookie parsing",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/24",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/request.zig",
+        "src/engine.zig",
+        "docs/request-parsing.md"
+      ],
+      "notes": "processUri parses the query string into ARGS_GET/ARGS with the pinned Coraza doParseQuery split and x-www-form-urlencoded queryUnescape, honoring the configured SecArgumentSeparator; addRequestHeader parses the Cookie header into REQUEST_COOKIES. Focused, engine-integration, and fuzz coverage are executable. Body-argument processors, cookie v0/v1 formats, path arguments, smuggling-safe host parsing, and decoding-error variables remain later slices of WAF-23."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",

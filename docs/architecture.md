@@ -53,3 +53,6 @@ memoization, and bounded regex errors are documented in
 The phrase (Aho-Corasick) and IP CIDR matcher operators, file loading, and
 compatibility parsing are documented in
 [Phrase and IP matcher contracts](matchers.md).
+Query-string argument and cookie parsing, decoding, and separator configuration
+are documented in
+[Request-target parsing contracts](request-parsing.md).
