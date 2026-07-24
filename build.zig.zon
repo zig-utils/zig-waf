@@ -3,7 +3,17 @@
     .version = "0.0.0",
     .minimum_zig_version = "0.17.0-dev.1441+d5181a9c9",
     .fingerprint = 0x76c8394cfc892bf7, // Changing this has security and trust implications.
-.paths = .{
+    .dependencies = .{
+        .injection = .{
+            .url = "https://registry.pantry.dev/zig/packages/zig-injection/0.1.0/tarball",
+            .hash = "zig_injection-0.1.0-7QN34L8yCADbOW8gYvKFhQfRT61WgGxTRNgSmUmd64a5",
+        },
+        .regex = .{
+            .url = "https://registry.pantry.dev/zig/packages/zig-regex/0.2.1/tarball",
+            .hash = "zig_regex-0.2.1-omky0ZgdGQA1p3_ZDMPQ2PxIxqVzXZH8NhVTeHal08R3",
+        },
+    },
+    .paths = .{
         "README.md",
         "LICENSE",
         "SECURITY.md",
