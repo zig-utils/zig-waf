@@ -8,6 +8,7 @@ const directives = @import("directives.zig");
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
+const request = @import("request.zig");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
 const transformations = @import("transformations.zig");
@@ -1655,7 +1656,42 @@ pub const Transaction = struct {
         const request_line = try std.fmt.allocPrint(self.waf.allocator, "{s} {s} {s}", .{ method, uri, protocol });
         defer self.waf.allocator.free(request_line);
         try self.setScalar(.request_line, request_line, .request_target, .request_headers);
+        try self.parseQueryArguments(uri, query);
         self.lifecycle = .uri;
+    }
+
+    /// The configured `SecArgumentSeparator`, defaulting to `&`.
+    fn argumentSeparator(self: *const Transaction) u8 {
+        if (self.waf.directiveConfiguration()) |configuration| {
+            if (configuration.latest(.sec_argument_separator)) |directive| {
+                var values = directive.values();
+                if (values.next()) |decoded| switch (decoded.value) {
+                    .byte_separator => |byte| return byte,
+                    else => {},
+                };
+            }
+        }
+        return request.default_separator;
+    }
+
+    /// Populate ARGS_GET from the raw query string with the pinned Coraza
+    /// x-www-form-urlencoded decoding. Decoded key and value share one scratch
+    /// buffer bounded by the query length.
+    fn parseQueryArguments(self: *Transaction, uri: []const u8, query: []const u8) TransactionError!void {
+        if (query.len == 0) return;
+        const scratch = try self.waf.allocator.alloc(u8, query.len);
+        defer self.waf.allocator.free(scratch);
+        var it = request.parseQuery(query, self.argumentSeparator());
+        while (it.next()) |pair| {
+            const key = request.queryUnescape(scratch, pair.key);
+            const value = request.queryUnescape(scratch[key.len..], pair.value);
+            const source: collections.Source = .{
+                .origin = .request_target,
+                .offset = @intFromPtr(pair.key.ptr) - @intFromPtr(uri.ptr),
+                .length = pair.key.len + 1 + pair.value.len,
+            };
+            try self.addArgument(.query, key, value, source);
+        }
     }
 
     pub fn addRequestHeader(self: *Transaction, name: []const u8, value: []const u8) TransactionError!void {
@@ -1691,6 +1727,16 @@ pub const Transaction = struct {
         } else if (std.ascii.eqlIgnoreCase(name, "host")) {
             const host = hostWithoutPort(value);
             if (host.len != 0) try self.setScalar(.server_name, host, .request_header, .request_headers);
+        } else if (std.ascii.eqlIgnoreCase(name, "cookie")) {
+            var cookies = request.parseCookies(value);
+            while (cookies.next()) |pair| {
+                const source: collections.Source = .{
+                    .origin = .request_header,
+                    .offset = value_source.offset + (@intFromPtr(pair.key.ptr) - @intFromPtr(value.ptr)),
+                    .length = pair.key.len + 1 + pair.value.len,
+                };
+                try self.addRequestCookie(pair.key, pair.value, source);
+            }
         }
         self.request_header_count += 1;
         self.request_header_bytes += added;
@@ -3443,6 +3489,58 @@ test "argument cookie and file producers maintain derived collections and sizes"
     try std.testing.expectEqualStrings("42", (try tx.scalar(.files_combined_size)).?.value);
     try std.testing.expectEqualStrings("me.png", (try tx.collectionFirst(.files_names, "avatar")).?.value);
     try std.testing.expectEqualStrings("/tmp/upload-1", (try tx.collectionFirst(.files_tmp_names, "avatar")).?.value);
+}
+
+test "processUri populates ARGS_GET from the decoded query string" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/search?q=zig+lang&empty=&flag&name=%41lice", "GET", "HTTP/1.1");
+
+    try std.testing.expectEqualStrings("zig lang", (try tx.collectionFirst(.args_get, "q")).?.value);
+    try std.testing.expectEqualStrings("zig lang", (try tx.collectionFirst(.args, "q")).?.value);
+    try std.testing.expectEqualStrings("q", (try tx.collectionFirst(.args_get_names, "q")).?.value);
+    try std.testing.expectEqualStrings("", (try tx.collectionFirst(.args_get, "empty")).?.value);
+    try std.testing.expectEqualStrings("", (try tx.collectionFirst(.args_get, "flag")).?.value);
+    try std.testing.expectEqualStrings("Alice", (try tx.collectionFirst(.args_get, "name")).?.value);
+}
+
+test "addRequestHeader populates REQUEST_COOKIES from the Cookie header" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.addRequestHeader("Cookie", "SESSION=abc; theme=dark; flag");
+
+    try std.testing.expectEqualStrings("abc", (try tx.collectionFirst(.request_cookies, "SESSION")).?.value);
+    try std.testing.expectEqualStrings("dark", (try tx.collectionFirst(.request_cookies, "theme")).?.value);
+    try std.testing.expectEqualStrings("", (try tx.collectionFirst(.request_cookies, "flag")).?.value);
+    try std.testing.expectEqualStrings("theme", (try tx.collectionFirst(.request_cookies_names, "theme")).?.value);
+}
+
+test "SecArgumentSeparator reconfigures query parsing" {
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sep.conf", "SecArgumentSeparator \";\"", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.buildTransferringPlan(plan);
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/p?a=1;b=2", "GET", "HTTP/1.1");
+
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.args_get, "a")).?.value);
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.args_get, "b")).?.value);
+    // With ';' as the separator, no argument named "a=1;b" exists under '&'.
+    try std.testing.expect((try tx.collectionFirst(.args_get, "a=1;b")) == null);
 }
 
 test "engine initializes mutates flushes and expires persistent collections" {
