@@ -105,22 +105,40 @@ const months = [_][]const u8{
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 };
 
-/// Append `epoch_seconds` (UTC) as ModSecurity's audit timestamp,
-/// `[dd/Mmm/yyyy:hh:mm:ss +0000]`. UTC keeps the output deterministic and free
-/// of the host time-zone database.
-pub fn writeTimestamp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, epoch_seconds: i64) !void {
+/// The UTC calendar breakdown of an epoch timestamp.
+pub const Civil = struct {
+    year: u16,
+    month: u4,
+    day: u5,
+    hour: u5,
+    minute: u6,
+    second: u6,
+};
+
+/// Break `epoch_seconds` into UTC calendar components. UTC keeps every derived
+/// timestamp and path deterministic and free of the host time-zone database.
+pub fn civil(epoch_seconds: i64) Civil {
     const secs: u64 = @intCast(@max(epoch_seconds, 0));
     const epoch_day = std.time.epoch.EpochDay{ .day = @intCast(secs / std.time.epoch.secs_per_day) };
     const day_seconds = std.time.epoch.DaySeconds{ .secs = @intCast(secs % std.time.epoch.secs_per_day) };
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
+    return .{
+        .year = year_day.year,
+        .month = month_day.month.numeric(),
+        .day = month_day.day_index + 1,
+        .hour = day_seconds.getHoursIntoDay(),
+        .minute = day_seconds.getMinutesIntoHour(),
+        .second = day_seconds.getSecondsIntoMinute(),
+    };
+}
+
+/// Append `epoch_seconds` (UTC) as ModSecurity's audit timestamp,
+/// `[dd/Mmm/yyyy:hh:mm:ss +0000]`.
+pub fn writeTimestamp(out: *std.ArrayList(u8), allocator: std.mem.Allocator, epoch_seconds: i64) !void {
+    const c = civil(epoch_seconds);
     try appendFmt(out, allocator, "[{d:0>2}/{s}/{d}:{d:0>2}:{d:0>2}:{d:0>2} +0000]", .{
-        month_day.day_index + 1,
-        months[month_day.month.numeric() - 1],
-        year_day.year,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
+        c.day, months[c.month - 1], c.year, c.hour, c.minute, c.second,
     });
 }
 
