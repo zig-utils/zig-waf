@@ -11,6 +11,7 @@ const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
 const request_buffer = @import("request_buffer.zig");
 const multipart = @import("multipart.zig");
+const xml = @import("xml");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
 const transformations = @import("transformations.zig");
@@ -1817,6 +1818,8 @@ pub const Transaction = struct {
                     try self.parseJsonBody(.request, body);
                 } else if (std.mem.eql(u8, name, "MULTIPART")) {
                     try self.parseMultipartBody(body);
+                } else if (std.mem.eql(u8, name, "XML")) {
+                    try self.parseXmlBody(body);
                 }
             }
         }
@@ -1973,6 +1976,41 @@ pub const Transaction = struct {
                 try self.setScalarUnsigned(.files_combined_size, combined_size, .parser, .request_body);
             } else {
                 try self.addArgument(.body, name, part.body, source);
+            }
+        }
+    }
+
+    /// Parse an XML body with the lenient zig-xml tokenizer, pinned to Coraza's
+    /// XML body processor: every attribute value is collected under the XML
+    /// collection key `//@*` and every non-blank text/CDATA run under `/*`
+    /// (the two selectors OWASP CRS inspects). Character references are decoded.
+    fn parseXmlBody(self: *Transaction, body: []const u8) TransactionError!void {
+        const source: collections.Source = .{ .origin = .request_body, .offset = 0, .length = 0 };
+        var reader = xml.Reader.init(self.waf.allocator, body);
+        defer reader.deinit();
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(self.waf.allocator);
+        while (try reader.next()) |event| {
+            switch (event) {
+                .open, .self_closing => |element| {
+                    for (element.attributes) |attr| {
+                        scratch.clearRetainingCapacity();
+                        try xml.decodeInto(&scratch, self.waf.allocator, attr.value);
+                        try self.collection_variables.add(.xml, "//@*", scratch.items, source);
+                    }
+                },
+                .text => |raw| {
+                    scratch.clearRetainingCapacity();
+                    try xml.decodeInto(&scratch, self.waf.allocator, raw);
+                    const trimmed = std.mem.trim(u8, scratch.items, " \t\r\n");
+                    if (trimmed.len != 0) try self.collection_variables.add(.xml, "/*", trimmed, source);
+                },
+                .cdata => |raw| {
+                    // CDATA is literal — no entity decoding, matching Go's decoder.
+                    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+                    if (trimmed.len != 0) try self.collection_variables.add(.xml, "/*", trimmed, source);
+                },
+                else => {},
             }
         }
     }
@@ -3968,6 +4006,42 @@ test "a multipart body populates ARGS_POST and the FILES collections" {
         "Content-Disposition: form-data; name=\"field\"",
         (try tx.collectionFirst(.multipart_part_headers, "field")).?.value,
     );
+}
+
+test "an XML body populates XML://@* and XML:/* with decoded content" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "application/xml");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody(
+        \\<order id="42" ref="a&amp;b"><item>widget</item><note><![CDATA[<raw>]]></note></order>
+    );
+    try tx.processRequestBody();
+
+    try std.testing.expectEqualStrings("XML", (try tx.scalar(.reqbody_processor)).?.value);
+    // Attribute values (entity-decoded) land under //@*.
+    try std.testing.expectEqualStrings("42", (try tx.collectionFirst(.xml, "//@*")).?.value);
+    // Text and CDATA runs land under /*.
+    try std.testing.expectEqualStrings("widget", (try tx.collectionFirst(.xml, "/*")).?.value);
+
+    // The second attribute decoded its entity; the CDATA text is literal.
+    var saw_amp = false;
+    var saw_cdata = false;
+    var it = (try tx.collection(.xml, .{ .key = "//@*" })).?;
+    while (try it.next()) |view| {
+        if (std.mem.eql(u8, view.value, "a&b")) saw_amp = true;
+    }
+    var it2 = (try tx.collection(.xml, .{ .key = "/*" })).?;
+    while (try it2.next()) |view| {
+        if (std.mem.eql(u8, view.value, "<raw>")) saw_cdata = true;
+    }
+    try std.testing.expect(saw_amp);
+    try std.testing.expect(saw_cdata);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
