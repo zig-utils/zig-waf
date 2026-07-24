@@ -19,9 +19,12 @@ see effects staged by the matching rule. All allow scopes leave phase-5 logging
 reachable.
 
 Transaction-local controls cover rule engine, audit engine and parts, request
-body access/limit/processor, force-request-body, response-body access, rule ID
-and tag exclusions, and exact or regex-delimited target exclusions by ID or
-tag. Body controls reject changes after their consumption boundary. Exclusions
+body access/limit/processor, force-request-body, response-body access and
+processor, rule ID and tag exclusions, and exact or regex-delimited target
+exclusions by ID or tag. Body controls reject changes after their consumption
+boundary; `ctl:responseBodyProcessor` is accepted through the response-headers
+phase and selects the response body processor (JSON flattens into
+`RESPONSE_ARGS`), since responses have no Content-Type auto-detection. Exclusions
 are bounded by count and owned bytes and affect only subsequent evaluation.
 Regex target selectors compile through the pinned `zig-regex` dependency and
 use pointer-stable compiled programs with isolated per-transaction workers;

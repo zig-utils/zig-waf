@@ -223,6 +223,21 @@
       "notes": "The request body is buffered in memory up to the request-body limit and exposed as REQUEST_BODY (honoring SecRequestBodyAccess), with a reject/process-partial policy and a spool-sink boundary for disk spooling. The URLENCODED and JSON body processors populate ARGS_POST (JSON flattened into dotted json.* keys with array-length entries, matching Coraza). Temp-file spooling, multipart (WAF-25), and XML (WAF-27) body processors remain."
     },
     {
+      "id": "engine.response-body-inspection",
+      "area": "engine",
+      "name": "Response-header and body inspection",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/29",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/engine.zig",
+        "src/request_buffer.zig"
+      ],
+      "notes": "Response headers populate RESPONSE_HEADERS/RESPONSE_CONTENT_TYPE and the response body is buffered and exposed as RESPONSE_BODY (honoring SecResponseBodyAccess). The response JSON body processor is opt-in via ctl:responseBodyProcessor (Coraza does no Content-Type auto-detection for responses) and flattens the body into RESPONSE_ARGS with the same dotted json.* keys and array-length entries as the request side, publishing RES_BODY_PROCESSOR and raising RES_BODY_PROCESSOR_ERROR on invalid JSON. Response-body mutation and content injection remain."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",
