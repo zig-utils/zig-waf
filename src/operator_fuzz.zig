@@ -49,6 +49,25 @@ pub fn fuzzOne(allocator: std.mem.Allocator, input: []const u8) !void {
 
     const global = memo.evaluateGlobal(allocator, value);
     std.mem.doNotOptimizeAway(global.match_count);
+
+    // Aho-Corasick phrase matching must not crash and must stay deterministic.
+    var pm = try operators.PhraseOperator.compile(allocator, parameter, .{});
+    defer pm.deinit();
+    const pm_hit = pm.matches(value);
+    if (pm.matches(value) != pm_hit) return error.PhraseNonDeterministic;
+    var pm_iter = pm.iterator(value);
+    var previous_end: usize = 0;
+    while (pm_iter.next()) |m| {
+        // Matches are within bounds and advance monotonically.
+        if (m.end > value.len or m.start > m.end or m.start < previous_end) return error.PhraseIteratorInvalid;
+        previous_end = m.end;
+    }
+
+    // IP subnet matching must not crash and must stay deterministic.
+    var ip = try operators.compileIpMatch(allocator, parameter, .{});
+    defer ip.deinit();
+    const ip_hit = ip.matches(value);
+    if (ip.matches(value) != ip_hit) return error.IpMatchNonDeterministic;
 }
 
 const structured_seed = "id=42&name=alice:token=SELECT../a=b 0x41&&user:admin==";

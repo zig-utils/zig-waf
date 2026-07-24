@@ -65,11 +65,29 @@ pub fn main() !void {
     const memo_ns = timeRx(io, &memo_worker, "1 union select password from users");
     const memo_stats = memo_worker.memoStats();
 
+    // Aho-Corasick phrase set over a realistic multi-keyword denylist.
+    var pm = try operators.PhraseOperator.compile(allocator, "webzip webcopier webster libwww python-requests curl nikto sqlmap", .{});
+    defer pm.deinit();
+    const pm_input = "Mozilla/5.0 (compatible; scanner) python-requests/2.31 like gecko";
+    const pm_start = std.Io.Clock.now(.awake, io);
+    for (0..iterations) |_| std.mem.doNotOptimizeAway(pm.matches(pm_input));
+    const pm_elapsed: u64 = @intCast(pm_start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
+    const pm_ns = pm_elapsed / iterations;
+
+    // IP CIDR membership over a small subnet set.
+    var ip = try operators.compileIpMatch(allocator, "10.0.0.0/8, 192.168.0.0/16, 2001:db8::/32", .{});
+    defer ip.deinit();
+    const ip_start = std.Io.Clock.now(.awake, io);
+    for (0..iterations) |_| std.mem.doNotOptimizeAway(ip.matches("192.168.42.7"));
+    const ip_elapsed: u64 = @intCast(ip_start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
+    const ip_ns = ip_elapsed / iterations;
+
     std.debug.print(
         "operators iterations={d}" ++
             " eq_ns={d} ge_ns={d} contains_ns={d} begins_with_ns={d} within_ns={d} contains_word_ns={d}" ++
             " rx_match_ns={d} rx_miss_ns={d} rx_global_ns={d}" ++
-            " rx_memoized_ns={d} memo_hits={d} memo_entries={d}\n",
+            " rx_memoized_ns={d} memo_hits={d} memo_entries={d}" ++
+            " pm_ns={d} ip_match_ns={d}\n",
         .{
             iterations,
             eq_ns,
@@ -84,6 +102,8 @@ pub fn main() !void {
             memo_ns,
             memo_stats.hits,
             memo_stats.entries,
+            pm_ns,
+            ip_ns,
         },
     );
 }
