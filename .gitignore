@@ -3,3 +3,4 @@ zig-out/
 pantry/
 console/dist/
 .DS_Store
+zig-pkg/

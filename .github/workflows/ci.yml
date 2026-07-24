@@ -15,21 +15,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: zig-waf
-      - uses: actions/checkout@v4
-        with:
-          repository: zig-utils/zig-injection
-          ref: 8afd9a27a910a2688e99d78cfb717b61dea92940
-          path: zig-injection
-      - uses: actions/checkout@v4
-        with:
-          repository: zig-utils/zig-regex
-          ref: 1b2293e749de60620cb6024c551fedb3d02d54c0
-          path: zig-regex
-      - uses: actions/checkout@v4
-        with:
-          repository: zig-utils/zig-tls
-          ref: 0929822b781d65f91d47d2f04e15627f22a86ab7
-          path: zig-tls
+      # zig-injection and zig-regex are resolved from the pantry registry by the
+      # Zig package manager (build.zig.zon url+hash), not checked out here.
       - uses: actions/checkout@v4
         with:
           repository: stacksjs/stx
@@ -63,16 +50,6 @@ jobs:
       - name: Reject Git submodules
         working-directory: zig-waf
         run: test ! -f .gitmodules
-      - name: Verify dependency lock
-        working-directory: zig-waf
-        run: |
-          test "$(git -C ../zig-injection rev-parse HEAD)" = "$(jq -r '.repositories["zig-injection"].commit' dependencies.lock.json)"
-          test "$(git -C ../zig-regex rev-parse HEAD)" = "$(jq -r '.repositories["zig-regex"].commit' dependencies.lock.json)"
-          test "$(git -C ../zig-tls rev-parse HEAD)" = "$(jq -r '.repositories["zig-tls"].commit' dependencies.lock.json)"
-          test "$(git -C ../stx rev-parse HEAD)" = "$(jq -r '.repositories.stx.commit' dependencies.lock.json)"
-          test "$(git -C ../owasp-crs rev-parse HEAD)" = "$(jq -r '.repositories["owasp-crs"].commit' dependencies.lock.json)"
-          test "$(git -C ../modsecurity rev-parse HEAD)" = "$(jq -r '.repositories.modsecurity.commit' dependencies.lock.json)"
-          test "$(git -C ../coraza rev-parse HEAD)" = "$(jq -r '.repositories.coraza.commit' dependencies.lock.json)"
       - name: Format
         working-directory: zig-waf
         run: zig fmt --check build.zig src benchmarks tools

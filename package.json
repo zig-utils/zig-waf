@@ -1,0 +1,20 @@
+{
+  "name": "zig-waf",
+  "version": "0.0.0",
+  "description": "A stable-union ModSecurity/Coraza-compatible web application firewall engine in Zig.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zig-utils/zig-waf.git"
+  },
+  "scripts": {
+    "release": "pantry release patch --yes",
+    "release:minor": "pantry release minor --yes",
+    "release:major": "pantry release major --yes"
+  },
+  "dependencies": {
+    "ziglang.org": "0.17.0-dev",
+    "openldap.org/liblmdb": "^0.9.35",
+    "postgresql.org/libpq": "^18"
+  }
+}
