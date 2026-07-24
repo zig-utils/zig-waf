@@ -146,6 +146,25 @@
       "notes": "eq/ge/gt/le/lt, beginsWith/endsWith/contains/strmatch/within/streq/containsWord, and rx/rxGlobal/rsub resolve case-insensitively to a typed union. Numeric parsing preserves the ModSecurity std::stoi and Coraza strconv.Atoi profiles; rx exposes capture fields 0..9, bounded compile and runtime errors, empty-pattern always-match, and optional per-worker LRU memoization. rsub preserves the pinned ModSecurity 3.0.16 always-true stub. Evidence covers the 118-case Coraza operator corpus and ReleaseFast benchmarks. Engine rule-evaluation wiring and detectSQLi/detectXSS parity remain separate issues."
     },
     {
+      "id": "operator.validation-operators",
+      "area": "operators",
+      "name": "Encoding and byte-range validation operators",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/21",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/operators.zig",
+        "tests/operator_evidence.zig",
+        "tests/fixtures/operators/coraza/validateByteRange.json",
+        "tests/fixtures/operators/coraza/validateUtf8Encoding.json",
+        "tests/fixtures/operators/coraza/validateUrlEncoding.json",
+        "docs/operators.md"
+      ],
+      "notes": "validateByteRange (compiled allowed-byte set with empty-arg always-match), validateUtf8Encoding, and validateUrlEncoding match the pinned Coraza semantics and pass the retained 53-case corpus. GeoIP, RBL, GSB, fuzzy-hash, file-inspection, national-identifier, and schema validation operators remain later slices of WAF-20, several gated on external data or the XML subsystem."
+    },
+    {
       "id": "operator.phrase-ip-operators",
       "area": "operators",
       "name": "Phrase (Aho-Corasick) and IP CIDR operators",

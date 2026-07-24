@@ -87,11 +87,26 @@ of recent `@rx` outcomes keyed by exact input bytes and rebuilds capture fields
 against the live input from stored offsets, with least-recently-used eviction
 and hit/miss statistics.
 
+## Validation operators
+
+Three validation operators check the encoding or byte composition of a value and
+match when it is invalid, matching the pinned Coraza semantics:
+
+- **`@validateByteRange`** compiles a comma-separated allowed-byte set of
+  `start-end` ranges and single values, and matches when the input contains any
+  byte outside the set. An empty argument matches unconditionally, and an empty
+  input never matches. An out-of-range or non-numeric byte specification is a
+  distinguishable compile error.
+- **`@validateUtf8Encoding`** matches when the input is not valid UTF-8.
+- **`@validateUrlEncoding`** matches when the input contains a `%` not followed
+  by two hexadecimal digits, or a truncated `%`. An empty input never matches.
+
 ## Qualification evidence
 
 - The retained Coraza operator corpus (`tests/operator_evidence.zig`) pins the
-  12 scalar operator fixture files by SHA-256 and replays their 118 cases under
-  the Coraza profile.
+  scalar operator fixture files by SHA-256 and replays their 118 cases under the
+  Coraza profile, plus the 53-case `validateByteRange`/`validateUtf8Encoding`/
+  `validateUrlEncoding` corpus.
 - Focused unit tests in `src/operators.zig` cover both numeric profiles, string
   and word-boundary semantics, negation, regex captures, empty patterns, invalid
   patterns, `rxGlobal` match counting, `rsub`, and memoization with LRU eviction.
