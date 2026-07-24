@@ -71,6 +71,8 @@ pub const AuditRecord = struct {
     // Rule messages for the trailer (part H), producer info.
     messages: []const []const u8 = &.{},
     producer: []const u8 = "zig-waf",
+    /// The rule-engine mode string (JSON legacy `engine_mode`).
+    rule_engine: []const u8 = "",
 };
 
 const months = [_][]const u8{
@@ -273,6 +275,85 @@ fn appendHeaderObject(out: *std.ArrayList(u8), allocator: std.mem.Allocator, hea
     try out.append(allocator, '}');
 }
 
+/// Serialize `record` in Coraza's legacy JSON audit format: a flatter object
+/// with `remote_address`/`local_address` naming and header maps whose repeated
+/// values are joined with ", " into a single string.
+pub fn writeLegacyJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, record: AuditRecord, parts: Parts) !void {
+    const gpa = allocator;
+    try out.appendSlice(gpa, "{\"transaction\":{");
+    try appendJsonField(out, gpa, "time", record.timestamp_string orelse "", true);
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "transaction_id", record.unique_id, true);
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "remote_address", record.client_ip, true);
+    try appendFmt(out, gpa, ",\"remote_port\":{d}", .{record.client_port});
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "local_address", record.server_ip, true);
+    try appendFmt(out, gpa, ",\"local_port\":{d}", .{record.server_port});
+    try out.append(gpa, '}');
+
+    // request
+    try out.appendSlice(gpa, ",\"request\":{\"request_line\":");
+    try appendFmt(out, gpa, "\"{s} {s} HTTP/{s}\"", .{ record.method, record.uri, record.http_version });
+    try out.appendSlice(gpa, ",\"headers\":");
+    try appendHeaderObjectJoined(out, gpa, if (parts.has('B')) record.request_headers else &.{});
+    try out.append(gpa, '}');
+
+    // response
+    try appendFmt(out, gpa, ",\"response\":{{\"status\":{d}", .{record.response_status});
+    try out.appendSlice(gpa, ",\"protocol\":");
+    try appendFmt(out, gpa, "\"HTTP/{s}\"", .{record.http_version});
+    try out.appendSlice(gpa, ",\"headers\":");
+    try appendHeaderObjectJoined(out, gpa, if (parts.has('F')) record.response_headers else &.{});
+    try out.append(gpa, '}');
+
+    // audit_data
+    try out.appendSlice(gpa, ",\"audit_data\":{\"messages\":[");
+    for (record.messages, 0..) |message, index| {
+        if (index != 0) try out.append(gpa, ',');
+        try appendJsonString(out, gpa, message);
+    }
+    try out.appendSlice(gpa, "],\"producer\":[");
+    try appendJsonString(out, gpa, record.producer);
+    try out.appendSlice(gpa, "],");
+    try appendJsonField(out, gpa, "engine_mode", record.rule_engine, true);
+    try out.appendSlice(gpa, "}}");
+}
+
+/// Emit headers as a JSON object mapping each name to a single string, joining
+/// repeated values with ", " (Coraza legacy map[string]string).
+fn appendHeaderObjectJoined(out: *std.ArrayList(u8), allocator: std.mem.Allocator, headers: []const Header) !void {
+    try out.append(allocator, '{');
+    var written: usize = 0;
+    for (headers, 0..) |header, index| {
+        var seen = false;
+        var prior: usize = 0;
+        while (prior < index) : (prior += 1) {
+            if (std.mem.eql(u8, headers[prior].name, header.name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (written != 0) try out.append(allocator, ',');
+        written += 1;
+        try appendJsonString(out, allocator, header.name);
+        try out.append(allocator, ':');
+        // Join all values for this name with ", ".
+        var joined: std.ArrayList(u8) = .empty;
+        defer joined.deinit(allocator);
+        var value_count: usize = 0;
+        for (headers) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, header.name)) continue;
+            if (value_count != 0) try joined.appendSlice(allocator, ", ");
+            value_count += 1;
+            try joined.appendSlice(allocator, candidate.value);
+        }
+        try appendJsonString(out, allocator, joined.items);
+    }
+    try out.append(allocator, '}');
+}
+
 /// Append `value` as a JSON string literal with the mandatory escapes.
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
     try out.append(allocator, '"');
@@ -454,6 +535,46 @@ test "the JSON format parses back into the expected structure" {
     const messages = parsed.value.object.get("messages").?.array;
     try testing.expectEqual(@as(usize, 2), messages.items.len);
     try testing.expectEqualStrings("rule 942100", messages.items[0].object.get("message").?.string);
+}
+
+test "the legacy JSON format joins repeated headers and uses remote_/local_ naming" {
+    const record: AuditRecord = .{
+        .boundary = "b",
+        .timestamp = 1626354855,
+        .timestamp_string = "15/Jul/2021:13:14:15",
+        .unique_id = "id-1",
+        .client_ip = "192.0.2.10",
+        .client_port = 5000,
+        .server_ip = "198.51.100.5",
+        .server_port = 443,
+        .method = "GET",
+        .uri = "/",
+        .http_version = "1.1",
+        .request_headers = &.{
+            .{ .name = "Accept", .value = "a" },
+            .{ .name = "Accept", .value = "b" },
+        },
+        .response_status = 200,
+        .messages = &.{"m1"},
+        .rule_engine = "DetectionOnly",
+    };
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(testing.allocator);
+    try writeLegacyJson(&buffer, testing.allocator, record, Parts.fromLetters("ABFHZ"));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buffer.items, .{});
+    defer parsed.deinit();
+    const tx = parsed.value.object.get("transaction").?.object;
+    try testing.expectEqualStrings("192.0.2.10", tx.get("remote_address").?.string);
+    try testing.expectEqual(@as(i64, 5000), tx.get("remote_port").?.integer);
+    try testing.expectEqualStrings("198.51.100.5", tx.get("local_address").?.string);
+    const req = parsed.value.object.get("request").?.object;
+    try testing.expectEqualStrings("GET / HTTP/1.1", req.get("request_line").?.string);
+    // Repeated header values join into one string.
+    try testing.expectEqualStrings("a, b", req.get("headers").?.object.get("Accept").?.string);
+    const audit_data = parsed.value.object.get("audit_data").?.object;
+    try testing.expectEqualStrings("DetectionOnly", audit_data.get("engine_mode").?.string);
+    try testing.expectEqualStrings("m1", audit_data.get("messages").?.array.items[0].string);
 }
 
 test "JSON body fields are suppressed when their part is not selected" {
