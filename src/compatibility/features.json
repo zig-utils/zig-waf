@@ -242,6 +242,29 @@
       "notes": "Atomic decisions, allow scopes, skip/skipAfter, transaction-local engine/audit/body controls, exact rule-tag and exact/bounded zig-regex rule-target exclusions, capability-gated proxy, exhaustive allocation rollback, fuzzing, and ReleaseFast decision/cursor/exclusion benchmarks are executable. Pause duration parsing and execution remain explicitly assigned to WAF-21."
     },
     {
+      "id": "engine.transformations",
+      "area": "engine",
+      "name": "Stable transformation union, aliases, ordered pipelines, and bounded caching",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/17",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/transformations.zig",
+        "src/html_entities.zig",
+        "src/transformation_fuzz.zig",
+        "tests/transformation_evidence.zig",
+        "tests/transformation_differential.zig",
+        "tests/fixtures/transformations/coraza",
+        "tools/transformation_inventory.zig",
+        "tools/transformation_fuzz.zig",
+        "benchmarks/transformations.zig",
+        "docs/transformations.md"
+      ],
+      "notes": "All 35 typed kinds, two American-spelling aliases, and the compile-time none reset resolve case-insensitively, execute in published plan order with multiMatch checkpoints and bounded transaction caching, and preserve profile-specific ModSecurity and Coraza byte semantics. Evidence covers the 355-case retained Coraza corpus, per-kind differential vectors, upstream inventory drift, deterministic fuzzing, and ReleaseFast hot-path benchmarks with zero steady-state allocation. Plugin transformation execution remains assigned to WAF-22."
+    },
+    {
       "id": "fleet.postgresql-18",
       "area": "fleet",
       "name": "Pantry-managed PostgreSQL 18 and native libpq 18",

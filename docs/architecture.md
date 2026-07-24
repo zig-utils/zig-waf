@@ -44,3 +44,6 @@ The keyed namespace, target, selector, and macro contract is documented in
 Cross-request collection storage, mutation, expiry, failure policy, and the
 Pantry-linked LMDB backend are documented in
 [Persistent collections](persistence.md).
+The stable transformation union, ownership, bounded pipelines, caching, and
+ModSecurity/Coraza profile byte semantics are documented in
+[Transformation contracts](transformations.md).

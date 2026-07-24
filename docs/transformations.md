@@ -99,6 +99,32 @@ ownership rules:
   ruleset before publication. Reduced builds never convert plugin steps into
   no-ops.
 
+## Qualification evidence
+
+Transformation behavior is qualified by executable evidence that runs in hosted
+CI on the exact closing SHA:
+
+- The retained Coraza 3.7.0 corpus (`tests/transformation_evidence.zig`) pins
+  all 35 upstream fixture files by SHA-256 and replays their 355 cases under the
+  Coraza profile.
+- Per-kind differential vectors (`tests/transformation_differential.zig`) assert
+  byte output and `changed` semantics across empty, unchanged, malformed,
+  binary, and expansion categories, require every stable kind and both aliases
+  to be exercised, and prove maximum-bound input stays deterministic and
+  allocation-bounded for every kind under both profiles.
+- Upstream inventory drift (`tools/transformation_inventory.zig`) compares the
+  typed registry against the pinned ModSecurity scanner/parser spellings and the
+  Coraza registration list; CI fails if the stable union drifts.
+- Deterministic fuzzing (`tools/transformation_fuzz.zig`) exercises every
+  decoder and random ordered pipelines under output and work limits.
+- ReleaseFast benchmarks (`benchmarks/transformations.zig`, `zig build
+  bench-transformations`) record borrowed no-op, decoder-heavy, path
+  normalization, digest, CRS-pipeline, `multiMatch`, and cache hit/miss timings
+  alongside allocation counts and output sizes. Borrowed no-op steps and the
+  warmed steady-state CRS pipeline both report zero per-operation allocations,
+  and the bounded cache demonstrates measured LRU eviction. Request-path p50/p95
+  /p99 gates belong to [WAF-39](https://github.com/zig-utils/zig-waf/issues/40).
+
 ## Cryptographic warning
 
 `md5` and `sha1` return the raw 16-byte and 20-byte digest values required by
