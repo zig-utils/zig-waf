@@ -12,6 +12,10 @@
             .url = "https://registry.pantry.dev/zig/packages/zig-regex/0.2.1/tarball",
             .hash = "zig_regex-0.2.1-omky0ZgdGQA1p3_ZDMPQ2PxIxqVzXZH8NhVTeHal08R3",
         },
+        .xml = .{
+            .url = "https://registry.pantry.dev/zig/packages/zig-xml/0.1.0/tarball",
+            .hash = "zig_xml-0.1.0-Lvy3xf5LAgCC-kxuVD2lwx7TBkfZiXvjUODcwSPLcVf-",
+        },
     },
     .paths = .{
         "README.md",

@@ -11,6 +11,10 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const xml_dependency = b.dependency("xml", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const lmdb_translate = b.addTranslateC(.{
         .root_source_file = b.path("pantry/openldap.org/liblmdb/v0.9.35/include/lmdb.h"),
         .target = target,
@@ -29,6 +33,7 @@ pub fn build(b: *std.Build) void {
     waf.addObjectFile(b.path("pantry/openldap.org/liblmdb/v0.9.35/lib/liblmdb.a"));
     waf.addImport("injection", injection_dependency.module("injection"));
     waf.addImport("regex", regex_dependency.module("regex"));
+    waf.addImport("xml", xml_dependency.module("xml"));
     waf.addImport("lmdb", lmdb_module);
 
     const cli_module = b.createModule(.{
