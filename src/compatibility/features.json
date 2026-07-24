@@ -218,9 +218,10 @@
       "crs_required": true,
       "evidence": [
         "src/request_buffer.zig",
+        "src/multipart.zig",
         "src/engine.zig"
       ],
-      "notes": "The request body is buffered in memory up to the request-body limit and exposed as REQUEST_BODY (honoring SecRequestBodyAccess), with a reject/process-partial policy and a spool-sink boundary for disk spooling. The URLENCODED and JSON body processors populate ARGS_POST (JSON flattened into dotted json.* keys with array-length entries, matching Coraza). Temp-file spooling, multipart (WAF-25), and XML (WAF-27) body processors remain."
+      "notes": "The request body is buffered in memory up to the request-body limit and exposed as REQUEST_BODY (honoring SecRequestBodyAccess), with a reject/process-partial policy and a spool-sink boundary for disk spooling. The URLENCODED, JSON, and MULTIPART body processors populate ARGS_POST (JSON flattened into dotted json.* keys with array-length entries, matching Coraza); multipart file parts fill FILES/FILES_NAMES/FILES_SIZES/FILES_COMBINED_SIZE and MULTIPART_NAME/MULTIPART_FILENAME/MULTIPART_PART_HEADERS, pinned to ModSecurity's multipart processor. Temp-file spooling (FILES_TMPNAMES) and the XML (WAF-27) body processor remain."
     },
     {
       "id": "engine.response-body-inspection",

@@ -51,6 +51,14 @@ processor (from the `Content-Type` or `ctl:requestBodyProcessor`):
   array indices (`json.items.0`) and a per-array length entry (`json.items`),
   matching the pinned Coraza flattening. Invalid JSON sets the request-body
   processor error flag.
+- **MULTIPART** parses `multipart/form-data` (boundary from the `Content-Type`)
+  with a reader pinned to Go's `mime/multipart` delimiter semantics. Fields
+  populate `ARGS_POST`; file parts populate `FILES` (client filename),
+  `FILES_NAMES` (field), `FILES_SIZES`, and `FILES_COMBINED_SIZE`; every part's
+  raw header lines are recorded in `MULTIPART_PART_HEADERS`, and the
+  Content-Disposition `name`/`filename` params mirror into `MULTIPART_NAME` and
+  `MULTIPART_FILENAME`, matching ModSecurity. A missing boundary or an
+  unterminated part raises `MULTIPART_STRICT_ERROR`.
 - **RAW** exposes the body as `REQUEST_BODY` without argument extraction.
 
 ## Bounds and safety
