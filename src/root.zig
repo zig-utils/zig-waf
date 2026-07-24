@@ -21,6 +21,7 @@ pub const rule_config_evidence = @import("rule_config_evidence.zig");
 pub const remote_rules = @import("remote_rules.zig");
 pub const request = @import("request.zig");
 pub const request_buffer = @import("request_buffer.zig");
+pub const multipart = @import("multipart.zig");
 pub const persistent = @import("persistent.zig");
 pub const persistent_lmdb = @import("persistent_lmdb.zig");
 pub const selectors = @import("selectors.zig");
@@ -76,6 +77,7 @@ test {
     _ = remote_rules;
     _ = request;
     _ = request_buffer;
+    _ = multipart;
     _ = persistent;
     _ = persistent_lmdb;
     _ = selectors;
