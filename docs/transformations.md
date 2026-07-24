@@ -120,10 +120,12 @@ CI on the exact closing SHA:
 - ReleaseFast benchmarks (`benchmarks/transformations.zig`, `zig build
   bench-transformations`) record borrowed no-op, decoder-heavy, path
   normalization, digest, CRS-pipeline, `multiMatch`, and cache hit/miss timings
-  alongside allocation counts and output sizes. Borrowed no-op steps and the
+  alongside allocation counts, output sizes, and p50/p95/p99 per-operation
+  latency for the CRS pipeline and cache-miss paths. Borrowed no-op steps and the
   warmed steady-state CRS pipeline both report zero per-operation allocations,
-  and the bounded cache demonstrates measured LRU eviction. Request-path p50/p95
-  /p99 gates belong to [WAF-39](https://github.com/zig-utils/zig-waf/issues/40).
+  and the bounded cache demonstrates measured LRU eviction. Request-path
+  throughput and percentile release gates belong to
+  [WAF-39](https://github.com/zig-utils/zig-waf/issues/40).
 
 ## Cryptographic warning
 

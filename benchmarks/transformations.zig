@@ -76,6 +76,30 @@ fn timePipeline(io: std.Io, executor: *Executor, pipeline: []const Kind, input: 
     return elapsed / iterations;
 }
 
+const Percentiles = struct { p50: u64, p95: u64, p99: u64 };
+
+/// Per-operation latency percentiles. Meaningful only for paths whose cost is
+/// large relative to the clock-read overhead (the CRS pipeline and cache miss);
+/// request-path percentile gates belong to WAF-39.
+fn percentiles(samples: []u64) Percentiles {
+    std.mem.sort(u64, samples, {}, std.sort.asc(u64));
+    return .{
+        .p50 = samples[samples.len / 2],
+        .p95 = samples[samples.len * 95 / 100],
+        .p99 = samples[samples.len * 99 / 100],
+    };
+}
+
+fn samplePipeline(io: std.Io, executor: *Executor, pipeline: []const Kind, input: []const u8, samples: []u64) Percentiles {
+    for (samples) |*sample| {
+        const start = std.Io.Clock.now(.awake, io);
+        const result = executor.applyPipeline(pipeline, input, false) catch unreachable;
+        std.mem.doNotOptimizeAway(result.bytes.ptr);
+        sample.* = @intCast(start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
+    }
+    return percentiles(samples);
+}
+
 pub fn main() !void {
     var threaded = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer threaded.deinit();
@@ -130,6 +154,11 @@ pub fn main() !void {
     const crs_out = (try executor.applyPipeline(&crs_pipeline, crs_input, false)).bytes.len;
     const crs_multi_ns = timePipeline(io, &executor, &crs_pipeline, crs_input, true);
 
+    // Per-operation latency distribution for the CRS pipeline.
+    const samples = try allocator.alloc(u64, iterations);
+    defer allocator.free(samples);
+    const crs_pct = samplePipeline(io, &executor, &crs_pipeline, crs_input, samples);
+
     // Cache hit throughput: identical pipeline and input keep hitting the LRU.
     var cached = try Executor.initWithOptions(allocator, limits, .{
         .profile = .coraza,
@@ -148,13 +177,16 @@ pub fn main() !void {
     defer miss.deinit();
     var scratch: [64]u8 = undefined;
     const miss_start = std.Io.Clock.now(.awake, io);
-    for (0..iterations) |index| {
+    for (samples, 0..) |*sample, index| {
         const rendered = std.fmt.bufPrint(&scratch, "  arg-{d}-value  ", .{index}) catch unreachable;
+        const op_start = std.Io.Clock.now(.awake, io);
         const result = miss.applyPipeline(&crs_pipeline, rendered, false) catch unreachable;
         std.mem.doNotOptimizeAway(result.bytes.ptr);
+        sample.* = @intCast(op_start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
     }
     const miss_elapsed: u64 = @intCast(miss_start.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
     const cache_miss_ns = miss_elapsed / iterations;
+    const miss_pct = percentiles(samples);
     const miss_stats = miss.cacheStats();
 
     std.debug.print(
@@ -164,8 +196,10 @@ pub fn main() !void {
             " normalise_path_ns={d}" ++
             " sha1_ns={d} md5_ns={d}" ++
             " crs_pipeline_ns={d} crs_steady_allocs={d} crs_out_bytes={d} crs_multimatch_ns={d}" ++
+            " crs_p50_ns={d} crs_p95_ns={d} crs_p99_ns={d}" ++
             " cache_hit_ns={d} cache_hits={d}" ++
-            " cache_miss_ns={d} cache_misses={d} cache_evictions={d}\n",
+            " cache_miss_ns={d} cache_miss_p50_ns={d} cache_miss_p95_ns={d} cache_miss_p99_ns={d}" ++
+            " cache_misses={d} cache_evictions={d}\n",
         .{
             iterations,
             borrowed_ns,
@@ -181,9 +215,15 @@ pub fn main() !void {
             crs_allocs,
             crs_out,
             crs_multi_ns,
+            crs_pct.p50,
+            crs_pct.p95,
+            crs_pct.p99,
             cache_hit_ns,
             hit_stats.hits,
             cache_miss_ns,
+            miss_pct.p50,
+            miss_pct.p95,
+            miss_pct.p99,
             miss_stats.misses,
             miss_stats.evictions,
         },
