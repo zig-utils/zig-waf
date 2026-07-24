@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: zig-utils/zig-injection
-          ref: 593add5ddb933f723b7b545359f7ba49f582c993
+          ref: 8afd9a27a910a2688e99d78cfb717b61dea92940
           path: zig-injection
       - uses: actions/checkout@v4
         with:
