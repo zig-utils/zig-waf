@@ -208,6 +208,21 @@
       "notes": "processUri parses the query string into ARGS_GET/ARGS with the pinned Coraza doParseQuery split and x-www-form-urlencoded queryUnescape, honoring the configured SecArgumentSeparator; addRequestHeader parses the Cookie header into REQUEST_COOKIES. Focused, engine-integration, and fuzz coverage are executable. Body-argument processors, cookie v0/v1 formats, path arguments, smuggling-safe host parsing, and decoding-error variables remain later slices of WAF-23."
     },
     {
+      "id": "engine.request-body-buffering",
+      "area": "engine",
+      "name": "Bounded request-body buffering and processors",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/25",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/request_buffer.zig",
+        "src/engine.zig"
+      ],
+      "notes": "The request body is buffered in memory up to the request-body limit and exposed as REQUEST_BODY (honoring SecRequestBodyAccess), with a reject/process-partial policy and a spool-sink boundary for disk spooling. The URLENCODED and JSON body processors populate ARGS_POST (JSON flattened into dotted json.* keys with array-length entries, matching Coraza). Temp-file spooling, multipart (WAF-25), and XML (WAF-27) body processors remain."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",
