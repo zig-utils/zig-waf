@@ -414,4 +414,28 @@ pub fn build(b: *std.Build) void {
     const run_transformation_benchmark = b.addRunArtifact(transformation_benchmark);
     const transformation_benchmark_step = b.step("bench-transformations", "Benchmark borrowed steps, decoder pipelines, digests, multiMatch, and cache behavior");
     transformation_benchmark_step.dependOn(&run_transformation_benchmark.step);
+
+    // Compile every corpus, inventory, fuzz, and benchmark executable under
+    // `zig build check` so an API change that breaks a tool or benchmark fails
+    // locally instead of only in the hosted corpus and benchmark steps.
+    for ([_]*std.Build.Step.Compile{
+        parser_corpus,
+        directive_inventory,
+        transformation_inventory,
+        crs_configuration,
+        parser_fuzz,
+        plan_fuzz,
+        action_fuzz,
+        transformation_fuzz,
+        ownership_benchmark,
+        lifecycle_benchmark,
+        scalar_benchmark,
+        collection_benchmark,
+        persistence_benchmark,
+        action_benchmark,
+        parser_benchmark,
+        plan_benchmark,
+        directive_benchmark,
+        transformation_benchmark,
+    }) |artifact| check_step.dependOn(&artifact.step);
 }
