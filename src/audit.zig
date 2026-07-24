@@ -73,6 +73,18 @@ pub const AuditRecord = struct {
     producer: []const u8 = "zig-waf",
     /// The rule-engine mode string (JSON legacy `engine_mode`).
     rule_engine: []const u8 = "",
+
+    // Extra facts used by the OCSF format.
+    /// Producer version (OCSF metadata.log_version).
+    version: []const u8 = "",
+    /// Server identity (OCSF ServerID observable).
+    server_id: []const u8 = "",
+    /// Highest matched-rule severity, as a label (OCSF severity).
+    highest_severity: []const u8 = "",
+    /// Preformatted request arguments as "k=v,k=v" (OCSF http_request.args).
+    args: []const u8 = "",
+    /// Request body length in bytes (OCSF http_request.length).
+    request_length: i64 = 0,
 };
 
 const months = [_][]const u8{
@@ -318,6 +330,128 @@ pub fn writeLegacyJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, re
     try out.appendSlice(gpa, "],");
     try appendJsonField(out, gpa, "engine_mode", record.rule_engine, true);
     try out.appendSlice(gpa, "}}");
+}
+
+/// Serialize `record` as an OCSF (Open Cybersecurity Schema Framework) v1.2.0
+/// "Web Resources Activity" event, matching Coraza's OCSF formatter. Emits the
+/// class/category/type identifiers, allowed/denied action, HTTP request and
+/// response objects, endpoints, enrichments per rule message, and observables.
+pub fn writeOcsf(out: *std.ArrayList(u8), allocator: std.mem.Allocator, record: AuditRecord, parts: Parts) !void {
+    const gpa = allocator;
+    const denied = record.is_interrupted;
+    try out.append(gpa, '{');
+    // Classification (OCSF Web Resources Activity: class 6004, category 6).
+    try appendFmt(out, gpa, "\"activity_id\":1,\"activity_name\":\"Read\"", .{});
+    try appendFmt(out, gpa, ",\"category_uid\":6,\"category_name\":\"Application Activity\"", .{});
+    try appendFmt(out, gpa, ",\"class_uid\":6004,\"class_name\":\"Web Resources Activity\"", .{});
+    try appendFmt(out, gpa, ",\"type_uid\":600401,\"type_name\":\"Read\"", .{});
+    try appendFmt(out, gpa, ",\"time\":{d},\"start_time\":{d}", .{ record.timestamp, record.timestamp });
+    try appendFmt(out, gpa, ",\"action_id\":{d},\"action\":\"{s}\"", .{
+        @as(u8, if (denied) 2 else 1),
+        @as([]const u8, if (denied) "Denied" else "Allowed"),
+    });
+    try appendFmt(out, gpa, ",\"timezone_offset\":0", .{});
+    // Severity (severity_id 99 = Other; the label carries the rule severity).
+    try out.appendSlice(gpa, ",\"severity_id\":99,\"severity\":");
+    try appendJsonString(out, gpa, record.highest_severity);
+
+    // metadata
+    try out.appendSlice(gpa, ",\"metadata\":{\"version\":\"1.2.0\",\"log_provider\":");
+    try appendJsonString(out, gpa, record.producer);
+    try out.appendSlice(gpa, ",\"log_version\":");
+    try appendJsonString(out, gpa, record.version);
+    try appendFmt(out, gpa, ",\"logged_time\":{d}", .{record.timestamp * std.time.us_per_s});
+    try out.appendSlice(gpa, ",\"product\":{\"vendor_name\":\"zig-waf Web Application Firewall\"}}");
+
+    // http_request
+    try out.appendSlice(gpa, ",\"http_request\":{\"http_method\":");
+    try appendJsonString(out, gpa, record.method);
+    try out.appendSlice(gpa, ",\"version\":");
+    try appendJsonString(out, gpa, record.http_version);
+    try out.appendSlice(gpa, ",\"uid\":");
+    try appendJsonString(out, gpa, record.unique_id);
+    try out.appendSlice(gpa, ",\"url\":{\"url_string\":");
+    try appendJsonString(out, gpa, record.uri);
+    try out.appendSlice(gpa, "},\"args\":");
+    try appendJsonString(out, gpa, record.args);
+    try appendFmt(out, gpa, ",\"length\":{d}", .{record.request_length});
+    if (findHeader(record.request_headers, "user-agent")) |ua| {
+        try out.appendSlice(gpa, ",\"user_agent\":");
+        try appendJsonString(out, gpa, ua);
+    }
+    if (findHeader(record.request_headers, "referer")) |ref| {
+        try out.appendSlice(gpa, ",\"referrer\":");
+        try appendJsonString(out, gpa, ref);
+    }
+    try out.appendSlice(gpa, ",\"http_headers\":");
+    try appendHeaderArray(out, gpa, if (parts.has('B')) record.request_headers else &.{});
+    try out.append(gpa, '}');
+
+    // http_response
+    try appendFmt(out, gpa, ",\"http_response\":{{\"code\":{d},\"http_headers\":", .{record.response_status});
+    try appendHeaderArray(out, gpa, if (parts.has('F')) record.response_headers else &.{});
+    try out.append(gpa, '}');
+
+    // endpoints
+    try out.appendSlice(gpa, ",\"src_endpoint\":{\"ip\":");
+    try appendJsonString(out, gpa, record.client_ip);
+    try appendFmt(out, gpa, ",\"port\":{d}}}", .{record.client_port});
+    try out.appendSlice(gpa, ",\"dst_endpoint\":{\"ip\":");
+    try appendJsonString(out, gpa, record.server_ip);
+    try appendFmt(out, gpa, ",\"port\":{d}}}", .{record.server_port});
+
+    // web_resources
+    try out.appendSlice(gpa, ",\"web_resources\":[{\"url_string\":");
+    try appendJsonString(out, gpa, record.uri);
+    try out.appendSlice(gpa, "}]");
+
+    // enrichments (one per rule message) and the primary message.
+    try out.appendSlice(gpa, ",\"enrichments\":[");
+    for (record.messages, 0..) |message, index| {
+        if (index != 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, "{\"name\":");
+        try appendJsonString(out, gpa, message);
+        try out.appendSlice(gpa, ",\"value\":");
+        try appendJsonString(out, gpa, message);
+        try out.appendSlice(gpa, ",\"data\":");
+        try appendJsonString(out, gpa, message);
+        try out.append(gpa, '}');
+    }
+    try out.append(gpa, ']');
+    if (record.messages.len != 0) {
+        try out.appendSlice(gpa, ",\"message\":");
+        try appendJsonString(out, gpa, record.messages[0]);
+    }
+
+    // observables (server id).
+    try out.appendSlice(gpa, ",\"observables\":[");
+    if (record.server_id.len != 0) {
+        try out.appendSlice(gpa, "{\"name\":\"ServerID\",\"type\":\"ServerID\",\"type_id\":99,\"value\":");
+        try appendJsonString(out, gpa, record.server_id);
+        try out.append(gpa, '}');
+    }
+    try out.appendSlice(gpa, "]}");
+}
+
+fn findHeader(headers: []const Header, name: []const u8) ?[]const u8 {
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
+    }
+    return null;
+}
+
+/// Emit headers as a JSON array of {name,value} objects (OCSF HttpHeader list).
+fn appendHeaderArray(out: *std.ArrayList(u8), allocator: std.mem.Allocator, headers: []const Header) !void {
+    try out.append(allocator, '[');
+    for (headers, 0..) |header, index| {
+        if (index != 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"name\":");
+        try appendJsonString(out, allocator, header.name);
+        try out.appendSlice(allocator, ",\"value\":");
+        try appendJsonString(out, allocator, header.value);
+        try out.append(allocator, '}');
+    }
+    try out.append(allocator, ']');
 }
 
 /// Emit headers as a JSON object mapping each name to a single string, joining
@@ -575,6 +709,53 @@ test "the legacy JSON format joins repeated headers and uses remote_/local_ nami
     const audit_data = parsed.value.object.get("audit_data").?.object;
     try testing.expectEqualStrings("DetectionOnly", audit_data.get("engine_mode").?.string);
     try testing.expectEqualStrings("m1", audit_data.get("messages").?.array.items[0].string);
+}
+
+test "the OCSF format emits a Web Resources Activity event" {
+    const record: AuditRecord = .{
+        .boundary = "b",
+        .timestamp = 1626354855,
+        .unique_id = "tx-9",
+        .client_ip = "192.0.2.10",
+        .client_port = 5000,
+        .server_ip = "198.51.100.5",
+        .server_port = 443,
+        .method = "POST",
+        .uri = "/login",
+        .http_version = "1.1",
+        .request_headers = &.{
+            .{ .name = "User-Agent", .value = "curl/8" },
+            .{ .name = "Host", .value = "example.com" },
+        },
+        .response_status = 403,
+        .messages = &.{"SQLi at 942100"},
+        .is_interrupted = true,
+        .highest_severity = "CRITICAL",
+        .server_id = "node-1",
+        .request_length = 42,
+    };
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(testing.allocator);
+    try writeOcsf(&buffer, testing.allocator, record, Parts.fromLetters("ABFHZ"));
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buffer.items, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try testing.expectEqual(@as(i64, 6004), obj.get("class_uid").?.integer);
+    try testing.expectEqual(@as(i64, 600401), obj.get("type_uid").?.integer);
+    // Interrupted → Denied.
+    try testing.expectEqual(@as(i64, 2), obj.get("action_id").?.integer);
+    try testing.expectEqualStrings("Denied", obj.get("action").?.string);
+    const req = obj.get("http_request").?.object;
+    try testing.expectEqualStrings("POST", req.get("http_method").?.string);
+    try testing.expectEqualStrings("curl/8", req.get("user_agent").?.string);
+    try testing.expectEqual(@as(i64, 42), req.get("length").?.integer);
+    try testing.expectEqualStrings("/login", req.get("url").?.object.get("url_string").?.string);
+    try testing.expectEqual(@as(i64, 403), obj.get("http_response").?.object.get("code").?.integer);
+    try testing.expectEqualStrings("192.0.2.10", obj.get("src_endpoint").?.object.get("ip").?.string);
+    try testing.expectEqualStrings("CRITICAL", obj.get("severity").?.string);
+    try testing.expectEqualStrings("SQLi at 942100", obj.get("message").?.string);
+    try testing.expectEqualStrings("node-1", obj.get("observables").?.array.items[0].object.get("value").?.string);
 }
 
 test "JSON body fields are suppressed when their part is not selected" {
