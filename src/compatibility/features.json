@@ -146,6 +146,27 @@
       "notes": "eq/ge/gt/le/lt, beginsWith/endsWith/contains/strmatch/within/streq/containsWord, and rx/rxGlobal/rsub resolve case-insensitively to a typed union. Numeric parsing preserves the ModSecurity std::stoi and Coraza strconv.Atoi profiles; rx exposes capture fields 0..9, bounded compile and runtime errors, empty-pattern always-match, and optional per-worker LRU memoization. rsub preserves the pinned ModSecurity 3.0.16 always-true stub. Evidence covers the 118-case Coraza operator corpus and ReleaseFast benchmarks. Engine rule-evaluation wiring and detectSQLi/detectXSS parity remain separate issues."
     },
     {
+      "id": "operator.phrase-ip-operators",
+      "area": "operators",
+      "name": "Phrase (Aho-Corasick) and IP CIDR operators",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/19",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/phrase.zig",
+        "src/ip_match.zig",
+        "src/operators.zig",
+        "tests/operator_evidence.zig",
+        "tests/fixtures/operators/coraza/pm.json",
+        "tests/fixtures/operators/coraza/ipMatch.json",
+        "benchmarks/operators.zig",
+        "docs/matchers.md"
+      ],
+      "notes": "pm/pmFromFile/pmFromDataset compile to an ASCII case-insensitive Aho-Corasick automaton with O(1)-per-byte membership, bounded state counts, empty-pattern always-match, and a non-overlapping capture iterator. ipMatch/ipMatchFromFile/ipMatchFromDataset parse IPv4 and zero-compressed IPv6 CIDR subnets with the pinned bare-address /32 and /128 defaults, unparseable-token skipping, and Go net.To4 IPv4-mapped normalization. Evidence replays the retained Coraza pm (15) and ipMatch (3623) corpora with fuzz and ReleaseFast benchmarks. Dataset registry and reload wiring land with the engine dataset subsystem."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",

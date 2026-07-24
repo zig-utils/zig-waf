@@ -50,3 +50,6 @@ ModSecurity/Coraza profile byte semantics are documented in
 The stable scalar and regex operator union, numeric parsing profiles, captures,
 memoization, and bounded regex errors are documented in
 [Operator contracts](operators.md).
+The phrase (Aho-Corasick) and IP CIDR matcher operators, file loading, and
+compatibility parsing are documented in
+[Phrase and IP matcher contracts](matchers.md).
