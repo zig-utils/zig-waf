@@ -1797,10 +1797,22 @@ pub const Transaction = struct {
         if (self.request_body_buffer) |*buffer| {
             const body = buffer.inMemory();
             try self.setScalar(.request_body, body, .parser, .request_body);
-            if (self.scalar_variables.get(.reqbody_processor, .request_body)) |processor| {
-                if (std.mem.eql(u8, processor.value, "URLENCODED")) {
+            // ctl:requestBodyProcessor overrides the Content-Type-derived
+            // processor; otherwise REQBODY_PROCESSOR (set from Content-Type in
+            // addRequestHeader) selects it.
+            const processor: ?[]const u8 = blk: {
+                if (self.control_state.request_body_processor) |bp| {
+                    const name = bp.canonicalName();
+                    try self.setScalar(.reqbody_processor, name, .parser, .request_body);
+                    break :blk name;
+                }
+                if (self.scalar_variables.get(.reqbody_processor, .request_body)) |existing| break :blk existing.value;
+                break :blk null;
+            };
+            if (processor) |name| {
+                if (std.mem.eql(u8, name, "URLENCODED")) {
                     try self.parseBodyArguments(body);
-                } else if (std.mem.eql(u8, processor.value, "JSON")) {
+                } else if (std.mem.eql(u8, name, "JSON")) {
                     try self.parseJsonBody(.request, body);
                 }
             }
@@ -3813,6 +3825,47 @@ test "an invalid JSON response body raises RES_BODY_PROCESSOR_ERROR" {
     try tx.processResponseBody();
 
     try std.testing.expectEqualStrings("1", (try tx.scalar(.res_body_processor_error)).?.value);
+}
+
+test "ctl:requestBodyProcessor overrides the Content-Type-derived processor" {
+    // A text/plain body would not auto-select a processor; the ctl forces JSON.
+    const input =
+        \\SecRule REQUEST_HEADERS:Host "@rx ." "id:1,phase:1,ctl:requestBodyProcessor=JSON,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "request-json-ctl.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("host", "example.com");
+    try tx.addRequestHeader("content-type", "text/plain");
+    try tx.processRequestHeaders();
+
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    try std.testing.expectEqual(@as(compiled_plan.RuleId, @fromBackingInt(0)), (try cursor.next()).?);
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "REQUEST_HEADERS:Host",
+        .value = "example.com",
+        .source = .{ .origin = .request_header, .offset = 0, .length = 11 },
+    });
+    try std.testing.expectEqual(action_config.BodyProcessor.json, tx.controlState().request_body_processor.?);
+
+    try tx.writeRequestBody(
+        \\{"name":"alice","tags":["a","b"]}
+    );
+    try tx.processRequestBody();
+
+    try std.testing.expectEqualStrings("JSON", (try tx.scalar(.reqbody_processor)).?.value);
+    try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args_post, "json.name")).?.value);
+    try std.testing.expectEqualStrings("2", (try tx.collectionFirst(.args_post, "json.tags")).?.value);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
