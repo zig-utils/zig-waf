@@ -19,6 +19,7 @@ pub const plan_fuzz = @import("plan_fuzz.zig");
 pub const rule_config = @import("rule_config.zig");
 pub const rule_config_evidence = @import("rule_config_evidence.zig");
 pub const remote_rules = @import("remote_rules.zig");
+pub const request = @import("request.zig");
 pub const persistent = @import("persistent.zig");
 pub const persistent_lmdb = @import("persistent_lmdb.zig");
 pub const selectors = @import("selectors.zig");
@@ -72,6 +73,7 @@ test {
     _ = rule_config;
     _ = rule_config_evidence;
     _ = remote_rules;
+    _ = request;
     _ = persistent;
     _ = persistent_lmdb;
     _ = selectors;
