@@ -291,16 +291,104 @@ pub const RegexOperator = struct {
         return .{ .matcher = if (self.compiled) |*compiled| compiled.matcher() else null };
     }
 
+    /// A memoizing worker keeps a bounded per-worker LRU of recent `@rx`
+    /// outcomes keyed by exact input bytes. It is optional; the plain `worker`
+    /// still amortizes the lazy DFA/NFA construction across evaluations.
+    pub fn workerWithMemo(self: *const RegexOperator, allocator: std.mem.Allocator, limits: MemoLimits) Worker {
+        var w = self.worker();
+        w.memo = Memo{ .allocator = allocator, .limits = limits };
+        return w;
+    }
+
+    pub const MemoLimits = struct {
+        /// Maximum cached distinct inputs before least-recent eviction.
+        max_entries: usize = 64,
+        /// Inputs longer than this are evaluated without being cached.
+        max_input_bytes: usize = 4096,
+    };
+
+    pub const MemoStats = struct {
+        entries: usize = 0,
+        hits: u64 = 0,
+        misses: u64 = 0,
+        evictions: u64 = 0,
+    };
+
+    const MemoEntry = struct {
+        input: []u8,
+        matched: bool,
+        runtime_error: bool,
+        limit_exceeded: bool,
+        match_count: u32,
+        capture_count: u8,
+        spans: [max_capture_fields][2]usize,
+        present: [max_capture_fields]bool,
+        last_used: u64,
+    };
+
+    const Memo = struct {
+        allocator: std.mem.Allocator,
+        limits: MemoLimits,
+        entries: std.ArrayList(MemoEntry) = .empty,
+        clock: u64 = 0,
+        hits: u64 = 0,
+        misses: u64 = 0,
+        evictions: u64 = 0,
+
+        fn deinit(self: *Memo) void {
+            for (self.entries.items) |entry| self.allocator.free(entry.input);
+            self.entries.deinit(self.allocator);
+        }
+
+        fn find(self: *Memo, input: []const u8) ?*MemoEntry {
+            for (self.entries.items) |*entry| {
+                if (std.mem.eql(u8, entry.input, input)) return entry;
+            }
+            return null;
+        }
+    };
+
     pub const Worker = struct {
         matcher: ?regex.Regex.Matcher,
+        memo: ?Memo = null,
 
         pub fn deinit(self: *Worker) void {
             if (self.matcher) |*m| m.deinit();
+            if (self.memo) |*memo| memo.deinit();
             self.* = undefined;
         }
 
-        /// `@rx`: the leftmost match with capture fields 0..9.
+        pub fn memoStats(self: *const Worker) MemoStats {
+            if (self.memo) |memo| return .{
+                .entries = memo.entries.items.len,
+                .hits = memo.hits,
+                .misses = memo.misses,
+                .evictions = memo.evictions,
+            };
+            return .{};
+        }
+
+        /// `@rx`: the leftmost match with capture fields 0..9. When a memo is
+        /// enabled, an exact repeat input is served from the cache and its
+        /// capture fields are rebuilt against the live input.
         pub fn evaluate(self: *Worker, input: []const u8) RegexOutcome {
+            if (self.memo != null and input.len <= self.memo.?.limits.max_input_bytes) {
+                const memo = &self.memo.?;
+                memo.clock += 1;
+                if (memo.find(input)) |entry| {
+                    memo.hits += 1;
+                    entry.last_used = memo.clock;
+                    return rebuildFromEntry(entry.*, input);
+                }
+                memo.misses += 1;
+                const outcome = self.evaluateUncached(input);
+                storeMemoEntry(memo, input, outcome) catch {};
+                return outcome;
+            }
+            return self.evaluateUncached(input);
+        }
+
+        fn evaluateUncached(self: *Worker, input: []const u8) RegexOutcome {
             if (self.matcher == null) return regexAlwaysMatch();
             const matcher = &self.matcher.?;
             var match = (matcher.find(input) catch |err| return regexRuntimeFailure(err)) orelse return .{};
@@ -312,6 +400,7 @@ pub const RegexOperator = struct {
 
         /// `@rxGlobal`: every non-overlapping match. Capture fields keep the
         /// first value per field index, matching ModSecurity `storeOrUpdateFirst`.
+        /// Global evaluation is not memoized.
         pub fn evaluateGlobal(self: *Worker, allocator: std.mem.Allocator, input: []const u8) RegexOutcome {
             if (self.matcher == null) return regexAlwaysMatch();
             const matcher = &self.matcher.?;
@@ -327,6 +416,67 @@ pub const RegexOperator = struct {
         }
     };
 };
+
+/// Rebuild a memoized outcome's capture fields against the live input using the
+/// stored byte offsets. The cached and live inputs are byte-equal on a hit, so
+/// the offsets address identical bytes.
+fn rebuildFromEntry(entry: RegexOperator.MemoEntry, input: []const u8) RegexOutcome {
+    var outcome = RegexOutcome{
+        .matched = entry.matched,
+        .runtime_error = entry.runtime_error,
+        .limit_exceeded = entry.limit_exceeded,
+        .match_count = entry.match_count,
+        .capture_count = entry.capture_count,
+    };
+    var field: usize = 0;
+    while (field < entry.capture_count) : (field += 1) {
+        outcome.captures_present[field] = entry.present[field];
+        const span = entry.spans[field];
+        outcome.captures[field] = if (span[1] != 0 and span[0] + span[1] <= input.len)
+            input[span[0] .. span[0] + span[1]]
+        else
+            "";
+    }
+    return outcome;
+}
+
+fn storeMemoEntry(memo: *RegexOperator.Memo, input: []const u8, outcome: RegexOutcome) !void {
+    // Evict the least-recently-used entry when the bound is reached.
+    if (memo.entries.items.len >= memo.limits.max_entries) {
+        var victim: usize = 0;
+        for (memo.entries.items, 0..) |entry, index| {
+            if (entry.last_used < memo.entries.items[victim].last_used) victim = index;
+        }
+        memo.allocator.free(memo.entries.items[victim].input);
+        _ = memo.entries.swapRemove(victim);
+        memo.evictions += 1;
+    }
+    const owned = try memo.allocator.dupe(u8, input);
+    errdefer memo.allocator.free(owned);
+
+    var entry = RegexOperator.MemoEntry{
+        .input = owned,
+        .matched = outcome.matched,
+        .runtime_error = outcome.runtime_error,
+        .limit_exceeded = outcome.limit_exceeded,
+        .match_count = outcome.match_count,
+        .capture_count = outcome.capture_count,
+        .spans = @splat(.{ 0, 0 }),
+        .present = outcome.captures_present,
+        .last_used = memo.clock,
+    };
+    var field: usize = 0;
+    while (field < outcome.capture_count) : (field += 1) {
+        const capture = outcome.captures[field];
+        if (capture.len != 0 and
+            @intFromPtr(capture.ptr) >= @intFromPtr(input.ptr) and
+            @intFromPtr(capture.ptr) + capture.len <= @intFromPtr(input.ptr) + input.len)
+        {
+            entry.spans[field] = .{ @intFromPtr(capture.ptr) - @intFromPtr(input.ptr), capture.len };
+        }
+    }
+    try memo.entries.append(memo.allocator, entry);
+}
 
 fn regexAlwaysMatch() RegexOutcome {
     var present: [max_capture_fields]bool = @splat(false);
@@ -545,4 +695,45 @@ test "case-insensitive rx flag folds ASCII case" {
     defer worker.deinit();
     try std.testing.expect(worker.evaluate("UNION SELECT 1").matched);
     try std.testing.expect(!worker.evaluate("no keyword").matched);
+}
+
+test "rx memoization serves repeat inputs and rebuilds captures from the live input" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "id=([0-9]+)");
+    defer operator.deinit();
+    var worker = operator.workerWithMemo(std.testing.allocator, .{});
+    defer worker.deinit();
+
+    const first = worker.evaluate("id=42");
+    try std.testing.expect(first.matched);
+    try std.testing.expectEqualStrings("42", first.captures[1]);
+    try std.testing.expectEqual(@as(u64, 0), worker.memoStats().hits);
+    try std.testing.expectEqual(@as(u64, 1), worker.memoStats().misses);
+
+    // A distinct buffer with identical bytes must hit the cache and rebuild the
+    // capture field to point into this new buffer, not the cached copy.
+    var live = [_]u8{ 'i', 'd', '=', '4', '2' };
+    const second = worker.evaluate(&live);
+    try std.testing.expect(second.matched);
+    try std.testing.expectEqualStrings("42", second.captures[1]);
+    try std.testing.expect(second.captures[1].ptr == live[3..].ptr);
+    try std.testing.expectEqual(@as(u64, 1), worker.memoStats().hits);
+
+    const miss = worker.evaluate("no match here");
+    try std.testing.expect(!miss.matched);
+    try std.testing.expectEqual(@as(u64, 2), worker.memoStats().misses);
+}
+
+test "rx memoization bounds entries with least-recently-used eviction" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "[a-z]+");
+    defer operator.deinit();
+    var worker = operator.workerWithMemo(std.testing.allocator, .{ .max_entries = 2 });
+    defer worker.deinit();
+
+    _ = worker.evaluate("alpha");
+    _ = worker.evaluate("bravo");
+    try std.testing.expectEqual(@as(usize, 2), worker.memoStats().entries);
+    // A third distinct input evicts the least-recently-used entry.
+    _ = worker.evaluate("charlie");
+    try std.testing.expectEqual(@as(usize, 2), worker.memoStats().entries);
+    try std.testing.expectEqual(@as(u64, 1), worker.memoStats().evictions);
 }
