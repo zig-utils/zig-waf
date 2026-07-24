@@ -156,6 +156,12 @@ jobs:
       - name: Deterministic non-disruptive action fuzzing
         working-directory: zig-waf
         run: zig build fuzz-actions -Daction-fuzz-iterations=10000
+      - name: Deterministic transformation fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-transformations -Dtransformation-fuzz-iterations=10000
+      - name: Deterministic operator fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-operators -Doperator-fuzz-iterations=10000
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
@@ -174,3 +180,9 @@ jobs:
       - name: Non-disruptive action benchmark
         working-directory: zig-waf
         run: zig build bench-actions -Doptimize=ReleaseFast
+      - name: Transformation benchmark
+        working-directory: zig-waf
+        run: zig build bench-transformations -Doptimize=ReleaseFast
+      - name: Operator benchmark
+        working-directory: zig-waf
+        run: zig build bench-operators -Doptimize=ReleaseFast
