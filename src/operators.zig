@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const injection = @import("injection");
+const regex = @import("regex");
 
 pub const SqlInjection = struct {
     state: injection.sqli.State = .{},
@@ -219,6 +220,151 @@ fn isWordByte(byte: u8) bool {
     return (byte >= 'A' and byte <= 'Z') or (byte >= 'a' and byte <= 'z');
 }
 
+/// Compile-time errors for a regex operator. These are distinguishable so a
+/// ruleset with an invalid or over-complex pattern is rejected before
+/// publication instead of failing silently at request time.
+pub const RegexCompileError = error{
+    InvalidRegexPattern,
+    RegexProgramTooComplex,
+    OutOfMemory,
+};
+
+/// The largest capture field index ModSecurity and Coraza expose. Field 0 is
+/// the full match; fields 1..9 are the first nine parenthesized groups.
+pub const max_capture_fields = 10;
+
+/// The outcome of one regex evaluation. A bounded runtime error (match-limit,
+/// step-limit, oversized input) is not a match; it is reported through
+/// `runtime_error`/`limit_exceeded` exactly as ModSecurity sets
+/// `TX.MSC_PCRE_ERROR` and `TX.MSC_PCRE_LIMITS_EXCEEDED` and does not match.
+pub const RegexOutcome = struct {
+    matched: bool = false,
+    runtime_error: bool = false,
+    limit_exceeded: bool = false,
+    /// Number of populated capture fields (0 when unmatched).
+    capture_count: u8 = 0,
+    /// Global match count; equals 1 for a plain `rx` match.
+    match_count: u32 = 0,
+    /// Capture fields borrow the evaluated input and are valid only while it is.
+    captures: [max_capture_fields][]const u8 = @splat(""),
+    /// Whether each capture field participated in the match; a non-participating
+    /// optional group is distinct from one that matched the empty string.
+    captures_present: [max_capture_fields]bool = @splat(false),
+};
+
+/// A ruleset-owned compiled regex operator (`@rx` / `@rxGlobal`). The compiled
+/// program is immutable and may be shared by request workers; create one
+/// reusable `Worker` per worker thread so mutable matcher caches are never
+/// shared. An empty pattern always matches, mirroring the pinned engines.
+pub const RegexOperator = struct {
+    compiled: ?regex.Regex,
+
+    pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) RegexCompileError!RegexOperator {
+        return compileWithFlags(allocator, pattern, .{});
+    }
+
+    pub fn compileWithFlags(allocator: std.mem.Allocator, pattern: []const u8, flags: regex.common.CompileFlags) RegexCompileError!RegexOperator {
+        if (pattern.len == 0) return .{ .compiled = null };
+        const compiled = regex.Regex.compileWithFlags(allocator, pattern, flags) catch |err| {
+            const widened: anyerror = err;
+            return switch (widened) {
+                error.OutOfMemory => error.OutOfMemory,
+                error.TooManyStates,
+                error.TooManyCaptures,
+                error.TooManyAlternations,
+                error.PatternTooComplex,
+                error.NestingTooDeep,
+                error.StackOverflow,
+                => error.RegexProgramTooComplex,
+                else => error.InvalidRegexPattern,
+            };
+        };
+        return .{ .compiled = compiled };
+    }
+
+    pub fn deinit(self: *RegexOperator) void {
+        if (self.compiled) |*compiled| compiled.deinit();
+        self.* = undefined;
+    }
+
+    pub fn worker(self: *const RegexOperator) Worker {
+        return .{ .matcher = if (self.compiled) |*compiled| compiled.matcher() else null };
+    }
+
+    pub const Worker = struct {
+        matcher: ?regex.Regex.Matcher,
+
+        pub fn deinit(self: *Worker) void {
+            if (self.matcher) |*m| m.deinit();
+            self.* = undefined;
+        }
+
+        /// `@rx`: the leftmost match with capture fields 0..9.
+        pub fn evaluate(self: *Worker, input: []const u8) RegexOutcome {
+            if (self.matcher == null) return regexAlwaysMatch();
+            const matcher = &self.matcher.?;
+            var match = (matcher.find(input) catch |err| return regexRuntimeFailure(err)) orelse return .{};
+            defer match.deinit(matcher.re.allocator);
+            var outcome = RegexOutcome{ .matched = true, .match_count = 1 };
+            regexFillCaptures(&outcome, match);
+            return outcome;
+        }
+
+        /// `@rxGlobal`: every non-overlapping match. Capture fields keep the
+        /// first value per field index, matching ModSecurity `storeOrUpdateFirst`.
+        pub fn evaluateGlobal(self: *Worker, allocator: std.mem.Allocator, input: []const u8) RegexOutcome {
+            if (self.matcher == null) return regexAlwaysMatch();
+            const matcher = &self.matcher.?;
+            const matches = matcher.findAll(allocator, input) catch |err| return regexRuntimeFailure(err);
+            defer {
+                for (matches) |*match| match.deinit(matcher.re.allocator);
+                allocator.free(matches);
+            }
+            if (matches.len == 0) return .{};
+            var outcome = RegexOutcome{ .matched = true, .match_count = @intCast(matches.len) };
+            regexFillCaptures(&outcome, matches[0]);
+            return outcome;
+        }
+    };
+};
+
+fn regexAlwaysMatch() RegexOutcome {
+    var present: [max_capture_fields]bool = @splat(false);
+    present[0] = true;
+    return .{ .matched = true, .match_count = 1, .capture_count = 1, .captures_present = present };
+}
+
+fn regexFillCaptures(outcome: *RegexOutcome, match: regex.Match) void {
+    outcome.captures[0] = match.slice;
+    outcome.captures_present[0] = true;
+    var count: u8 = 1;
+    for (match.captures, 0..) |group, index| {
+        if (count == max_capture_fields) break;
+        outcome.captures[count] = group;
+        outcome.captures_present[count] = if (index < match.captures_present.len)
+            match.captures_present[index]
+        else
+            true;
+        count += 1;
+    }
+    outcome.capture_count = count;
+}
+
+fn regexRuntimeFailure(err: anyerror) RegexOutcome {
+    return switch (err) {
+        error.Timeout, error.InputTooLong, error.DfaOverflow => .{ .runtime_error = true, .limit_exceeded = true },
+        else => .{ .runtime_error = true },
+    };
+}
+
+/// ModSecurity 3.0.16 leaves `@rsub` unimplemented: `Rsub::evaluate` is a
+/// documented stub that returns true. zig-waf preserves that exact pinned
+/// behavior rather than inventing substitution semantics the baseline lacks.
+/// Actual regex substitution is out of scope until upstream implements it.
+pub fn rsub(_: []const u8, _: []const u8) bool {
+    return true;
+}
+
 test "SQL injection adapter preserves detector evidence" {
     var operator: SqlInjection = .{};
     const result = operator.evaluate("1 UNION SELECT password FROM users");
@@ -313,4 +459,90 @@ test "operator negation flips the raw outcome" {
     try std.testing.expect(!evaluateNegated(.str_eq, p, "abc", "abc", true));
     try std.testing.expect(evaluateNegated(.str_eq, p, "abc", "xyz", true));
     try std.testing.expect(evaluateNegated(.str_eq, p, "abc", "abc", false));
+}
+
+test "rx operator matches and extracts capture fields 0..9" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "id=([0-9]+)&name=([a-z]+)");
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+
+    const hit = worker.evaluate("path?id=42&name=alice#frag");
+    try std.testing.expect(hit.matched);
+    try std.testing.expect(!hit.runtime_error);
+    try std.testing.expectEqual(@as(u32, 1), hit.match_count);
+    try std.testing.expectEqual(@as(u8, 3), hit.capture_count);
+    try std.testing.expectEqualStrings("id=42&name=alice", hit.captures[0]);
+    try std.testing.expectEqualStrings("42", hit.captures[1]);
+    try std.testing.expectEqualStrings("alice", hit.captures[2]);
+    try std.testing.expect(hit.captures_present[0]);
+    try std.testing.expect(hit.captures_present[1]);
+
+    const miss = worker.evaluate("no identifiers here");
+    try std.testing.expect(!miss.matched);
+    try std.testing.expectEqual(@as(u8, 0), miss.capture_count);
+}
+
+test "rx capture fields borrow the evaluated input" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "(a+)(b+)");
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+
+    const input = "xxaaabbyy";
+    const outcome = worker.evaluate(input);
+    try std.testing.expect(outcome.matched);
+    // Full match and each group are slices into the original input.
+    try std.testing.expectEqualStrings("aaabb", outcome.captures[0]);
+    try std.testing.expect(outcome.captures[0].ptr == input.ptr + 2);
+    try std.testing.expectEqualStrings("aaa", outcome.captures[1]);
+    try std.testing.expectEqualStrings("bb", outcome.captures[2]);
+}
+
+test "empty rx pattern always matches like the pinned engines" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "");
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+
+    const outcome = worker.evaluate("anything at all");
+    try std.testing.expect(outcome.matched);
+    try std.testing.expectEqual(@as(u8, 1), outcome.capture_count);
+    try std.testing.expect(outcome.captures_present[0]);
+}
+
+test "invalid rx pattern is a distinguishable compile error" {
+    try std.testing.expectError(error.InvalidRegexPattern, RegexOperator.compile(std.testing.allocator, "(unterminated"));
+}
+
+test "rxGlobal counts every non-overlapping match and keeps first captures" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "([0-9]+)");
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+
+    const outcome = worker.evaluateGlobal(std.testing.allocator, "a1bb22ccc333");
+    try std.testing.expect(outcome.matched);
+    try std.testing.expectEqual(@as(u32, 3), outcome.match_count);
+    // First-wins per field index, matching ModSecurity storeOrUpdateFirst.
+    try std.testing.expectEqualStrings("1", outcome.captures[0]);
+    try std.testing.expectEqualStrings("1", outcome.captures[1]);
+
+    const miss = worker.evaluateGlobal(std.testing.allocator, "no digits");
+    try std.testing.expect(!miss.matched);
+    try std.testing.expectEqual(@as(u32, 0), miss.match_count);
+}
+
+test "rsub preserves the pinned ModSecurity 3.0.16 always-true stub" {
+    try std.testing.expect(rsub("s/foo/bar/", "any input"));
+    try std.testing.expect(rsub("", ""));
+}
+
+test "case-insensitive rx flag folds ASCII case" {
+    var operator = try RegexOperator.compileWithFlags(std.testing.allocator, "select", .{ .case_insensitive = true });
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+    try std.testing.expect(worker.evaluate("UNION SELECT 1").matched);
+    try std.testing.expect(!worker.evaluate("no keyword").matched);
 }
