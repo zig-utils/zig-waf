@@ -425,6 +425,20 @@ pub fn build(b: *std.Build) void {
     const transformation_benchmark_step = b.step("bench-transformations", "Benchmark borrowed steps, decoder pipelines, digests, multiMatch, and cache behavior");
     transformation_benchmark_step.dependOn(&run_transformation_benchmark.step);
 
+    const operator_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/operators.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    operator_benchmark_module.addImport("waf", waf);
+    const operator_benchmark = b.addExecutable(.{
+        .name = "operator-benchmark",
+        .root_module = operator_benchmark_module,
+    });
+    const run_operator_benchmark = b.addRunArtifact(operator_benchmark);
+    const operator_benchmark_step = b.step("bench-operators", "Benchmark scalar comparison, regex match/capture, rxGlobal, and memoized operators");
+    operator_benchmark_step.dependOn(&run_operator_benchmark.step);
+
     // Compile every corpus, inventory, fuzz, and benchmark executable under
     // `zig build check` so an API change that breaks a tool or benchmark fails
     // locally instead of only in the hosted corpus and benchmark steps.
@@ -447,5 +461,6 @@ pub fn build(b: *std.Build) void {
         plan_benchmark,
         directive_benchmark,
         transformation_benchmark,
+        operator_benchmark,
     }) |artifact| check_step.dependOn(&artifact.step);
 }
