@@ -239,6 +239,21 @@
       "notes": "Response headers populate RESPONSE_HEADERS/RESPONSE_CONTENT_TYPE and the response body is buffered and exposed as RESPONSE_BODY (honoring SecResponseBodyAccess). The response JSON body processor is opt-in via ctl:responseBodyProcessor (Coraza does no Content-Type auto-detection for responses) and flattens the body into RESPONSE_ARGS with the same dotted json.* keys and array-length entries as the request side, publishing RES_BODY_PROCESSOR and raising RES_BODY_PROCESSOR_ERROR on invalid JSON. Response-body mutation and content injection remain."
     },
     {
+      "id": "engine.audit-log-formats",
+      "area": "engine",
+      "name": "Native, legacy JSON, JSON, and OCSF audit-log formats",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/30",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": false,
+      "evidence": [
+        "src/audit.zig",
+        "src/engine.zig"
+      ],
+      "notes": "A transaction snapshots into an AuditRecord (identity, connection endpoints, request line, request/response headers from their collections, bodies, status, timestamp, interruption, and part-H rule messages formatted in ModSecurity's RuleMessage::log layout) and serializes via serializeAuditLog in four formats honoring SecAuditLogParts: native serial (pinned to ModSecurity toOldAuditLogFormat), structured JSON and legacy JSON (Coraza schemas), and OCSF v1.2.0 Web Resources Activity (Coraza OCSF formatter). Audit writers (serial/concurrent/syslog/HTTPS, WAF-30) and redaction/telemetry (WAF-31) remain."
+    },
+    {
       "id": "engine.persistent-collections",
       "area": "engine",
       "name": "Revisioned TX and persistent IP, SESSION, USER, GLOBAL, and RESOURCE collections",
