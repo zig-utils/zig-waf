@@ -209,6 +209,23 @@ pub const Matcher = struct {
         return .{ .allocator = allocator, .subnets = try subnets.toOwnedSlice(allocator) };
     }
 
+    /// Build from `@ipMatchFromFile` bytes: one subnet per line, trimmed, with
+    /// blank lines and `#` comments ignored and unparseable tokens skipped.
+    pub fn buildFromFileBytes(allocator: std.mem.Allocator, bytes: []const u8, limits: Limits) BuildError!Matcher {
+        var subnets: std.ArrayList(Cidr) = .empty;
+        errdefer subnets.deinit(allocator);
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r\n");
+            if (line.len == 0 or line[0] == '#') continue;
+            if (parseCidr(line)) |cidr| {
+                if (subnets.items.len >= limits.max_subnets) return error.TooManySubnets;
+                try subnets.append(allocator, cidr);
+            }
+        }
+        return .{ .allocator = allocator, .subnets = try subnets.toOwnedSlice(allocator) };
+    }
+
     pub fn deinit(self: *Matcher) void {
         self.allocator.free(self.subnets);
         self.* = undefined;

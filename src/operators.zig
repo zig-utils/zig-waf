@@ -537,9 +537,24 @@ pub const PhraseOperator = struct {
         return .{ .automaton = try phrase.build(allocator, patterns.items, limits) };
     }
 
-    /// Compile from an explicit pattern list (`@pmFromFile`/`@pmFromDataset`).
+    /// Compile from an explicit pattern list (`@pmFromDataset`, or any dataset
+    /// the engine supplies).
     pub fn compilePatterns(allocator: std.mem.Allocator, patterns: []const []const u8, limits: phrase.Limits) phrase.BuildError!PhraseOperator {
         return .{ .automaton = try phrase.build(allocator, patterns, limits) };
+    }
+
+    /// Compile from `@pmFromFile` bytes: one keyword per line, trimmed, with
+    /// blank lines and `#` comments ignored.
+    pub fn compileFromFileBytes(allocator: std.mem.Allocator, bytes: []const u8, limits: phrase.Limits) phrase.BuildError!PhraseOperator {
+        var patterns: std.ArrayList([]const u8) = .empty;
+        defer patterns.deinit(allocator);
+        var lines = std.mem.splitScalar(u8, bytes, '\n');
+        while (lines.next()) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r\n");
+            if (line.len == 0 or line[0] == '#') continue;
+            try patterns.append(allocator, line);
+        }
+        return .{ .automaton = try phrase.build(allocator, patterns.items, limits) };
     }
 
     pub fn deinit(self: *PhraseOperator) void {
@@ -561,6 +576,50 @@ pub const PhraseOperator = struct {
 /// IPv4/IPv6 addresses and CIDR subnets. Unparseable tokens are skipped.
 pub fn compileIpMatch(allocator: std.mem.Allocator, argument: []const u8, limits: ip_match.Limits) ip_match.BuildError!IpMatcher {
     return IpMatcher.build(allocator, argument, limits);
+}
+
+/// Compile `@ipMatchFromFile` bytes into an IP subnet matcher.
+pub fn compileIpMatchFromFileBytes(allocator: std.mem.Allocator, bytes: []const u8, limits: ip_match.Limits) ip_match.BuildError!IpMatcher {
+    return IpMatcher.buildFromFileBytes(allocator, bytes, limits);
+}
+
+/// The compiled multi-pattern and IP-set operators. Unlike the scalar `Kind`
+/// union these carry a compiled automaton or subnet set, so they resolve to a
+/// constructor rather than the allocation-free `evaluate` dispatch.
+pub const MatcherKind = enum {
+    pm,
+    pm_from_file,
+    pm_from_dataset,
+    ip_match,
+    ip_match_from_file,
+    ip_match_from_dataset,
+};
+
+const MatcherSpec = struct {
+    kind: MatcherKind,
+    name: []const u8,
+    aliases: []const []const u8 = &.{},
+};
+
+pub const matcher_specs = [_]MatcherSpec{
+    .{ .kind = .pm, .name = "pm" },
+    .{ .kind = .pm_from_file, .name = "pmFromFile", .aliases = &.{"pmf"} },
+    .{ .kind = .pm_from_dataset, .name = "pmFromDataset" },
+    .{ .kind = .ip_match, .name = "ipMatch" },
+    .{ .kind = .ip_match_from_file, .name = "ipMatchFromFile", .aliases = &.{"ipMatchF"} },
+    .{ .kind = .ip_match_from_dataset, .name = "ipMatchFromDataset" },
+};
+
+/// Case-insensitive resolution of a matcher operator name, including the pinned
+/// `pmf`/`ipMatchF` shorthand aliases.
+pub fn resolveMatcher(name: []const u8) ?MatcherKind {
+    for (matcher_specs) |spec| {
+        if (std.ascii.eqlIgnoreCase(name, spec.name)) return spec.kind;
+        for (spec.aliases) |alias| {
+            if (std.ascii.eqlIgnoreCase(name, alias)) return spec.kind;
+        }
+    }
+    return null;
 }
 
 test "SQL injection adapter preserves detector evidence" {
@@ -734,6 +793,52 @@ test "rxGlobal counts every non-overlapping match and keeps first captures" {
 test "rsub preserves the pinned ModSecurity 3.0.16 always-true stub" {
     try std.testing.expect(rsub("s/foo/bar/", "any input"));
     try std.testing.expect(rsub("", ""));
+}
+
+test "pm operator matches case-insensitively across the phrase set" {
+    var operator = try PhraseOperator.compile(std.testing.allocator, "WebZIP WebCopier Webster", .{});
+    defer operator.deinit();
+    try std.testing.expect(operator.matches("agent: webcopier/1.0"));
+    try std.testing.expect(operator.matches("WEBSTER"));
+    try std.testing.expect(!operator.matches("Mozilla/5.0"));
+}
+
+test "pmFromFile ignores comments and blank lines" {
+    const file =
+        "# denylist\n" ++
+        "WebZIP\n" ++
+        "\n" ++
+        "  WebCopier  \n" ++
+        "# another comment\n";
+    var operator = try PhraseOperator.compileFromFileBytes(std.testing.allocator, file, .{});
+    defer operator.deinit();
+    try std.testing.expect(operator.matches("x webcopier y"));
+    try std.testing.expect(operator.matches("webzip"));
+    try std.testing.expect(!operator.matches("# denylist"));
+}
+
+test "ipMatchFromFile parses one subnet per line" {
+    const file =
+        "# blocked networks\n" ++
+        "10.0.0.0/8\n" ++
+        "\n" ++
+        "2001:db8::/32\n";
+    var matcher = try compileIpMatchFromFileBytes(std.testing.allocator, file, .{});
+    defer matcher.deinit();
+    try std.testing.expectEqual(@as(usize, 2), matcher.subnets.len);
+    try std.testing.expect(matcher.matches("10.1.2.3"));
+    try std.testing.expect(matcher.matches("2001:db8::1"));
+    try std.testing.expect(!matcher.matches("192.168.1.1"));
+}
+
+test "matcher operator names and aliases resolve case-insensitively" {
+    try std.testing.expectEqual(MatcherKind.pm, resolveMatcher("PM").?);
+    try std.testing.expectEqual(MatcherKind.pm_from_file, resolveMatcher("pmFromFile").?);
+    try std.testing.expectEqual(MatcherKind.pm_from_file, resolveMatcher("pmf").?);
+    try std.testing.expectEqual(MatcherKind.ip_match, resolveMatcher("ipmatch").?);
+    try std.testing.expectEqual(MatcherKind.ip_match_from_file, resolveMatcher("ipMatchF").?);
+    try std.testing.expectEqual(MatcherKind.ip_match_from_dataset, resolveMatcher("ipMatchFromDataset").?);
+    try std.testing.expect(resolveMatcher("notAMatcher") == null);
 }
 
 test "case-insensitive rx flag folds ASCII case" {
