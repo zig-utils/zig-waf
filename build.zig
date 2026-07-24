@@ -390,4 +390,18 @@ pub fn build(b: *std.Build) void {
         run_directive_benchmark.addArg(benchmark_path);
     const directive_benchmark_step = b.step("bench-directives", "Benchmark validation and typed configuration throughput");
     directive_benchmark_step.dependOn(&run_directive_benchmark.step);
+
+    const transformation_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/transformations.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    transformation_benchmark_module.addImport("waf", waf);
+    const transformation_benchmark = b.addExecutable(.{
+        .name = "transformation-benchmark",
+        .root_module = transformation_benchmark_module,
+    });
+    const run_transformation_benchmark = b.addRunArtifact(transformation_benchmark);
+    const transformation_benchmark_step = b.step("bench-transformations", "Benchmark borrowed steps, decoder pipelines, digests, multiMatch, and cache behavior");
+    transformation_benchmark_step.dependOn(&run_transformation_benchmark.step);
 }
