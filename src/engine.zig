@@ -9,6 +9,7 @@ const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
+const request_buffer = @import("request_buffer.zig");
 const selectors = @import("selectors.zig");
 const seclang = @import("seclang/root.zig");
 const transformations = @import("transformations.zig");
@@ -889,6 +890,9 @@ pub const Transaction = struct {
     response_header_bytes: usize = 0,
     request_body_bytes: usize = 0,
     response_body_bytes: usize = 0,
+    /// Lazily initialized on the first body chunk; buffers the request body in
+    /// memory up to the request-body limit and exposes it as REQUEST_BODY.
+    request_body_buffer: ?request_buffer.Buffer = null,
     pending_intervention: ?Intervention = null,
     scalar_variables: variables.Store,
     collection_variables: collections.Store,
@@ -1753,6 +1757,20 @@ pub const Transaction = struct {
         if (chunk.len > self.control_state.request_body_limit -| self.request_body_bytes) {
             return error.RequestBodyLimitExceeded;
         }
+        // Buffer the body in memory (bounded by the request-body limit) so
+        // REQUEST_BODY and the body processors can inspect it.
+        if (self.control_state.request_body_access) {
+            if (self.request_body_buffer == null) {
+                self.request_body_buffer = request_buffer.Buffer.init(self.waf.allocator, .{
+                    .in_memory_limit = self.control_state.request_body_limit,
+                    .total_limit = self.control_state.request_body_limit,
+                }, .reject, null) catch return error.RequestBodyLimitExceeded;
+            }
+            self.request_body_buffer.?.write(chunk) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.RequestBodyLimitExceeded,
+            };
+        }
         const next_body_bytes = self.request_body_bytes + chunk.len;
         try self.setScalarUnsigned(.request_body_length, next_body_bytes, .request_body, .request_body);
         self.request_body_bytes = next_body_bytes;
@@ -1767,6 +1785,9 @@ pub const Transaction = struct {
         try self.setFlagIfMissing(.reqbody_error, false, .request_body, .request_body);
         try self.setFlagIfMissing(.reqbody_processor_error, false, .request_body, .request_body);
         try self.setFlagIfMissing(.inbound_data_error, false, .request_body, .request_body);
+        if (self.request_body_buffer) |*buffer| {
+            try self.setScalar(.request_body, buffer.inMemory(), .parser, .request_body);
+        }
         self.phase_interrupted = false;
         self.lifecycle = .request_body;
     }
@@ -2727,6 +2748,7 @@ pub const Transaction = struct {
         deinitRegexTargetExclusions(self.waf.allocator, &self.regex_target_exclusions);
         self.rule_exclusion_bytes = 0;
         self.transformation_executor.deinit();
+        if (self.request_body_buffer) |*buffer| buffer.deinit();
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
@@ -3489,6 +3511,24 @@ test "argument cookie and file producers maintain derived collections and sizes"
     try std.testing.expectEqualStrings("42", (try tx.scalar(.files_combined_size)).?.value);
     try std.testing.expectEqualStrings("me.png", (try tx.collectionFirst(.files_names, "avatar")).?.value);
     try std.testing.expectEqualStrings("/tmp/upload-1", (try tx.collectionFirst(.files_tmp_names, "avatar")).?.value);
+}
+
+test "request body is buffered and exposed as REQUEST_BODY" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/submit", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "application/x-www-form-urlencoded");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("name=alice");
+    try tx.writeRequestBody("&city=paris");
+    try tx.processRequestBody();
+
+    try std.testing.expectEqualStrings("name=alice&city=paris", (try tx.scalar(.request_body)).?.value);
+    try std.testing.expectEqualStrings("21", (try tx.scalar(.request_body_length)).?.value);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
