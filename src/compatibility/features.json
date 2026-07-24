@@ -178,6 +178,7 @@
       "evidence": [
         "src/request.zig",
         "src/engine.zig",
+        "benchmarks/request.zig",
         "docs/request-parsing.md"
       ],
       "notes": "processUri parses the query string into ARGS_GET/ARGS with the pinned Coraza doParseQuery split and x-www-form-urlencoded queryUnescape, honoring the configured SecArgumentSeparator; addRequestHeader parses the Cookie header into REQUEST_COOKIES. Focused, engine-integration, and fuzz coverage are executable. Body-argument processors, cookie v0/v1 formats, path arguments, smuggling-safe host parsing, and decoding-error variables remain later slices of WAF-23."

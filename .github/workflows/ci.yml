@@ -186,3 +186,6 @@ jobs:
       - name: Operator benchmark
         working-directory: zig-waf
         run: zig build bench-operators -Doptimize=ReleaseFast
+      - name: Request parsing benchmark
+        working-directory: zig-waf
+        run: zig build bench-request -Doptimize=ReleaseFast

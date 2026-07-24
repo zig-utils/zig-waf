@@ -52,6 +52,8 @@ empty value. Cookie names and values are stored as raw bytes.
 - A deterministic fuzz test asserts the parsers never crash, decoding stays
   within bounds and deterministic, and iterators yield only borrowed input
   slices.
+- A ReleaseFast benchmark (`zig build bench-request`) records allocation-free
+  query and cookie parsing throughput.
 
 Implementation and qualification are tracked by
 [WAF-23](https://github.com/zig-utils/zig-waf/issues/24). Body-argument
