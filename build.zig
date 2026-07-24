@@ -94,11 +94,20 @@ pub fn build(b: *std.Build) void {
     transformation_differential_module.addImport("waf", waf);
     const transformation_differential_tests = b.addTest(.{ .root_module = transformation_differential_module });
     const run_transformation_differential_tests = b.addRunArtifact(transformation_differential_tests);
+    const operator_evidence_module = b.createModule(.{
+        .root_source_file = b.path("tests/operator_evidence.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    operator_evidence_module.addImport("waf", waf);
+    const operator_evidence_tests = b.addTest(.{ .root_module = operator_evidence_module });
+    const run_operator_evidence_tests = b.addRunArtifact(operator_evidence_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_c_smoke.step);
     test_step.dependOn(&run_transformation_evidence_tests.step);
     test_step.dependOn(&run_transformation_differential_tests.step);
+    test_step.dependOn(&run_operator_evidence_tests.step);
 
     const check_step = b.step("check", "Compile libraries and executables");
     check_step.dependOn(&cli.step);
@@ -107,6 +116,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&tests.step);
     check_step.dependOn(&transformation_evidence_tests.step);
     check_step.dependOn(&transformation_differential_tests.step);
+    check_step.dependOn(&operator_evidence_tests.step);
 
     const parser_corpus_module = b.createModule(.{
         .root_source_file = b.path("tools/parser_corpus.zig"),
