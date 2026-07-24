@@ -113,10 +113,14 @@ fn hexNibble(byte: u8) ?u16 {
     };
 }
 
-/// Parse an address that is either IPv4 or IPv6.
+/// Parse an address that is either IPv4 or IPv6. An IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`) is normalized to IPv4, matching Go `net.IP.To4`, so it
+/// compares as IPv4 and never matches a genuine IPv6 subnet.
 pub fn parseAddress(text: []const u8) ?Address {
     if (std.mem.indexOfScalar(u8, text, ':') != null) {
-        return .{ .v6 = parseIpv6(text) orelse return null };
+        const value = parseIpv6(text) orelse return null;
+        if (value >> 32 == 0xffff) return .{ .v4 = @truncate(value) };
+        return .{ .v6 = value };
     }
     return .{ .v4 = parseIpv4(text) orelse return null };
 }
@@ -144,6 +148,13 @@ pub fn parseCidr(text_raw: []const u8) ?Cidr {
     if (is_v6) {
         if (prefix > 128) return null;
         const address = parseIpv6(address_text) orelse return null;
+        // An IPv4-mapped subnet normalizes to IPv4, keeping only the low 32 mask
+        // bits (Go `networkNumberAndMask` slices `mask[12:]`).
+        if (address >> 32 == 0xffff) {
+            const v4: u32 = @truncate(address);
+            const v4_prefix: u6 = if (prefix <= 96) 0 else @intCast(@min(@as(u16, 32), prefix - 96));
+            return .{ .v4 = .{ .network = v4 & maskV4(v4_prefix), .prefix = v4_prefix } };
+        }
         const mask = maskV6(@intCast(prefix));
         return .{ .v6 = .{ .network = address & mask, .prefix = @intCast(prefix) } };
     }

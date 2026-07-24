@@ -24,6 +24,18 @@ const corpora = [_]Corpus{
     corpus("within"),
 };
 
+const pm_corpus = corpus("pm");
+const ip_corpus = corpus("ipMatch");
+
+/// Every retained fixture file, for digest pinning.
+const all_files = [_]Corpus{
+    corpus("beginsWith"), corpus("contains"), corpus("containsWord"),
+    corpus("endsWith"),   corpus("eq"),       corpus("ge"),
+    corpus("gt"),         corpus("le"),       corpus("lt"),
+    corpus("streq"),      corpus("strmatch"), corpus("within"),
+    corpus("pm"),         corpus("ipMatch"),
+};
+
 fn corpus(comptime name: []const u8) Corpus {
     return .{
         .name = name,
@@ -48,7 +60,7 @@ test "retained Coraza operator fixture digests are pinned" {
         const basename = std.fs.path.basename(line[66..]);
         try std.testing.expect(std.mem.endsWith(u8, basename, ".json"));
         const name = basename[0 .. basename.len - ".json".len];
-        const source = for (corpora) |candidate| {
+        const source = for (all_files) |candidate| {
             if (std.mem.eql(u8, candidate.name, name)) break candidate.source;
         } else return error.UnexpectedFixtureChecksum;
 
@@ -58,7 +70,7 @@ test "retained Coraza operator fixture digests are pinned" {
         try std.testing.expectEqualStrings(line[0..64], &encoded);
         count += 1;
     }
-    try std.testing.expectEqual(corpora.len, count);
+    try std.testing.expectEqual(all_files.len, count);
 }
 
 test "all retained Coraza operator fixtures match evaluation" {
@@ -81,4 +93,38 @@ test "all retained Coraza operator fixtures match evaluation" {
         }
     }
     try std.testing.expectEqual(@as(usize, 118), case_count);
+}
+
+test "retained Coraza pm corpus matches the Aho-Corasick automaton" {
+    var parsed = try std.json.parseFromSlice([]Fixture, std.testing.allocator, pm_corpus.source, .{});
+    defer parsed.deinit();
+    var case_count: usize = 0;
+    for (parsed.value) |fixture| {
+        case_count += 1;
+        var operator = try operators.PhraseOperator.compile(std.testing.allocator, fixture.param, .{});
+        defer operator.deinit();
+        const expected = fixture.ret == 1;
+        std.testing.expectEqual(expected, operator.matches(fixture.input)) catch |err| {
+            std.debug.print("pm mismatch: param={s} input={s} expected={d}\n", .{ fixture.param, fixture.input, fixture.ret });
+            return err;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 15), case_count);
+}
+
+test "retained Coraza ipMatch corpus matches the CIDR matcher" {
+    var parsed = try std.json.parseFromSlice([]Fixture, std.testing.allocator, ip_corpus.source, .{});
+    defer parsed.deinit();
+    var case_count: usize = 0;
+    for (parsed.value) |fixture| {
+        case_count += 1;
+        var matcher = try operators.compileIpMatch(std.testing.allocator, fixture.param, .{});
+        defer matcher.deinit();
+        const expected = fixture.ret == 1;
+        std.testing.expectEqual(expected, matcher.matches(fixture.input)) catch |err| {
+            std.debug.print("ipMatch mismatch: param={s} input={s} expected={d}\n", .{ fixture.param, fixture.input, fixture.ret });
+            return err;
+        };
+    }
+    try std.testing.expectEqual(@as(usize, 3623), case_count);
 }

@@ -9,6 +9,10 @@
 const std = @import("std");
 const injection = @import("injection");
 const regex = @import("regex");
+const phrase = @import("phrase.zig");
+const ip_match = @import("ip_match.zig");
+
+pub const IpMatcher = ip_match.Matcher;
 
 pub const SqlInjection = struct {
     state: injection.sqli.State = .{},
@@ -513,6 +517,50 @@ fn regexRuntimeFailure(err: anyerror) RegexOutcome {
 /// Actual regex substitution is out of scope until upstream implements it.
 pub fn rsub(_: []const u8, _: []const u8) bool {
     return true;
+}
+
+/// A ruleset-owned compiled `@pm` phrase-set operator. Space-separated patterns
+/// are compiled into an immutable, shareable Aho-Corasick automaton; matching is
+/// ASCII case-insensitive. `@pmFromFile` and `@pmFromDataset` share this type by
+/// supplying their patterns from a file or dataset instead of the argument.
+pub const PhraseOperator = struct {
+    automaton: phrase.AhoCorasick,
+
+    /// Compile the pinned Coraza `@pm` argument form: the space-separated
+    /// keyword list. Empty tokens (from repeated spaces) become always-match
+    /// patterns, matching the pinned split semantics.
+    pub fn compile(allocator: std.mem.Allocator, argument: []const u8, limits: phrase.Limits) phrase.BuildError!PhraseOperator {
+        var patterns: std.ArrayList([]const u8) = .empty;
+        defer patterns.deinit(allocator);
+        var it = std.mem.splitScalar(u8, argument, ' ');
+        while (it.next()) |pattern| try patterns.append(allocator, pattern);
+        return .{ .automaton = try phrase.build(allocator, patterns.items, limits) };
+    }
+
+    /// Compile from an explicit pattern list (`@pmFromFile`/`@pmFromDataset`).
+    pub fn compilePatterns(allocator: std.mem.Allocator, patterns: []const []const u8, limits: phrase.Limits) phrase.BuildError!PhraseOperator {
+        return .{ .automaton = try phrase.build(allocator, patterns, limits) };
+    }
+
+    pub fn deinit(self: *PhraseOperator) void {
+        self.automaton.deinit();
+    }
+
+    /// Whether any phrase occurs in the input (case-insensitively).
+    pub fn matches(self: *const PhraseOperator, input: []const u8) bool {
+        return self.automaton.contains(input);
+    }
+
+    /// Non-overlapping match iterator for `@pm` capture extraction.
+    pub fn iterator(self: *const PhraseOperator, input: []const u8) phrase.AhoCorasick.Iterator {
+        return self.automaton.iterator(input);
+    }
+};
+
+/// Compile the pinned Coraza `@ipMatch` argument: a comma-separated list of
+/// IPv4/IPv6 addresses and CIDR subnets. Unparseable tokens are skipped.
+pub fn compileIpMatch(allocator: std.mem.Allocator, argument: []const u8, limits: ip_match.Limits) ip_match.BuildError!IpMatcher {
+    return IpMatcher.build(allocator, argument, limits);
 }
 
 test "SQL injection adapter preserves detector evidence" {
