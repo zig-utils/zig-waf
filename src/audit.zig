@@ -44,6 +44,11 @@ pub const AuditRecord = struct {
     boundary: []const u8,
     /// Seconds since the Unix epoch for the audit-header timestamp (part A).
     timestamp: i64,
+    /// Optional human-formatted timestamp for the JSON `timestamp` field; the
+    /// serial format always derives its own from `timestamp`.
+    timestamp_string: ?[]const u8 = null,
+    /// Whether the transaction was interrupted (JSON `is_interrupted`).
+    is_interrupted: bool = false,
 
     unique_id: []const u8,
     client_ip: []const u8,
@@ -169,6 +174,124 @@ fn writeBoundary(out: *std.ArrayList(u8), allocator: std.mem.Allocator, boundary
     try appendFmt(out, allocator, "--{s}-{c}--\n", .{ boundary, part });
 }
 
+/// Serialize `record` as a single JSON object matching Coraza's structured
+/// audit-log schema: `{"transaction":{...},"messages":[...]}`. Field values are
+/// gated by the same A–K part selection (headers/body only when their part is
+/// selected). Go marshals header maps in nondeterministic key order, so this is
+/// schema-compatible, not byte-identical.
+pub fn writeJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, record: AuditRecord, parts: Parts) !void {
+    const gpa = allocator;
+    try out.appendSlice(gpa, "{\"transaction\":{");
+    try appendJsonField(out, gpa, "timestamp", record.timestamp_string orelse "", true);
+    try appendFmt(out, gpa, ",\"unix_timestamp\":{d}", .{record.timestamp});
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "id", record.unique_id, true);
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "client_ip", record.client_ip, true);
+    try appendFmt(out, gpa, ",\"client_port\":{d}", .{record.client_port});
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "host_ip", record.server_ip, true);
+    try appendFmt(out, gpa, ",\"host_port\":{d}", .{record.server_port});
+
+    // request object (method/uri/version always; headers gated by B, body by C).
+    try out.appendSlice(gpa, ",\"request\":{");
+    try appendJsonField(out, gpa, "method", record.method, true);
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "uri", record.uri, true);
+    try out.append(gpa, ',');
+    try appendJsonField(out, gpa, "http_version", record.http_version, true);
+    try out.appendSlice(gpa, ",\"headers\":");
+    try appendHeaderObject(out, gpa, if (parts.has('B')) record.request_headers else &.{});
+    try out.appendSlice(gpa, ",\"body\":");
+    try appendJsonString(out, gpa, if (parts.has('C')) (record.request_body orelse "") else "");
+    try out.append(gpa, '}');
+
+    // response object (status always; headers gated by F, body by E).
+    try appendFmt(out, gpa, ",\"response\":{{\"status\":{d}", .{record.response_status});
+    try out.appendSlice(gpa, ",\"headers\":");
+    try appendHeaderObject(out, gpa, if (parts.has('F')) record.response_headers else &.{});
+    try out.appendSlice(gpa, ",\"body\":");
+    try appendJsonString(out, gpa, if (parts.has('E')) (record.response_body orelse "") else "");
+    try out.append(gpa, '}');
+
+    // producer object.
+    try out.appendSlice(gpa, ",\"producer\":{");
+    try appendJsonField(out, gpa, "connector", record.producer, true);
+    try out.append(gpa, '}');
+
+    try appendFmt(out, gpa, ",\"is_interrupted\":{}", .{record.is_interrupted});
+    try out.appendSlice(gpa, "},\"messages\":[");
+    for (record.messages, 0..) |message, index| {
+        if (index != 0) try out.append(gpa, ',');
+        try out.appendSlice(gpa, "{\"message\":");
+        try appendJsonString(out, gpa, message);
+        try out.append(gpa, '}');
+    }
+    try out.appendSlice(gpa, "]}");
+}
+
+fn appendJsonField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, value: []const u8, quoted: bool) !void {
+    try out.append(allocator, '"');
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, "\":");
+    if (quoted) {
+        try appendJsonString(out, allocator, value);
+    } else {
+        try out.appendSlice(allocator, value);
+    }
+}
+
+/// Emit headers as a JSON object mapping each name to an array of its values,
+/// grouping repeated names (matching Coraza's map[string][]string).
+fn appendHeaderObject(out: *std.ArrayList(u8), allocator: std.mem.Allocator, headers: []const Header) !void {
+    try out.append(allocator, '{');
+    var written: usize = 0;
+    for (headers, 0..) |header, index| {
+        // Skip a name already emitted by an earlier occurrence.
+        var seen = false;
+        var prior: usize = 0;
+        while (prior < index) : (prior += 1) {
+            if (std.mem.eql(u8, headers[prior].name, header.name)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+        if (written != 0) try out.append(allocator, ',');
+        written += 1;
+        try appendJsonString(out, allocator, header.name);
+        try out.appendSlice(allocator, ":[");
+        var value_count: usize = 0;
+        for (headers) |candidate| {
+            if (!std.mem.eql(u8, candidate.name, header.name)) continue;
+            if (value_count != 0) try out.append(allocator, ',');
+            value_count += 1;
+            try appendJsonString(out, allocator, candidate.value);
+        }
+        try out.append(allocator, ']');
+    }
+    try out.append(allocator, '}');
+}
+
+/// Append `value` as a JSON string literal with the mandatory escapes.
+fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
+    try out.append(allocator, '"');
+    for (value) |byte| {
+        switch (byte) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            0x08 => try out.appendSlice(allocator, "\\b"),
+            0x0C => try out.appendSlice(allocator, "\\f"),
+            0...7, 0x0B, 0x0E...0x1F => try appendFmt(out, allocator, "\\u{x:0>4}", .{byte}),
+            else => try out.append(allocator, byte),
+        }
+    }
+    try out.append(allocator, '"');
+}
+
 fn appendFmt(out: *std.ArrayList(u8), allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
     const rendered = try std.fmt.allocPrint(allocator, fmt, args);
     defer allocator.free(rendered);
@@ -270,6 +393,89 @@ test "request and response bodies render only when part and content are present"
     try testing.expect(std.mem.indexOf(u8, out, "--b-C--\na=1&b=2\n\n") != null);
     // Empty response body → no E section.
     try testing.expect(std.mem.indexOf(u8, out, "--b-E--") == null);
+}
+
+fn serializeJson(allocator: std.mem.Allocator, record: AuditRecord, parts: Parts) ![]u8 {
+    var buffer: std.ArrayList(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    try writeJson(&buffer, allocator, record, parts);
+    return buffer.toOwnedSlice(allocator);
+}
+
+test "the JSON format parses back into the expected structure" {
+    const record: AuditRecord = .{
+        .boundary = "b",
+        .timestamp = 1626354855,
+        .timestamp_string = "15/Jul/2021:13:14:15",
+        .unique_id = "zigwaf-xyz",
+        .client_ip = "192.0.2.10",
+        .client_port = 44321,
+        .server_ip = "198.51.100.5",
+        .server_port = 443,
+        .method = "POST",
+        .uri = "/login",
+        .http_version = "1.1",
+        .request_headers = &.{
+            .{ .name = "Host", .value = "example.com" },
+            .{ .name = "Accept", .value = "a" },
+            .{ .name = "Accept", .value = "b" },
+        },
+        .request_body = "user=alice&pw=\"x\"",
+        .response_status = 403,
+        .response_headers = &.{.{ .name = "Content-Type", .value = "text/html" }},
+        .response_body = "denied",
+        .messages = &.{ "rule 942100", "rule 949110" },
+        .is_interrupted = true,
+    };
+    const out = try serializeJson(testing.allocator, record, Parts.fromLetters("ABCEFHZ"));
+    defer testing.allocator.free(out);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out, .{});
+    defer parsed.deinit();
+    const tx = parsed.value.object.get("transaction").?.object;
+    try testing.expectEqualStrings("zigwaf-xyz", tx.get("id").?.string);
+    try testing.expectEqual(@as(i64, 44321), tx.get("client_port").?.integer);
+    try testing.expectEqual(@as(i64, 1626354855), tx.get("unix_timestamp").?.integer);
+    try testing.expect(tx.get("is_interrupted").?.bool);
+
+    const req = tx.get("request").?.object;
+    try testing.expectEqualStrings("POST", req.get("method").?.string);
+    // The escaped body round-trips exactly.
+    try testing.expectEqualStrings("user=alice&pw=\"x\"", req.get("body").?.string);
+    // Repeated header names group into a single array.
+    const accept = req.get("headers").?.object.get("Accept").?.array;
+    try testing.expectEqual(@as(usize, 2), accept.items.len);
+    try testing.expectEqualStrings("b", accept.items[1].string);
+
+    const res = tx.get("response").?.object;
+    try testing.expectEqual(@as(i64, 403), res.get("status").?.integer);
+    try testing.expectEqualStrings("denied", res.get("body").?.string);
+
+    const messages = parsed.value.object.get("messages").?.array;
+    try testing.expectEqual(@as(usize, 2), messages.items.len);
+    try testing.expectEqualStrings("rule 942100", messages.items[0].object.get("message").?.string);
+}
+
+test "JSON body fields are suppressed when their part is not selected" {
+    const record: AuditRecord = .{
+        .boundary = "b",
+        .timestamp = 0,
+        .unique_id = "id",
+        .client_ip = "1.1.1.1",
+        .client_port = 1,
+        .server_ip = "2.2.2.2",
+        .server_port = 2,
+        .method = "GET",
+        .uri = "/",
+        .http_version = "1.1",
+        .request_body = "secret",
+        .response_body = "hidden",
+    };
+    // No C/E parts → bodies must be empty in the JSON.
+    const out = try serializeJson(testing.allocator, record, Parts.fromLetters("ABFHZ"));
+    defer testing.allocator.free(out);
+    try testing.expect(std.mem.indexOf(u8, out, "secret") == null);
+    try testing.expect(std.mem.indexOf(u8, out, "hidden") == null);
 }
 
 test "selected reserved parts emit empty markers" {
