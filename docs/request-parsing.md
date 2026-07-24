@@ -59,6 +59,12 @@ processor (from the `Content-Type` or `ctl:requestBodyProcessor`):
   Content-Disposition `name`/`filename` params mirror into `MULTIPART_NAME` and
   `MULTIPART_FILENAME`, matching ModSecurity. A missing boundary or an
   unterminated part raises `MULTIPART_STRICT_ERROR`.
+- **XML** walks the body with the lenient `zig-xml` tokenizer and populates the
+  `XML` collection under `//@*` (every attribute value) and `/*` (every
+  non-blank text or CDATA run) — the two selectors OWASP CRS inspects, matching
+  Coraza's XML processor. Character references in attributes and text are
+  entity-decoded; CDATA is kept literal. The parser does no DTD or
+  external-entity processing, so it is not exposed to XXE.
 - **RAW** exposes the body as `REQUEST_BODY` without argument extraction.
 
 ## Bounds and safety
