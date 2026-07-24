@@ -12,6 +12,7 @@ pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
 pub const phrase = @import("phrase.zig");
+pub const ip_match = @import("ip_match.zig");
 pub const operator_fuzz = @import("operator_fuzz.zig");
 pub const plan = @import("plan.zig");
 pub const plan_fuzz = @import("plan_fuzz.zig");
@@ -65,6 +66,7 @@ test {
     _ = operators;
     _ = operator_fuzz;
     _ = phrase;
+    _ = ip_match;
     _ = plan;
     _ = plan_fuzz;
     _ = rule_config;
