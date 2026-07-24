@@ -165,6 +165,58 @@ test "custom separator parses semicolon-delimited queries" {
     try std.testing.expect(it.next() == null);
 }
 
+/// Fuzz invariants for the request parsers: parsing never crashes, decoding
+/// never exceeds the input length and is deterministic, and iterators yield
+/// only borrowed slices of the input.
+pub fn fuzzOne(input: []const u8) !void {
+    var scratch: [1024]u8 = undefined;
+    if (input.len > scratch.len) return;
+
+    inline for (.{ default_separator, ';', '&' }) |separator| {
+        var query = parseQuery(input, separator);
+        while (query.next()) |pair| {
+            if (!within(input, pair.key) or !within(input, pair.value)) return error.QuerySliceEscaped;
+            const decoded = queryUnescape(&scratch, pair.value);
+            if (decoded.len > pair.value.len) return error.DecodeExpanded;
+            var again: [1024]u8 = undefined;
+            if (!std.mem.eql(u8, decoded, queryUnescape(&again, pair.value))) return error.DecodeNonDeterministic;
+        }
+    }
+
+    var cookies = parseCookies(input);
+    while (cookies.next()) |pair| {
+        if (!within(input, pair.key) or !within(input, pair.value)) return error.CookieSliceEscaped;
+    }
+}
+
+fn within(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    const start = @intFromPtr(needle.ptr);
+    const base = @intFromPtr(haystack.ptr);
+    return start >= base and start + needle.len <= base + haystack.len;
+}
+
+test "request parsers survive a deterministic fuzz corpus" {
+    var prng = std.Random.DefaultPrng.init(0x1234567890abcdef);
+    const random = prng.random();
+    const alphabet = "abc=&;%+ \t01AF#$";
+    var buffer: [256]u8 = undefined;
+    for (0..4000) |iteration| {
+        const length = random.uintLessThan(usize, buffer.len + 1);
+        const input = buffer[0..length];
+        switch (iteration % 3) {
+            0 => random.bytes(input),
+            1 => for (input) |*byte| {
+                byte.* = alphabet[random.uintLessThan(usize, alphabet.len)];
+            },
+            else => for (input, 0..) |*byte, i| {
+                byte.* = @truncate(i);
+            },
+        }
+        try fuzzOne(input);
+    }
+}
+
 test "cookie parsing splits on semicolons and trims spaces" {
     var it = parseCookies("SESSION=abc; theme=dark ; flag");
     const first = it.next().?;
