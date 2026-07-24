@@ -32,6 +32,27 @@ so rule evidence and audit logging can quote the original bytes.
 pairs separated by `;` with surrounding spaces trimmed; a pair with no `=` has an
 empty value. Cookie names and values are stored as raw bytes.
 
+## Request body
+
+The request body is buffered in a transaction-owned buffer as chunks arrive,
+bounded by the request-body limit, and published as `REQUEST_BODY` at
+`processRequestBody` when `SecRequestBodyAccess` is on. The buffer keeps bytes in
+memory up to an in-memory threshold and streams the overflow to a spool sink
+(`src/request_buffer.zig`); a hard total limit caps the body, and the
+reject/process-partial policy governs overflow. Disk-exhaustion is a distinct,
+non-blocking error.
+
+Body processors run against the buffered body based on the request-body
+processor (from the `Content-Type` or `ctl:requestBodyProcessor`):
+
+- **URLENCODED** parses `application/x-www-form-urlencoded` bodies into
+  `ARGS_POST` with the same pinned decoding and separator as the query string.
+- **JSON** flattens the body into dotted `ARGS_POST` keys rooted at `json`, with
+  array indices (`json.items.0`) and a per-array length entry (`json.items`),
+  matching the pinned Coraza flattening. Invalid JSON sets the request-body
+  processor error flag.
+- **RAW** exposes the body as `REQUEST_BODY` without argument extraction.
+
 ## Bounds and safety
 
 - The raw request target is bounded by `max_request_target_bytes`; an oversized
