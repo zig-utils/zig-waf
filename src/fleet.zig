@@ -527,9 +527,19 @@ pub const EventSpool = struct {
         });
     }
 
+    /// The batch size from which COPY beats a statement per event. Below it the
+    /// staging table COPY needs costs more than the round trips it saves. Measured
+    /// by `zig build bench-ingestion` (PostgreSQL 18.4, local socket): COPY is 6×
+    /// slower for a single event, level at 16, 1.1× faster at 24, and 3.5× faster
+    /// at 1024.
+    pub const copy_threshold = 24;
+
     /// Ingest the whole queue into PostgreSQL in one batched transaction and
     /// clear it. On failure the queue is left intact for a later retry. Returns
     /// the number of events ingested.
+    ///
+    /// Large batches go through COPY and small ones through a statement per event,
+    /// since neither path is faster at every size — see `copy_threshold`.
     pub fn drain(self: *EventSpool, repository: EventRepository) (pg.Error || error{OutOfMemory})!usize {
         if (self.events.items.len == 0) return 0;
         const batch = try self.allocator.alloc(Event, self.events.items.len);
@@ -542,7 +552,12 @@ pub const EventSpool = struct {
             .message = owned.message,
             .key = owned.key,
         };
-        _ = try repository.recordBatch(batch); // kept on failure — nothing freed yet
+        // Kept on failure — nothing is freed until the batch is committed.
+        if (batch.len >= copy_threshold) {
+            _ = try repository.recordBatchCopy(self.allocator, batch);
+        } else {
+            _ = try repository.recordBatch(batch);
+        }
         const drained = self.events.items.len;
         for (self.events.items) |*event| event.deinit(self.allocator);
         self.events.clearRetainingCapacity();
@@ -1332,6 +1347,43 @@ test "COPY ingestion round-trips awkward fields and deduplicates by key" {
     try testing.expectEqual(@as(usize, 1), try events.recordBatchCopy(testing.allocator, &.{
         .{ .node_id = node_id, .occurred_at = "2024-05-02T00:00:00Z", .action = "deny", .uri = "/f", .message = "after failure", .key = "copy-4" },
     }));
+}
+
+test "a drain at the threshold ingests through COPY" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const events = EventRepository{ .conn = conn };
+    const node_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    var spool = EventSpool.init(testing.allocator, 128);
+    defer spool.deinit();
+
+    // A batch at the threshold takes the COPY path; every event must still arrive
+    // exactly once, keys and awkward fields included.
+    var buffer: [64]u8 = undefined;
+    for (0..EventSpool.copy_threshold) |index| {
+        const key = try std.fmt.bufPrint(&buffer, "drain-{d}", .{index});
+        buffer[key.len] = 0;
+        try spool.enqueue(.{
+            .node_id = node_id,
+            .occurred_at = "2024-08-01T00:00:00Z",
+            .action = "deny",
+            .uri = "/tab\there",
+            .message = "copied",
+            .key = buffer[0..key.len :0],
+        });
+    }
+    try testing.expectEqual(@as(usize, EventSpool.copy_threshold), try spool.drain(events));
+    try testing.expectEqual(@as(usize, 0), spool.len());
+
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    var expected: [8]u8 = undefined;
+    try testing.expectEqualStrings(try std.fmt.bufPrint(&expected, "{d}", .{EventSpool.copy_threshold}), count);
+    const uri = (try conn.queryScalarParams(testing.allocator, "SELECT uri FROM security_events WHERE event_key = $1", &.{"drain-0"})).?;
+    defer testing.allocator.free(uri);
+    try testing.expectEqualStrings("/tab\there", uri);
 }
 
 test "a spool drain survives the server severing the connection" {
