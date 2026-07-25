@@ -2887,17 +2887,28 @@ fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
 }
 
 /// Actions that are recognized but deliberately not implemented, and are therefore
-/// rejected rather than accepted and ignored.
+/// rejected rather than accepted and ignored. Every one of these is also rejected
+/// by ModSecurity 3.0.16's parser ("Action: X is not yet supported",
+/// seclang-parser.yy), and none exists in Coraza 3.7.0.
 ///
-/// `sanitizeMatchedBytes` masks only the matched bytes within a variable, and
-/// neither baseline implements it: ModSecurity 3.0.16's parser rejects it outright
-/// ("Action: SanitiseMatchedBytes is not yet supported", seclang-parser.yy), and
-/// Coraza 3.7.0 has no such action. Accepting it silently would be worse than
-/// either — a rule would look like it redacts a secret from the audit log while
-/// writing it out in full.
+/// Silently accepting any of them is worse than either baseline: a rule would look
+/// as though it redacts a secret, injects content, or delays a response, and would
+/// do none of it. Where a configuration expects an effect that will not happen, the
+/// only safe answer is to refuse to compile it.
+///
+///   * `sanitizeMatchedBytes` — masks only the matched bytes within a variable.
+///     The whole-variable form (`sanitizeMatched`) is implemented; this one is not.
+///   * `append` / `prepend` — response content injection. ModSecurity v3 does not
+///     support content injection at all, so implementing them would diverge from
+///     the baseline rather than catch up to it.
+///   * `pause` — delays the response by a number of milliseconds, which would mean
+///     sleeping on the request path.
 fn isUnimplementedAction(name: []const u8) bool {
-    return std.ascii.eqlIgnoreCase(name, "sanitizeMatchedBytes") or
-        std.ascii.eqlIgnoreCase(name, "sanitiseMatchedBytes");
+    return equalsAny(name, &.{
+        "sanitizeMatchedBytes", "sanitiseMatchedBytes",
+        "append",               "prepend",
+        "pause",
+    });
 }
 
 fn classifyAction(name: []const u8) ActionClass {
@@ -4416,6 +4427,23 @@ test "an action neither baseline implements is rejected, not ignored" {
         error.UnimplementedAction,
         compile(std.testing.allocator, &parsed_british.registry, &british_documents, .{}),
     );
+
+    // Content injection and pause are rejected for the same reason: ModSecurity v3
+    // does not support content injection at all, and `pause` would mean sleeping on
+    // the request path, so a rule carrying either would silently do nothing.
+    for ([_][]const u8{
+        "SecRule ARGS \"@rx .\" \"id:1,phase:2,pass,nolog,append:'<!-- x -->'\"",
+        "SecRule ARGS \"@rx .\" \"id:1,phase:2,pass,nolog,prepend:'<!-- x -->'\"",
+        "SecRule ARGS \"@rx .\" \"id:1,phase:2,pass,nolog,pause:100\"",
+    }) |source| {
+        var each = try seclang.parser.parseBytes(std.testing.allocator, "unsupported.conf", source, .{}, .{});
+        defer each.deinit();
+        var each_documents = [_]seclang.parser.Document{each.document};
+        try std.testing.expectError(
+            error.UnimplementedAction,
+            compile(std.testing.allocator, &each.registry, &each_documents, .{}),
+        );
+    }
 
     // The redaction actions that *are* implemented still compile.
     const supported =
