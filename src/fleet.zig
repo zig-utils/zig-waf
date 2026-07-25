@@ -81,6 +81,28 @@ pub const NodeRepository = struct {
     pub fn statusOf(self: NodeRepository, allocator: std.mem.Allocator, node_id: [:0]const u8) pg.Error!?[]u8 {
         return self.conn.queryScalarParams(allocator, "SELECT status FROM nodes WHERE node_id = $1", &.{node_id});
     }
+
+    /// How many nodes are in a given status — for the fleet inventory (#50).
+    pub fn countByStatus(self: NodeRepository, allocator: std.mem.Allocator, status: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(allocator, "SELECT count(*) FROM nodes WHERE status = $1", &.{status});
+    }
+
+    /// How many active nodes have not sent a heartbeat within `max_age_seconds`
+    /// (or have never been seen) — the "stale/unhealthy" count for fleet
+    /// telemetry and alerting (#59).
+    pub fn staleCount(self: NodeRepository, allocator: std.mem.Allocator, max_age_seconds: u32) pg.Error!?[]u8 {
+        var seconds_buffer: [16]u8 = undefined;
+        const seconds = std.fmt.bufPrint(&seconds_buffer, "{d}", .{max_age_seconds}) catch return error.QueryFailed;
+        seconds_buffer[seconds.len] = 0;
+        return self.conn.queryScalarParams(
+            allocator,
+            \\SELECT count(*) FROM nodes
+            \\WHERE status = 'active'
+            \\  AND (last_seen_at IS NULL OR last_seen_at < now() - make_interval(secs => $1::int))
+        ,
+            &.{seconds_buffer[0..seconds.len :0]},
+        );
+    }
 };
 
 /// Ingestion and per-node counts for the security-event stream (#55/#56).
@@ -318,6 +340,15 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     defer testing.allocator.free(status);
     try testing.expectEqualStrings("active", status);
     try testing.expect((try nodes.statusOf(testing.allocator, "00000000-0000-0000-0000-000000000000")) == null);
+
+    // Inventory: one active node, and it is fresh (heartbeat just now) within a
+    // 60-second staleness window.
+    const active_count = (try nodes.countByStatus(testing.allocator, "active")).?;
+    defer testing.allocator.free(active_count);
+    try testing.expectEqualStrings("1", active_count);
+    const stale = (try nodes.staleCount(testing.allocator, 60)).?;
+    defer testing.allocator.free(stale);
+    try testing.expectEqualStrings("0", stale);
 
     // Ingest events, including an SQL-injection-shaped URI that must be stored
     // literally (parameter binding), not executed.
