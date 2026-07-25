@@ -23,6 +23,8 @@ pub fn main(init: std.process.Init) !void {
 
     if (std.mem.eql(u8, command, "validate")) {
         try validate(gpa, io, &args);
+    } else if (std.mem.eql(u8, command, "explain")) {
+        try explain(gpa, io, &args);
     } else if (std.mem.eql(u8, command, "version")) {
         std.debug.print("zig-waf {s}\n", .{waf.version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -40,10 +42,57 @@ fn usage() void {
         \\
         \\usage:
         \\  zig-waf validate <file.conf>...   parse, compile, and validate SecLang configs
+        \\  zig-waf explain <file.conf>       list the compiled rules (phase, id, action, location)
         \\  zig-waf version                   print the engine version
         \\  zig-waf help                      show this help
         \\
     , .{});
+}
+
+/// Compile a config and print one line per rule: index, phase, id, disruptive
+/// action, and source location — a quick view of what a rule set resolves to.
+fn explain(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse {
+        std.debug.print("zig-waf explain: expected a config file\n", .{});
+        std.process.exit(2);
+    };
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(bytes);
+
+    var parsed = try waf.seclang.parser.parseBytesOutcome(gpa, path, bytes, .{}, .{});
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .diagnostic => |value| {
+            const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
+            defer gpa.free(rendered);
+            std.debug.print("{s}", .{rendered});
+            std.process.exit(1);
+        },
+        .document => |document| document,
+    };
+    var documents = [_]waf.seclang.parser.Document{document};
+    const compiled = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+        std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
+        std.process.exit(1);
+    };
+    defer compiled.deinit();
+
+    std.debug.print("{s}: {d} rule(s)\n", .{ path, compiled.rules.len });
+    for (compiled.rules, 0..) |rule, index| {
+        const location = try compiled.sourceLocation(rule.source.source, rule.source.start);
+        var id_buf: [24]u8 = undefined;
+        const id = if (rule.external_id) |value|
+            std.fmt.bufPrint(&id_buf, "{d}", .{value}) catch "?"
+        else
+            "-";
+        std.debug.print("  [{d}] phase={d} id={s} action={s} @ {d}:{d}\n", .{
+            index,                          rule.phase,    id,
+            @tagName(rule.disruptive.kind), location.line, location.column,
+        });
+    }
 }
 
 fn validate(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
