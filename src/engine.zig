@@ -4717,6 +4717,49 @@ test "the sanitizeMatched action masks the matched variable" {
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
 }
 
+test "evaluatePhase drives CRS-style anomaly scoring across rules" {
+    // A detection rule adds to tx.score; a later rule blocks once the threshold
+    // is crossed — the core CRS anomaly-scoring pattern, all inside one phase.
+    const input =
+        \\SecRule ARGS "@rx attack" "id:1,phase:1,pass,nolog,setvar:'tx.score=+5'"
+        \\SecRule ARGS "@rx probe" "id:2,phase:1,pass,nolog,setvar:'tx.score=+3'"
+        \\SecRule TX:score "@ge 5" "id:100,phase:1,deny,status:403,msg:'anomaly threshold'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "scoring.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // Two hits (attack + probe) accumulate score 8 >= 5 → blocked.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?a=attack&b=probe", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqualStrings("8", (try tx.collectionFirst(.tx, "score")).?.value);
+        try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
+    }
+
+    // One low-score hit (probe = 3 < 5) stays under the threshold → allowed.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?b=probe", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqualStrings("3", (try tx.collectionFirst(.tx, "score")).?.value);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
 test "evaluatePhase autonomously runs a rule set and blocks a malicious request" {
     const input =
         \\SecRule ARGS "@rx select.*from" "id:1,phase:1,t:lowercase,deny,status:403,msg:'SQLi'"
