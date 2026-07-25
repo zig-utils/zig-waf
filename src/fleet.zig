@@ -518,6 +518,24 @@ pub const RolloutRepository = struct {
         );
     }
 
+    /// Assign every node carrying `label_key` = `label_value` to a ruleset
+    /// version — a segmented rollout to a labeled cohort (region, tier, canary),
+    /// pairing `NodeRepository.setLabel`/`withLabel` with staged distribution.
+    /// Returns the number of nodes assigned (caller frees the text count).
+    pub fn assignByLabel(self: RolloutRepository, allocator: std.mem.Allocator, label_key: [:0]const u8, label_value: [:0]const u8, ruleset_name: [:0]const u8, version: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            \\WITH rolled AS (
+            \\  INSERT INTO node_rulesets (node_id, ruleset_name, version)
+            \\  SELECT node_id, $3, $4 FROM nodes WHERE labels ->> $1 = $2
+            \\  ON CONFLICT (node_id, ruleset_name) DO UPDATE SET version = EXCLUDED.version, assigned_at = now()
+            \\  RETURNING 1
+            \\) SELECT count(*) FROM rolled
+        ,
+            &.{ label_key, label_value, ruleset_name, version },
+        );
+    }
+
     /// The version a node is assigned to run for `ruleset_name` (caller frees),
     /// or null if the node has no assignment.
     pub fn assignedVersion(self: RolloutRepository, allocator: std.mem.Allocator, node_id: [:0]const u8, ruleset_name: [:0]const u8) pg.Error!?[]u8 {
@@ -847,6 +865,22 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
         const vb = (try rollout.assignedVersion(testing.allocator, b, "crs")).?;
         defer testing.allocator.free(vb);
         try testing.expectEqualStrings("3", vb);
+    }
+
+    // Segmented rollout: only the labeled cohort is moved to v4.
+    try nodes.setLabel(a, "tier", "canary");
+    {
+        const rolled = (try rollout.assignByLabel(testing.allocator, "tier", "canary", "crs", "4")).?;
+        defer testing.allocator.free(rolled);
+        try testing.expectEqualStrings("1", rolled); // only node a is canary
+    }
+    {
+        const va = (try rollout.assignedVersion(testing.allocator, a, "crs")).?;
+        defer testing.allocator.free(va);
+        try testing.expectEqualStrings("4", va);
+        const vb2 = (try rollout.assignedVersion(testing.allocator, b, "crs")).?;
+        defer testing.allocator.free(vb2);
+        try testing.expectEqualStrings("3", vb2); // unlabeled node b untouched
     }
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets CASCADE");
