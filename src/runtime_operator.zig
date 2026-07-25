@@ -20,6 +20,7 @@ pub const RuntimeOperator = union(enum) {
     regex: operators.RegexOperator,
     phrase: operators.PhraseOperator,
     ip: operators.IpMatcher,
+    identity: operators.IdentityOperator,
 
     /// Compile an operator by name. `@rx`/`@pm`/`@ipMatch` build reusable state;
     /// every other operator is stored as a borrowed name/parameter pair.
@@ -35,6 +36,11 @@ pub const RuntimeOperator = union(enum) {
         if (eqName(op, "pmf") or eqName(op, "pmFromFile") or eqName(op, "pmFromDataset")) {
             return .{ .phrase = try operators.PhraseOperator.compileFromFileBytes(allocator, parameter, .{}) };
         }
+        // `@verifyCC` / `@verifyCPF` / `@verifySSN`: a candidate-finding regex plus a
+        // checksum, so they compile like `@rx` and carry their verifier with them.
+        if (operators.resolveIdentity(op)) |kind| {
+            return .{ .identity = try operators.IdentityOperator.compile(allocator, kind, parameter) };
+        }
         if (eqName(op, "ipMatch")) {
             return .{ .ip = try operators.compileIpMatch(allocator, parameter, .{}) };
         }
@@ -49,6 +55,7 @@ pub const RuntimeOperator = union(enum) {
     pub fn deinit(self: *RuntimeOperator) void {
         switch (self.*) {
             .regex => |*re| re.deinit(),
+            .identity => |*id| id.deinit(),
             .phrase => |*p| p.deinit(),
             .ip => |*ip| ip.deinit(),
             .compile_free => {},
@@ -73,6 +80,9 @@ pub const RuntimeOperator = union(enum) {
         matched: bool,
         regex: ?operators.RegexOutcome = null,
         sqli: ?operators.SqlInjection.Match = null,
+        /// The verified candidate for an identity operator, which a capturing rule
+        /// stores in TX.0. Borrows the evaluated input.
+        identity: ?[]const u8 = null,
     };
 
     pub fn match(self: *const RuntimeOperator, input: []const u8, profile: operators.Profile) Match {
@@ -96,6 +106,15 @@ pub const RuntimeOperator = union(enum) {
                 defer worker.deinit();
                 const outcome = worker.evaluate(input);
                 return .{ .matched = outcome.matched, .regex = outcome };
+            },
+            .identity => |*id| {
+                // The verifier needs an allocator for the match list; identity
+                // operators are rare and their inputs bounded, so a fixed scratch
+                // buffer keeps this off the general allocator.
+                var scratch: [8 * 1024]u8 = undefined;
+                var fixed = std.heap.FixedBufferAllocator.init(&scratch);
+                const outcome = id.evaluate(fixed.allocator(), input);
+                return .{ .matched = outcome.matched, .identity = if (outcome.matched) outcome.candidate else null };
             },
             .phrase => |*p| return .{ .matched = p.matches(input) },
             .ip => |*ip| return .{ .matched = ip.matches(input) },

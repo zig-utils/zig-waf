@@ -2634,17 +2634,17 @@ pub const Transaction = struct {
                     const result = self.transformation_executor.applyPipeline(transforms, resolved.value, true) catch {
                         const hit = operator.match(resolved.value, .modsecurity);
                         if (hit.matched != negated)
-                            return try matchContext(arena, resolved.name, resolved.value, hit.regex, hit.sqli);
+                            return try matchContext(arena, resolved.name, resolved.value, hit.regex, hit.sqli, hit.identity);
                         continue;
                     };
                     for (result.checkpoints) |checkpoint| {
                         const hit = operator.match(checkpoint.bytes, .modsecurity);
                         if (hit.matched != negated)
-                            return try matchContext(arena, resolved.name, checkpoint.bytes, hit.regex, hit.sqli);
+                            return try matchContext(arena, resolved.name, checkpoint.bytes, hit.regex, hit.sqli, hit.identity);
                     }
                     const hit = operator.match(result.bytes, .modsecurity);
                     if (hit.matched != negated)
-                        return try matchContext(arena, resolved.name, result.bytes, hit.regex, hit.sqli);
+                        return try matchContext(arena, resolved.name, result.bytes, hit.regex, hit.sqli, hit.identity);
                 } else {
                     const transformed = if (transforms.len == 0)
                         resolved.value
@@ -2655,7 +2655,7 @@ pub const Transaction = struct {
                     };
                     const hit = operator.match(transformed, .modsecurity);
                     if (hit.matched != negated)
-                        return try matchContext(arena, resolved.name, transformed, hit.regex, hit.sqli);
+                        return try matchContext(arena, resolved.name, transformed, hit.regex, hit.sqli, hit.identity);
                 }
             }
         }
@@ -3746,9 +3746,20 @@ fn matchContext(
     value: []const u8,
     regex: ?operators.RegexOutcome,
     sqli: ?operators.SqlInjection.Match,
+    identity: ?[]const u8,
 ) std.mem.Allocator.Error!MatchContext {
     const owned = try arena.dupe(u8, value);
     var derived: []const []const u8 = &.{};
+    // `@verifyCC` and friends store the verified candidate in TX.0 for a capturing
+    // rule (ModSecurity 3.0.16 src/operators/verify_cc.cc). It is a substring of the
+    // value, but which substring is decided by the operator, so it travels the same
+    // derived-capture path rather than a range the caller would have to recompute.
+    if (identity) |candidate| {
+        const owned_candidate = try arena.dupe(u8, candidate);
+        const slots = try arena.alloc([]const u8, 1);
+        slots[0] = owned_candidate;
+        derived = slots;
+    }
     // ModSecurity 3.0.16 stores libinjection's fingerprint in TX.0 for a capturing
     // `@detectSQLi` (src/operators/detect_sqli.cc). The bytes are copied into the
     // arena because the detector's result is held by value on the caller's stack.
@@ -7065,4 +7076,93 @@ test "derived captures are bounded like any other match evidence" {
         .derived_captures = &fingerprint,
     }));
     try std.testing.expectEqualStrings("s&1c", (try tx.collectionFirst(.tx, "0")).?.value);
+}
+
+test "@verifyCC denies a real card number and ignores a lookalike" {
+    // The pattern finds candidates; the Luhn check decides which are cards. A rule
+    // running the pattern alone would report every 16-digit order reference as a
+    // leaked card, which is why upstream pairs the two.
+    const input =
+        \\SecRule ARGS "@verifyCC [0-9]{13,16}" "id:1,phase:1,deny,status:403,capture,t:none,msg:'card in request'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "cc.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A card number that passes Luhn is denied, and the verified candidate — not
+    // the whole argument — is what lands in TX.0.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/pay?card=4111111111111111", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        const decision = (try tx.intervention()).?;
+        try std.testing.expectEqual(@as(u16, 403), decision.status);
+        try std.testing.expectEqualStrings("4111111111111111", (try tx.collectionFirst(.tx, "0")).?.value);
+    }
+
+    // A 16-digit reference that fails Luhn passes: the shape matched, the checksum
+    // did not.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/order?ref=1234567890123456", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "@verifySSN and @verifyCPF gate on their own structural rules" {
+    const input =
+        \\SecRule ARGS:ssn "@verifySSN [0-9]{3}-?[0-9]{2}-?[0-9]{4}" "id:1,phase:1,deny,status:403,t:none"
+        \\SecRule ARGS:doc "@verifyCPF [0-9]{11}" "id:2,phase:1,deny,status:406,t:none"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "id.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // Each rule reads its own argument: an eleven-digit CPF contains a nine-digit
+    // run that is itself a structurally valid SSN, so a shared target would make
+    // the fixture ambiguous rather than testing either operator.
+    const cases = [_]struct { query: []const u8, status: ?u16 }{
+        // An issued SSN range is denied; an area that was never issued is not.
+        .{ .query = "/x?ssn=123-45-6789", .status = 403 },
+        .{ .query = "/x?ssn=666-45-6789", .status = null },
+        .{ .query = "/x?ssn=123-00-6789", .status = null },
+        // A CPF whose check digits verify is denied; one digit off is not.
+        .{ .query = "/x?doc=52998224725", .status = 406 },
+        .{ .query = "/x?doc=52998224726", .status = null },
+        // A repeated-digit CPF satisfies the arithmetic but is not a real one.
+        .{ .query = "/x?doc=11111111111", .status = null },
+    };
+    for (cases) |case| {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri(case.query, "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        const decision = try tx.intervention();
+        if (case.status) |expected| {
+            try std.testing.expectEqual(expected, decision.?.status);
+        } else {
+            try std.testing.expect(decision == null);
+        }
+    }
 }

@@ -719,6 +719,169 @@ pub const validation_specs = [_]ValidationSpec{
     .{ .kind = .validate_url_encoding, .name = "validateUrlEncoding" },
 };
 
+/// The national-identifier and card operators (`@verifyCC`, `@verifyCPF`,
+/// `@verifySSN`) share one shape: a regex parameter finds candidate digit runs, and
+/// each candidate is accepted only if it also passes a checksum or structural rule.
+/// The regex alone would match any digit string of the right shape, which is why
+/// upstream pairs it with a verifier — a rule that only ran the regex would report
+/// every 16-digit order number as a credit card.
+///
+/// Upstream (ModSecurity 3.0.16 `verify_cc.cc`) restarts the match at every byte
+/// offset and stops at the first candidate that verifies, so overlapping candidates
+/// are all considered. `findAll` supplies the same set of match start positions.
+/// Coraza 3.7.0 dropped these operators, so ModSecurity is the only baseline.
+pub const IdentityKind = enum {
+    /// Luhn mod-10 (ISO 2894 / ANSI 4.13).
+    credit_card,
+    /// Brazilian CPF: two mod-11 check digits.
+    cpf,
+    /// US Social Security number: structurally impossible ranges.
+    ssn,
+
+    pub fn verify(self: IdentityKind, candidate: []const u8) bool {
+        return switch (self) {
+            .credit_card => luhnValid(candidate),
+            .cpf => cpfValid(candidate),
+            .ssn => ssnValid(candidate),
+        };
+    }
+};
+
+/// Resolve an identity operator name, or null if it is not one.
+pub fn resolveIdentity(name: []const u8) ?IdentityKind {
+    if (std.ascii.eqlIgnoreCase(name, "verifyCC")) return .credit_card;
+    if (std.ascii.eqlIgnoreCase(name, "verifyCPF")) return .cpf;
+    if (std.ascii.eqlIgnoreCase(name, "verifySSN")) return .ssn;
+    return null;
+}
+
+/// The result of an identity check: whether any candidate verified, and which one,
+/// so a capturing rule can store it in TX.0 as upstream does.
+pub const IdentityOutcome = struct {
+    matched: bool = false,
+    /// Borrows the input; valid only while it is.
+    candidate: []const u8 = "",
+};
+
+/// Luhn mod-10 over the digits of `value`, ignoring any non-digit bytes (a card
+/// number written with spaces or dashes still verifies, matching upstream, which
+/// weights only digits). A candidate with no digits never verifies.
+pub fn luhnValid(value: []const u8) bool {
+    // Precomputed doubling table: i*2, minus 9 when that exceeds 9.
+    const weighted = [10]u8{ 0, 2, 4, 6, 8, 1, 3, 5, 7, 9 };
+    var sums = [2]u32{ 0, 0 };
+    var odd: usize = 0;
+    var digits: usize = 0;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) continue;
+        const digit = byte - '0';
+        sums[0] += if (odd == 0) weighted[digit] else digit;
+        sums[1] += if (odd == 1) weighted[digit] else digit;
+        odd = 1 - odd;
+        digits += 1;
+    }
+    if (digits == 0) return false;
+    // Which sum applies depends on the parity of the digit count, which is what
+    // `odd` holds after the loop — the same trick upstream uses to avoid a second
+    // pass over the digits.
+    return sums[odd] % 10 == 0;
+}
+
+/// Brazilian CPF: eleven digits whose last two are mod-11 check digits over the
+/// preceding nine and ten. A run of one repeated digit (`111.111.111-11`) satisfies
+/// the arithmetic but is not a real CPF, and every issuer rejects it, so it is
+/// rejected here too.
+pub fn cpfValid(value: []const u8) bool {
+    var digits: [11]u8 = undefined;
+    var count: usize = 0;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) continue;
+        if (count == digits.len) return false; // too many digits to be a CPF
+        digits[count] = byte - '0';
+        count += 1;
+    }
+    if (count != digits.len) return false;
+
+    var uniform = true;
+    for (digits[1..]) |digit| if (digit != digits[0]) {
+        uniform = false;
+        break;
+    };
+    if (uniform) return false;
+
+    inline for (.{ 9, 10 }) |position| {
+        var sum: u32 = 0;
+        for (digits[0..position], 0..) |digit, index| {
+            sum += @as(u32, digit) * @as(u32, @intCast(position + 1 - index));
+        }
+        const remainder = (sum * 10) % 11;
+        const expected: u8 = if (remainder == 10) 0 else @intCast(remainder);
+        if (digits[position] != expected) return false;
+    }
+    return true;
+}
+
+/// US Social Security number: nine digits, excluding the ranges the Social Security
+/// Administration has never issued — area 000, 666, and 900-999; group 00; serial
+/// 0000. There is no checksum, so these structural rules are the whole test, and
+/// omitting them would make the operator match any nine digits.
+pub fn ssnValid(value: []const u8) bool {
+    var digits: [9]u8 = undefined;
+    var count: usize = 0;
+    for (value) |byte| {
+        if (!std.ascii.isDigit(byte)) continue;
+        if (count == digits.len) return false;
+        digits[count] = byte - '0';
+        count += 1;
+    }
+    if (count != digits.len) return false;
+
+    const area = @as(u16, digits[0]) * 100 + @as(u16, digits[1]) * 10 + digits[2];
+    if (area == 0 or area == 666 or area >= 900) return false;
+    const group = @as(u16, digits[3]) * 10 + digits[4];
+    if (group == 0) return false;
+    const serial = @as(u16, digits[5]) * 1000 + @as(u16, digits[6]) * 100 + @as(u16, digits[7]) * 10 + digits[8];
+    if (serial == 0) return false;
+    return true;
+}
+
+/// A ruleset-owned `@verifyCC` / `@verifyCPF` / `@verifySSN` operator: the compiled
+/// candidate-finding regex plus the verifier that decides which candidates count.
+pub const IdentityOperator = struct {
+    kind: IdentityKind,
+    regex: RegexOperator,
+
+    pub fn compile(allocator: std.mem.Allocator, kind: IdentityKind, pattern: []const u8) RegexCompileError!IdentityOperator {
+        return .{ .kind = kind, .regex = try RegexOperator.compile(allocator, pattern) };
+    }
+
+    pub fn deinit(self: *IdentityOperator) void {
+        self.regex.deinit();
+        self.* = undefined;
+    }
+
+    /// The first candidate in `input` that both matches the pattern and verifies.
+    /// Every candidate is considered, not just the first match: a benign digit run
+    /// earlier in the value must not shadow a real card number after it.
+    pub fn evaluate(self: *const IdentityOperator, allocator: std.mem.Allocator, input: []const u8) IdentityOutcome {
+        const compiled = self.regex.compiled orelse
+            // An empty pattern matches everywhere upstream, so the whole value is
+            // the only candidate.
+            return .{ .matched = self.kind.verify(input), .candidate = input };
+        var matcher = compiled.matcher();
+        defer matcher.deinit();
+        const matches = matcher.findAll(allocator, input) catch return .{};
+        defer {
+            for (matches) |*match| match.deinit(compiled.allocator);
+            allocator.free(matches);
+        }
+        for (matches) |match| {
+            if (self.kind.verify(match.slice)) return .{ .matched = true, .candidate = match.slice };
+        }
+        return .{};
+    }
+};
+
 /// Case-insensitive resolution of a validation operator name.
 pub fn resolveValidation(name: []const u8) ?ValidationKind {
     for (validation_specs) |spec| {
@@ -1045,4 +1208,97 @@ test "rx memoization bounds entries with least-recently-used eviction" {
     _ = worker.evaluate("charlie");
     try std.testing.expectEqual(@as(usize, 2), worker.memoStats().entries);
     try std.testing.expectEqual(@as(u64, 1), worker.memoStats().evictions);
+}
+
+test "Luhn accepts published test numbers and rejects near misses" {
+    // The card-network test numbers, which are the standard published vectors.
+    for ([_][]const u8{
+        "4111111111111111", // Visa
+        "5500005555555559", // Mastercard
+        "340000000000009", // American Express
+        "6011000000000004", // Discover
+        "3530111333300000", // JCB
+    }) |number| try std.testing.expect(luhnValid(number));
+
+    // Separators are ignored, as upstream weights only digits.
+    try std.testing.expect(luhnValid("4111 1111 1111 1111"));
+    try std.testing.expect(luhnValid("4111-1111-1111-1111"));
+
+    // A single altered digit fails, which is the entire point of the check.
+    try std.testing.expect(!luhnValid("4111111111111112"));
+    try std.testing.expect(!luhnValid("4111111111111121"));
+    // Digit strings that merely look like cards do not verify.
+    try std.testing.expect(!luhnValid("1234567890123456"));
+    try std.testing.expect(!luhnValid(""));
+    try std.testing.expect(!luhnValid("no digits here"));
+}
+
+test "CPF verifies both check digits and rejects repeated-digit strings" {
+    // Valid CPFs, formatted and bare.
+    try std.testing.expect(cpfValid("529.982.247-25"));
+    try std.testing.expect(cpfValid("52998224725"));
+    try std.testing.expect(cpfValid("111.444.777-35"));
+
+    // Either check digit being wrong fails.
+    try std.testing.expect(!cpfValid("52998224726"));
+    try std.testing.expect(!cpfValid("52998224715"));
+
+    // A run of one repeated digit satisfies the arithmetic but is not a real CPF,
+    // and no issuer accepts one.
+    try std.testing.expect(!cpfValid("111.111.111-11"));
+    try std.testing.expect(!cpfValid("00000000000"));
+
+    // Wrong length either way.
+    try std.testing.expect(!cpfValid("5299822472"));
+    try std.testing.expect(!cpfValid("529982247251"));
+}
+
+test "SSN rejects the ranges that were never issued" {
+    try std.testing.expect(ssnValid("123-45-6789"));
+    try std.testing.expect(ssnValid("123456789"));
+
+    // Area 000, 666, and 900-999 have never been issued.
+    try std.testing.expect(!ssnValid("000-45-6789"));
+    try std.testing.expect(!ssnValid("666-45-6789"));
+    try std.testing.expect(!ssnValid("900-45-6789"));
+    try std.testing.expect(!ssnValid("999-45-6789"));
+    // Nor is a zero group or serial.
+    try std.testing.expect(!ssnValid("123-00-6789"));
+    try std.testing.expect(!ssnValid("123-45-0000"));
+    // Wrong length.
+    try std.testing.expect(!ssnValid("12345678"));
+    try std.testing.expect(!ssnValid("1234567890"));
+}
+
+test "an identity operator finds a verifying candidate anywhere in the value" {
+    var operator = try IdentityOperator.compile(std.testing.allocator, .credit_card, "[0-9]{13,16}");
+    defer operator.deinit();
+
+    // A real card number is found and reported, so a capturing rule can store it.
+    {
+        const outcome = operator.evaluate(std.testing.allocator, "card=4111111111111111&x=1");
+        try std.testing.expect(outcome.matched);
+        try std.testing.expectEqualStrings("4111111111111111", outcome.candidate);
+    }
+
+    // A digit run of the right shape that fails Luhn is not a card. This is the
+    // case the regex alone cannot decide, and the reason upstream pairs the two.
+    {
+        const outcome = operator.evaluate(std.testing.allocator, "order=1234567890123456");
+        try std.testing.expect(!outcome.matched);
+    }
+
+    // A benign digit run before a real card must not shadow it: every candidate is
+    // considered, not just the first match.
+    {
+        const outcome = operator.evaluate(std.testing.allocator, "ref=1234567890123456;card=4111111111111111");
+        try std.testing.expect(outcome.matched);
+        try std.testing.expectEqualStrings("4111111111111111", outcome.candidate);
+    }
+
+    // Nothing that looks like a candidate at all.
+    {
+        const outcome = operator.evaluate(std.testing.allocator, "name=alice");
+        try std.testing.expect(!outcome.matched);
+    }
 }
