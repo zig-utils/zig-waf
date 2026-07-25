@@ -26,11 +26,20 @@ pub const RuntimeOperator = union(enum) {
     pub fn compile(allocator: std.mem.Allocator, name: []const u8, parameter: []const u8) CompileError!RuntimeOperator {
         const op = normalize(name);
         if (eqName(op, "rx")) return .{ .regex = try operators.RegexOperator.compile(allocator, parameter) };
-        if (eqName(op, "pm") or eqName(op, "pmf") or eqName(op, "pmFromFile")) {
+        if (eqName(op, "pm")) {
             return .{ .phrase = try operators.PhraseOperator.compile(allocator, parameter, .{}) };
         }
-        if (eqName(op, "ipMatch") or eqName(op, "ipMatchFromFile")) {
+        // For `@pmFromFile` the compiler has already replaced the filename with
+        // the file's bytes, so `parameter` is a newline-delimited keyword list.
+        if (eqName(op, "pmf") or eqName(op, "pmFromFile")) {
+            return .{ .phrase = try operators.PhraseOperator.compileFromFileBytes(allocator, parameter, .{}) };
+        }
+        if (eqName(op, "ipMatch")) {
             return .{ .ip = try operators.compileIpMatch(allocator, parameter, .{}) };
+        }
+        // Likewise `parameter` here is the subnet-per-line contents of the file.
+        if (eqName(op, "ipMatchFromFile") or eqName(op, "ipMatchF")) {
+            return .{ .ip = try operators.compileIpMatchFromFileBytes(allocator, parameter, .{}) };
         }
         return .{ .compile_free = .{ .name = name, .parameter = parameter } };
     }

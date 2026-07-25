@@ -4900,6 +4900,130 @@ test "SecAction honours disruptive and flow actions in rule order" {
     try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
 }
 
+const TestDataProvider = struct {
+    bytes: []const u8,
+    seen_filename: ?[]const u8 = null,
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8 {
+        _ = base_dir;
+        const self: *TestDataProvider = @ptrCast(@alignCast(context));
+        self.seen_filename = filename;
+        return allocator.dupe(u8, self.bytes);
+    }
+};
+
+test "@pmFromFile compiles its phrase set from a data provider" {
+    // The compiler resolves the filename to bytes via the provider; the runtime
+    // then matches ARGS against the newline-delimited phrase set — the mechanism
+    // CRS rules like 932160 (unix-shell.data) depend on.
+    const input =
+        \\SecRule ARGS "@pmFromFile shells.data" "id:1,phase:1,deny,status:403,t:none,msg:'RCE'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "rce.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    var data = TestDataProvider{ .bytes = "bin/cat\nbin/ls\n# a comment\n\nbin/sh\n" };
+    const provider = compiled_plan.DataProvider{ .context = &data, .readFn = TestDataProvider.read };
+    const plan = try compiled_plan.compileWithProvider(std.testing.allocator, &parsed.registry, &documents, .{}, provider);
+    defer plan.deinit();
+    // The provider was asked for the exact filename named in the rule.
+    try std.testing.expectEqualStrings("shells.data", data.seen_filename.?);
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A value containing one of the file's phrases is blocked.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?c=/bin/cat%20/etc/passwd", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
+    }
+
+    // A value matching only the filename (not a file phrase) is NOT blocked —
+    // proving the operator matches file contents, not the filename.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?c=shells.data", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "@ipMatchFromFile compiles its subnet set from a data provider" {
+    // Same compile-time provider path as @pmFromFile, but the file is a
+    // subnet-per-line list feeding an IP matcher against REMOTE_ADDR.
+    const input =
+        \\SecRule REMOTE_ADDR "@ipMatchFromFile badips.data" "id:1,phase:1,deny,status:403,msg:'blocklisted'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "ip.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    var data = TestDataProvider{ .bytes = "10.0.0.0/8\n192.168.1.5\n# comment\n203.0.113.0/24\n" };
+    const provider = compiled_plan.DataProvider{ .context = &data, .readFn = TestDataProvider.read };
+    const plan = try compiled_plan.compileWithProvider(std.testing.allocator, &parsed.registry, &documents, .{}, provider);
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A client inside a blocklisted subnet is denied.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("10.4.5.6", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
+    }
+
+    // A client outside every listed subnet is allowed.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("8.8.8.8", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "@pmFromFile without a data provider does not load the file's phrases" {
+    // Plain `compile` (no provider) cannot read the data file, so a real RCE
+    // payload that would match a file phrase passes untouched — confirming the
+    // file's contents are only available when a provider is supplied.
+    const input =
+        \\SecRule ARGS "@pmFromFile shells.data" "id:1,phase:1,deny,status:403,t:none"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "rce.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?c=/bin/cat%20/etc/passwd", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    try std.testing.expect((try tx.intervention()) == null);
+}
+
 test "evaluatePhase autonomously runs a rule set and blocks a malicious request" {
     const input =
         \\SecRule ARGS "@rx select.*from" "id:1,phase:1,t:lowercase,deny,status:403,msg:'SQLi'"

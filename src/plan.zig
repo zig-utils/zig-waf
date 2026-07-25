@@ -182,6 +182,23 @@ pub const CompileError = std.mem.Allocator.Error || error{
     UnterminatedMacro,
     EmptyMacroExpression,
     InvalidSourceTree,
+    InvalidOperatorDataFile,
+};
+
+/// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
+/// referenced from a rule file. The compiler resolves the file once, at compile
+/// time, so the runtime never touches the filesystem. `base_dir` is the
+/// directory of the rule file that named the data file; the provider is
+/// responsible for confining the read (see `seclang.include.readDataFileAlloc`).
+/// A null provider (the default) leaves file-backed operators unresolved.
+pub const DataProvider = struct {
+    context: *anyopaque,
+    readFn: *const fn (context: *anyopaque, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8,
+
+    /// Read the data file's bytes relative to `base_dir`, owned by `allocator`.
+    pub fn read(self: DataProvider, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8 {
+        return self.readFn(self.context, allocator, base_dir, filename);
+    }
 };
 
 pub const DiagnosticCode = enum {
@@ -727,7 +744,21 @@ pub fn compile(
     documents: []const seclang.parser.Document,
     limits: Limits,
 ) CompileError!*Plan {
-    return compileDetailed(allocator, registry, documents, limits, null);
+    return compileDetailed(allocator, registry, documents, limits, null, null);
+}
+
+/// Like `compile`, but with a `DataProvider` so `@pmFromFile` / `@ipMatchFromFile`
+/// operators load their referenced data files (resolved relative to each rule
+/// file's directory). Callers that read config from disk supply a provider;
+/// callers with no filesystem context use `compile`.
+pub fn compileWithProvider(
+    allocator: std.mem.Allocator,
+    registry: *const seclang.source.Registry,
+    documents: []const seclang.parser.Document,
+    limits: Limits,
+    data_provider: ?DataProvider,
+) CompileError!*Plan {
+    return compileDetailed(allocator, registry, documents, limits, null, data_provider);
 }
 
 /// Compile an include/remote source tree in textual directive order. Child
@@ -738,10 +769,20 @@ pub fn compileTree(
     tree: *const seclang.include.Tree,
     limits: Limits,
 ) CompileError!*Plan {
+    return compileTreeWithProvider(allocator, tree, limits, null);
+}
+
+/// Include-aware `compileTree` with a `DataProvider` for file-backed operators.
+pub fn compileTreeWithProvider(
+    allocator: std.mem.Allocator,
+    tree: *const seclang.include.Tree,
+    limits: Limits,
+    data_provider: ?DataProvider,
+) CompileError!*Plan {
     try limits.validate();
     if (tree.documents.items.len > limits.max_documents) return error.TooManyDocuments;
     if (tree.registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
-    var compiler = Compiler.init(allocator, limits, null);
+    var compiler = Compiler.init(allocator, limits, null, data_provider);
     defer compiler.deinit();
     var visited: std.AutoHashMapUnmanaged(seclang.source.SourceId, void) = .empty;
     defer visited.deinit(allocator);
@@ -770,7 +811,11 @@ fn compileTreeDocument(
     const document = tree.documents.items[document_index];
     if (visited.contains(document.source_id)) return;
     try visited.put(compiler.allocator, document.source_id, {});
+    const source_path = if (tree.registry.get(document.source_id)) |record| record.path else null;
     for (document.directives.items) |directive| {
+        // Re-set before each directive: a nested include compiled during the
+        // previous iteration will have left the child's path in place.
+        compiler.current_source_path = source_path;
         try compiler.addDirective(directive);
         for (tree.documents.items, 0..) |child, child_index| {
             const record = tree.registry.get(child.source_id) orelse return error.InvalidSourceId;
@@ -807,7 +852,7 @@ pub fn compileOutcome(
     limits: Limits,
 ) CompileError!CompileOutcome {
     var failure: ?Failure = null;
-    const plan = compileDetailed(allocator, registry, documents, limits, &failure) catch |cause| {
+    const plan = compileDetailed(allocator, registry, documents, limits, &failure, null) catch |cause| {
         if (failure) |detail| {
             const code = diagnosticCode(cause) orelse return cause;
             return .{ .diagnostic = .{
@@ -828,14 +873,16 @@ fn compileDetailed(
     documents: []const seclang.parser.Document,
     limits: Limits,
     failure: ?*?Failure,
+    data_provider: ?DataProvider,
 ) CompileError!*Plan {
     try limits.validate();
     if (documents.len > limits.max_documents) return error.TooManyDocuments;
     if (registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
-    var compiler = Compiler.init(allocator, limits, failure);
+    var compiler = Compiler.init(allocator, limits, failure, data_provider);
     defer compiler.deinit();
     for (documents) |*document| {
         try validateDocument(registry, document);
+        compiler.current_source_path = if (registry.get(document.source_id)) |record| record.path else null;
         try compiler.addDocument(document);
     }
     return compiler.finish(registry);
@@ -924,9 +971,20 @@ const Compiler = struct {
     pending_chain_members: usize = 0,
     graph_edges: usize = 0,
     failure: ?*?Failure,
+    /// Optional loader for `@pmFromFile` / `@ipMatchFromFile` data files.
+    data_provider: ?DataProvider = null,
+    /// Path of the rule file whose directives are currently being compiled;
+    /// the base directory for resolving that file's operator data files.
+    current_source_path: ?[]const u8 = null,
 
-    fn init(allocator: std.mem.Allocator, limits: Limits, failure: ?*?Failure) Compiler {
-        return .{ .allocator = allocator, .limits = limits, .interner = Interner.init(allocator, limits), .failure = failure };
+    fn init(allocator: std.mem.Allocator, limits: Limits, failure: ?*?Failure, data_provider: ?DataProvider) Compiler {
+        return .{
+            .allocator = allocator,
+            .limits = limits,
+            .interner = Interner.init(allocator, limits),
+            .failure = failure,
+            .data_provider = data_provider,
+        };
     }
 
     fn deinit(self: *Compiler) void {
@@ -1238,6 +1296,40 @@ const Compiler = struct {
         });
     }
 
+    const FileOperatorKind = enum { none, phrase, ip };
+
+    fn fileOperatorKind(name: []const u8) FileOperatorKind {
+        if (std.ascii.eqlIgnoreCase(name, "pmFromFile") or std.ascii.eqlIgnoreCase(name, "pmf")) return .phrase;
+        if (std.ascii.eqlIgnoreCase(name, "ipMatchFromFile") or std.ascii.eqlIgnoreCase(name, "ipMatchF")) return .ip;
+        return .none;
+    }
+
+    /// Intern an operator's parameter. For `@pmFromFile` / `@ipMatchFromFile`
+    /// (when a data provider is configured), resolve and read the referenced
+    /// data file relative to the current rule file and intern its bytes in place
+    /// of the filename, so the runtime compiles the phrase/subnet set from the
+    /// file contents. Without a provider (or for any other operator) the raw
+    /// parameter is interned unchanged.
+    fn internOperatorParameter(
+        self: *Compiler,
+        name: []const u8,
+        parameter: []const u8,
+        span: seclang.source.Span,
+    ) CompileError!StringId {
+        const provider = self.data_provider orelse return self.interner.intern(parameter);
+        if (fileOperatorKind(name) == .none) return self.interner.intern(parameter);
+        const source_path = self.current_source_path orelse
+            return self.fail(error.InvalidOperatorDataFile, span, null);
+        const base_dir = std.fs.path.dirname(source_path) orelse ".";
+        const filename = std.mem.trim(u8, parameter, " \t");
+        const bytes = provider.read(self.allocator, base_dir, filename) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return self.fail(error.InvalidOperatorDataFile, span, null),
+        };
+        defer self.allocator.free(bytes);
+        return self.interner.intern(bytes);
+    }
+
     fn addRule(self: *Compiler, directive_id: DirectiveId, directive: seclang.parser.Directive) CompileError!RuleId {
         if (self.rules.items.len == self.limits.max_rules) return error.TooManyRules;
         if (directive.parsed_targets.len > self.limits.max_targets -| self.targets.items.len) return error.TooManyTargets;
@@ -1280,6 +1372,11 @@ const Compiler = struct {
         const prefilter = try self.addPrefilter(parsed_operator);
         const operator_macro = self.addMacro(unquote(parsed_operator.parameter)) catch |cause|
             return self.fail(cause, directive.operator().?.physical, null);
+        const operator_parameter = try self.internOperatorParameter(
+            parsed_operator.name,
+            parsed_operator.parameter,
+            directive.operator().?.physical,
+        );
         try self.rules.append(self.allocator, .{
             .directive = directive_id,
             .source = directive.physical,
@@ -1294,7 +1391,7 @@ const Compiler = struct {
             .operator = .{
                 .raw = try self.interner.intern(parsed_operator.raw),
                 .name = try self.interner.intern(parsed_operator.name),
-                .parameter = try self.interner.intern(parsed_operator.parameter),
+                .parameter = operator_parameter,
                 .negated = parsed_operator.negated,
                 .implicit_regex = parsed_operator.implicit_regex,
                 .prefilter = prefilter,

@@ -9,6 +9,34 @@ const std = @import("std");
 const waf = @import("waf");
 
 const max_config_bytes = 32 * 1024 * 1024;
+const max_data_file_bytes = 8 * 1024 * 1024;
+
+/// Loads `@pmFromFile` / `@ipMatchFromFile` data files for the compiler,
+/// resolving each relative to the referencing rule file and confining reads to
+/// `root` (the config file's directory).
+const DataFileProvider = struct {
+    io: std.Io,
+    root: []const u8,
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8 {
+        const self: *DataFileProvider = @ptrCast(@alignCast(context));
+        return waf.seclang.include.readDataFileAlloc(allocator, self.io, self.root, base_dir, filename, max_data_file_bytes, false);
+    }
+
+    fn provider(self: *DataFileProvider) waf.plan.DataProvider {
+        return .{ .context = self, .readFn = read };
+    }
+};
+
+/// The configuration root for data-file resolution: the canonical directory
+/// holding `path`. Returns null if the path cannot be canonicalised (callers
+/// then compile without file-backed operator support).
+fn configRoot(io: std.Io, gpa: std.mem.Allocator, path: []const u8) ?[]u8 {
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, path, gpa) catch return null;
+    defer gpa.free(canonical);
+    const directory = std.fs.path.dirname(canonical) orelse return null;
+    return gpa.dupe(u8, directory) catch null;
+}
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -131,7 +159,15 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         .document => |document| document,
     };
     var documents = [_]waf.seclang.parser.Document{document};
-    const plan = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+    const root = configRoot(io, gpa, path);
+    defer if (root) |value| gpa.free(value);
+    var provider_storage: DataFileProvider = undefined;
+    var provider: ?waf.plan.DataProvider = null;
+    if (root) |value| {
+        provider_storage = .{ .io = io, .root = value };
+        provider = provider_storage.provider();
+    }
+    const plan = waf.plan.compileWithProvider(gpa, &parsed.registry, &documents, .{}, provider) catch |failure| {
         std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
         std.process.exit(1);
     };
@@ -207,7 +243,15 @@ fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
         },
         .document => |document| {
             var documents = [_]waf.seclang.parser.Document{document};
-            const compiled = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+            const root = configRoot(io, gpa, path);
+            defer if (root) |value| gpa.free(value);
+            var provider_storage: DataFileProvider = undefined;
+            var provider: ?waf.plan.DataProvider = null;
+            if (root) |value| {
+                provider_storage = .{ .io = io, .root = value };
+                provider = provider_storage.provider();
+            }
+            const compiled = waf.plan.compileWithProvider(gpa, &parsed.registry, &documents, .{}, provider) catch |failure| {
                 std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
                 return false;
             };

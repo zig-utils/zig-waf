@@ -287,6 +287,63 @@ fn pathLessThan(_: void, left: []u8, right: []u8) bool {
     return std.mem.lessThan(u8, left, right);
 }
 
+pub const DataFileError = error{
+    DataFileNotFound,
+    DataFileRootEscape,
+    DataFileTooLarge,
+    AbsoluteDataFileForbidden,
+    EmptyDataFilePath,
+};
+
+/// Read an operator data file (e.g. `@pmFromFile unix-shell.data`) referenced
+/// from a rule file, resolving `requested` relative to `base_dir` and confining
+/// the result to `root` — the same canonical-prefix boundary `Include` enforces.
+/// Returns the file bytes (caller owns), bounded by `max_bytes`. Absolute paths
+/// are rejected unless `allow_absolute`. This is the file-backed-operator
+/// counterpart to `Include`'s single-file resolution, sharing `withinRoot` so a
+/// data file cannot escape the configuration root via `..` or a symlink.
+pub fn readDataFileAlloc(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    root: []const u8,
+    base_dir: []const u8,
+    requested: []const u8,
+    max_bytes: usize,
+    allow_absolute: bool,
+) ![]u8 {
+    if (requested.len == 0) return error.EmptyDataFilePath;
+    if (std.fs.path.isAbsolute(requested) and !allow_absolute) return error.AbsoluteDataFileForbidden;
+
+    const resolved = if (std.fs.path.isAbsolute(requested))
+        try std.fs.path.resolve(allocator, &.{requested})
+    else
+        try std.fs.path.resolve(allocator, &.{ base_dir, requested });
+    defer allocator.free(resolved);
+
+    // Canonicalise (resolving symlinks and `..`) and confine the *real* path to
+    // the root. `base_dir` may be non-canonical (e.g. `/tmp` when the root is the
+    // canonical `/private/tmp`), so the boundary is enforced only after
+    // canonicalisation — the check that actually matters for escape prevention.
+    const canonical = canonicalPathAlloc(allocator, io, resolved) catch |failure| switch (failure) {
+        error.FileNotFound => return error.DataFileNotFound,
+        else => |other| return other,
+    };
+    defer allocator.free(canonical);
+    if (!withinRoot(root, canonical)) return error.DataFileRootEscape;
+
+    const stat = std.Io.Dir.cwd().statFile(io, canonical, .{}) catch |failure| switch (failure) {
+        error.FileNotFound => return error.DataFileNotFound,
+        else => |other| return other,
+    };
+    if (stat.kind != .file) return error.DataFileNotFound;
+
+    const read_limit = std.math.add(usize, max_bytes, 1) catch max_bytes;
+    return std.Io.Dir.cwd().readFileAlloc(io, canonical, allocator, .limited(read_limit)) catch |failure| switch (failure) {
+        error.StreamTooLong => return error.DataFileTooLarge,
+        else => |other| return other,
+    };
+}
+
 fn canonicalPathAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const sentinel_path = try std.Io.Dir.cwd().realPathFileAlloc(io, path, allocator);
     defer allocator.free(sentinel_path);
@@ -419,6 +476,36 @@ test "include root rejects traversal absolute paths and symlink escapes" {
     const absolute = try std.fs.path.join(std.testing.allocator, &.{ root, "traversal.conf" });
     defer std.testing.allocator.free(absolute);
     try std.testing.expectError(error.AbsoluteIncludeForbidden, parseTree(std.testing.allocator, std.testing.io, root, absolute, .{}));
+}
+
+test "readDataFileAlloc reads within root and rejects escapes" {
+    var temporary = std.testing.tmpDir(.{ .iterate = true });
+    defer temporary.cleanup();
+    try temporary.dir.createDirPath(std.testing.io, "root/rules");
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "outside.data", .data = "secret" });
+    try temporary.dir.writeFile(std.testing.io, .{ .sub_path = "root/rules/shells.data", .data = "bin/cat\nbin/ls\n" });
+    try temporary.dir.symLink(std.testing.io, "../../outside.data", "root/rules/escape.data", .{});
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_length = try temporary.dir.realPathFile(std.testing.io, "root", &root_buffer);
+    const root = root_buffer[0..root_length];
+    var base_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const base_length = try temporary.dir.realPathFile(std.testing.io, "root/rules", &base_buffer);
+    const base_dir = base_buffer[0..base_length];
+
+    // A data file inside the root resolves and reads.
+    const bytes = try readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "shells.data", 4096, false);
+    defer std.testing.allocator.free(bytes);
+    try std.testing.expectEqualStrings("bin/cat\nbin/ls\n", bytes);
+
+    // `..` traversal, a symlink escape, an absolute path, a missing file, and an
+    // empty path are all rejected.
+    try std.testing.expectError(error.DataFileRootEscape, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "../../outside.data", 4096, false));
+    try std.testing.expectError(error.DataFileRootEscape, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "escape.data", 4096, false));
+    try std.testing.expectError(error.AbsoluteDataFileForbidden, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "/etc/passwd", 4096, false));
+    try std.testing.expectError(error.DataFileNotFound, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "absent.data", 4096, false));
+    try std.testing.expectError(error.EmptyDataFilePath, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "", 4096, false));
+    // A file exceeding the byte cap is rejected rather than truncated.
+    try std.testing.expectError(error.DataFileTooLarge, readDataFileAlloc(std.testing.allocator, std.testing.io, root, base_dir, "shells.data", 4, false));
 }
 
 test "include graph enforces depth and glob match limits" {
