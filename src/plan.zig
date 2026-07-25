@@ -232,6 +232,9 @@ pub const DiagnosticCode = enum {
     invalid_transformation,
     unterminated_macro,
     empty_macro_expression,
+    unknown_operator,
+    unimplemented_action,
+    unknown_dataset,
 
     pub fn id(self: DiagnosticCode) []const u8 {
         return switch (self) {
@@ -243,6 +246,9 @@ pub const DiagnosticCode = enum {
             .invalid_transformation => "WAF-PLAN-0106",
             .unterminated_macro => "WAF-PLAN-0107",
             .empty_macro_expression => "WAF-PLAN-0108",
+            .unknown_operator => "WAF-PLAN-0124",
+            .unimplemented_action => "WAF-PLAN-0125",
+            .unknown_dataset => "WAF-PLAN-0126",
             .invalid_default_action => "WAF-PLAN-0109",
             .duplicate_default_phase => "WAF-PLAN-0110",
             .missing_default_disruptive_action => "WAF-PLAN-0111",
@@ -280,6 +286,11 @@ pub const DiagnosticCode = enum {
             .invalid_transformation => "transformation action requires a non-empty name",
             .unterminated_macro => "runtime macro expression is missing a closing brace",
             .empty_macro_expression => "runtime macro expression cannot be empty",
+            // Each says what the rule would silently have done, because that is the
+            // part an operator needs to know.
+            .unknown_operator => "operator is not implemented, so the rule could never match",
+            .unimplemented_action => "action is not implemented, so it would have no effect",
+            .unknown_dataset => "dataset is not declared by any SecDataset, so the set would be empty",
         };
     }
 };
@@ -3014,6 +3025,9 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.DanglingChain => .dangling_chain,
         error.ChainPhaseMismatch => .chain_phase_mismatch,
         error.InvalidTransformation => .invalid_transformation,
+        error.UnknownOperator => .unknown_operator,
+        error.UnimplementedAction => .unimplemented_action,
+        error.UnknownDataset => .unknown_dataset,
         error.UnterminatedMacro => .unterminated_macro,
         error.EmptyMacroExpression => .empty_macro_expression,
         else => null,
