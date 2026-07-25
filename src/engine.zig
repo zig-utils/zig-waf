@@ -1990,6 +1990,27 @@ pub const Transaction = struct {
         }
     }
 
+    /// Publish the MULTIPART_* anomaly flags, and MULTIPART_STRICT_ERROR when any
+    /// of them fired. Each is written only when true, so a rule reading one sees a
+    /// flag that means "this happened" rather than a default it has to distinguish
+    /// from an unparsed body.
+    fn publishMultipartAnomalies(self: *Transaction, anomalies: multipart.Anomalies) TransactionError!void {
+        const flags = [_]struct { set: bool, name: variables.Name }{
+            .{ .set = anomalies.boundary_quoted, .name = .multipart_boundary_quoted },
+            .{ .set = anomalies.boundary_whitespace, .name = .multipart_boundary_whitespace },
+            .{ .set = anomalies.lf_line, .name = .multipart_lf_line },
+            .{ .set = anomalies.crlf_lf_lines, .name = .multipart_crlf_lf_lines },
+            .{ .set = anomalies.invalid_header_folding, .name = .multipart_invalid_header_folding },
+            .{ .set = anomalies.invalid_quoting, .name = .multipart_invalid_quoting },
+            .{ .set = anomalies.invalid_part, .name = .multipart_invalid_part },
+            .{ .set = anomalies.unmatched_boundary, .name = .multipart_unmatched_boundary },
+        };
+        for (flags) |flag| {
+            if (flag.set) try self.setScalar(flag.name, "1", .parser, .request_body);
+        }
+        if (anomalies.any()) try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+    }
+
     /// Parse a multipart/form-data body, pinned to ModSecurity's multipart
     /// processor: fields populate ARGS_POST; file parts populate FILES,
     /// FILES_NAMES, FILES_SIZES and the FILES_COMBINED_SIZE running total;
@@ -1999,15 +2020,19 @@ pub const Transaction = struct {
     /// ARGS/FILES. A missing boundary or an unterminated part raises
     /// MULTIPART_STRICT_ERROR.
     fn parseMultipartBody(self: *Transaction, body: []const u8) TransactionError!void {
+        var anomalies: multipart.Anomalies = .{};
         const content_type = self.collection_variables.first(.request_headers, "content-type") orelse {
             try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
             return;
         };
-        const boundary = multipart.boundaryFromContentType(content_type.value) orelse {
+        const boundary = multipart.boundaryWithAnomalies(content_type.value, &anomalies) orelse {
+            try self.publishMultipartAnomalies(anomalies);
             try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
             return;
         };
+        multipart.scanAnomalies(body, boundary, &anomalies);
         var reader = multipart.Reader.init(self.waf.allocator, body, boundary) catch {
+            try self.publishMultipartAnomalies(anomalies);
             try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
             return;
         };
@@ -2016,7 +2041,8 @@ pub const Transaction = struct {
         const source: collections.Source = .{ .origin = .request_body, .offset = 0, .length = 0 };
         var combined_size: u64 = 0;
         while (reader.next()) |part| {
-            if (part.incomplete) try self.setScalar(.multipart_strict_error, "1", .parser, .request_body);
+            if (part.incomplete) anomalies.invalid_part = true;
+            if (multipart.headersUseFolding(part.header_block)) anomalies.invalid_header_folding = true;
             const part_name = part.name();
 
             // MULTIPART_NAME / MULTIPART_FILENAME mirror the disposition params.
@@ -2047,6 +2073,8 @@ pub const Transaction = struct {
                 try self.addArgument(.body, name, part.body, source);
             }
         }
+        // Published after every part, so a flag raised by the last one still lands.
+        try self.publishMultipartAnomalies(anomalies);
     }
 
     /// Parse an XML body with the lenient zig-xml tokenizer, pinned to Coraza's
@@ -7311,4 +7339,113 @@ test "duplicate and conflicting request headers stay visible to rules" {
     try rule_tx.processRequestHeaders();
     try rule_tx.evaluatePhase(std.testing.allocator, .request_headers);
     try std.testing.expectEqual(@as(u16, 400), (try rule_tx.intervention()).?.status);
+}
+
+test "multipart anomalies are reported as flags a rule can act on" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A clean, fully conformant body raises nothing: the flags mean "this happened",
+    // so a well-formed request must leave every one of them absent.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=X");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--X--\r\n");
+        try tx.processRequestBody();
+        try std.testing.expect((try tx.scalar(.multipart_strict_error)) == null);
+        try std.testing.expect((try tx.scalar(.multipart_lf_line)) == null);
+        try std.testing.expectEqualStrings("value", (try tx.collectionFirst(.args, "a")).?.value);
+    }
+
+    // A quoted boundary is legal but is the classic way to make two parsers
+    // disagree, so it is reported while still being parsed.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=\"X\"");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--X--\r\n");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_boundary_quoted)).?.value);
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_strict_error)).?.value);
+        // Parsing still succeeded — the flag reports, it does not reject.
+        try std.testing.expectEqualStrings("value", (try tx.collectionFirst(.args, "a")).?.value);
+    }
+
+    // Bare-LF line endings, and a body mixing them with CRLF: two parsers most
+    // easily disagree about where a part ends when the endings are inconsistent.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=X");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n--X--\r\n");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_lf_line)).?.value);
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_crlf_lf_lines)).?.value);
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_strict_error)).?.value);
+    }
+
+    // A body with no closing delimiter: the last part was never terminated.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=X");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nvalue");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_invalid_part)).?.value);
+    }
+
+    // Obsolete header folding: parsers differ on whether the continuation belongs
+    // to the previous header, which is the ambiguity worth flagging.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=X");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\r\nContent-Disposition: form-data;\r\n name=\"a\"\r\n\r\nvalue\r\n--X--\r\n");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.multipart_invalid_header_folding)).?.value);
+    }
+
+    // And a rule can act on the summary flag, which is the point of publishing it.
+    {
+        const input =
+            \\SecRule MULTIPART_STRICT_ERROR "@eq 1" "id:1,phase:2,deny,status:400,t:none,msg:'multipart anomaly'"
+        ;
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "mp.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer plan.deinit();
+        var rule_builder = Builder.init(std.testing.allocator);
+        rule_builder.setRetainedPlan(plan);
+        const rule_waf = try rule_builder.build();
+        defer rule_waf.deinit() catch unreachable;
+
+        var tx = rule_waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/upload", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "multipart/form-data; boundary=\"X\"");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("--X\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n--X--\r\n");
+        try tx.processRequestBody();
+        try tx.evaluatePhase(std.testing.allocator, .request_body);
+        try std.testing.expectEqual(@as(u16, 400), (try tx.intervention()).?.status);
+    }
 }

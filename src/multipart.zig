@@ -156,6 +156,135 @@ fn dispositionParam(disposition: []const u8, key: []const u8) ?[]const u8 {
     return null;
 }
 
+/// What was irregular about a multipart body, mirroring ModSecurity's
+/// MULTIPART_* flags (#26).
+///
+/// None of these is malformed enough to stop parsing — every one of them is a body
+/// some client really sends and some server really accepts. They matter because a
+/// WAF and the application behind it may disagree about what such a body means, and
+/// that disagreement is the bypass: a part the WAF skips and the app reads is an
+/// unfiltered input. So each is reported as a flag a rule can act on, rather than
+/// being silently normalized away.
+pub const Anomalies = struct {
+    /// The boundary parameter was a quoted string.
+    boundary_quoted: bool = false,
+    /// Whitespace surrounded the boundary parameter's value.
+    boundary_whitespace: bool = false,
+    /// A line ended with a bare LF rather than CRLF.
+    lf_line: bool = false,
+    /// The body mixed CRLF and bare-LF line endings, which is how two parsers are
+    /// most easily made to disagree about where a part ends.
+    crlf_lf_lines: bool = false,
+    /// A part header used obsolete line folding.
+    invalid_header_folding: bool = false,
+    /// A part header's quoting did not close.
+    invalid_quoting: bool = false,
+    /// A part was not terminated by a boundary.
+    invalid_part: bool = false,
+    /// Something that looks like the boundary appeared inside part data.
+    unmatched_boundary: bool = false,
+
+    /// Whether any anomaly was seen, which is what MULTIPART_STRICT_ERROR reports.
+    pub fn any(self: Anomalies) bool {
+        return self.boundary_quoted or self.boundary_whitespace or self.lf_line or
+            self.crlf_lf_lines or self.invalid_header_folding or self.invalid_quoting or
+            self.invalid_part or self.unmatched_boundary;
+    }
+};
+
+/// The boundary parameter together with what was irregular about how it was
+/// written. A quoted boundary is legal per RFC 2046 but is the classic way to make
+/// two parsers disagree, so it is reported rather than merely accepted.
+pub fn boundaryWithAnomalies(content_type: []const u8, anomalies: *Anomalies) ?[]const u8 {
+    var rest = content_type;
+    const semicolon = std.mem.indexOfScalar(u8, rest, ';') orelse return null;
+    rest = rest[semicolon + 1 ..];
+
+    while (rest.len != 0) {
+        var i: usize = 0;
+        var in_quotes = false;
+        while (i < rest.len) : (i += 1) {
+            const c = rest[i];
+            if (c == '"') in_quotes = !in_quotes;
+            if (c == ';' and !in_quotes) break;
+        }
+        const raw_segment = rest[0..i];
+        const segment = std.mem.trim(u8, raw_segment, " \t");
+        rest = if (i < rest.len) rest[i + 1 ..] else rest[rest.len..];
+        if (segment.len == 0) continue;
+        const eq = std.mem.indexOfScalar(u8, segment, '=') orelse continue;
+        const name = std.mem.trim(u8, segment[0..eq], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "boundary")) continue;
+        const unclipped = segment[eq + 1 ..];
+        const raw = std.mem.trim(u8, unclipped, " \t");
+        if (raw.len != unclipped.len) anomalies.boundary_whitespace = true;
+        const quoted = raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"';
+        if (quoted) anomalies.boundary_quoted = true;
+        // An opening quote with no closing one is invalid quoting, not a boundary.
+        if (!quoted and std.mem.indexOfScalar(u8, raw, '"') != null) anomalies.invalid_quoting = true;
+        const value = if (quoted) raw[1 .. raw.len - 1] else raw;
+        return if (value.len == 0) null else value;
+    }
+    return null;
+}
+
+/// Scan a body for the line-ending and boundary anomalies that do not depend on
+/// how parts are split: bare LF endings, a mix of CRLF and LF, an unterminated
+/// final part, and boundary-looking text inside part data.
+pub fn scanAnomalies(body: []const u8, boundary: []const u8, anomalies: *Anomalies) void {
+    var saw_crlf = false;
+    var saw_lf = false;
+    var index: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, body, index, '\n')) |newline| {
+        if (newline != 0 and body[newline - 1] == '\r') saw_crlf = true else saw_lf = true;
+        index = newline + 1;
+    }
+    if (saw_lf) anomalies.lf_line = true;
+    if (saw_lf and saw_crlf) anomalies.crlf_lf_lines = true;
+
+    // The body must end with the closing delimiter; anything else means the last
+    // part was never terminated.
+    var closing_buffer: [80]u8 = undefined;
+    if (boundary.len + 6 <= closing_buffer.len) {
+        const closing = std.fmt.bufPrint(&closing_buffer, "--{s}--", .{boundary}) catch return;
+        const trimmed = std.mem.trimEnd(u8, body, "\r\n");
+        if (!std.mem.endsWith(u8, trimmed, closing)) anomalies.invalid_part = true;
+    }
+
+    // A boundary occurrence that is not at the start of a line cannot delimit a
+    // part, so whatever produced it disagrees with this parser about the body's
+    // structure.
+    var dash_buffer: [76]u8 = undefined;
+    if (boundary.len + 2 <= dash_buffer.len) {
+        const dash = std.fmt.bufPrint(&dash_buffer, "--{s}", .{boundary}) catch return;
+        var search: usize = 0;
+        while (std.mem.indexOfPos(u8, body, search, dash)) |at| {
+            const line_start = at == 0 or body[at - 1] == '\n';
+            if (!line_start) {
+                anomalies.unmatched_boundary = true;
+                break;
+            }
+            search = at + dash.len;
+        }
+    }
+}
+
+/// Whether a part's raw header block uses obsolete line folding — a continuation
+/// line starting with space or tab. Parsers differ on whether the folded value
+/// belongs to the previous header, which is exactly the ambiguity worth flagging.
+pub fn headersUseFolding(raw_headers: []const u8) bool {
+    var lines = std.mem.splitScalar(u8, raw_headers, '\n');
+    var first = true;
+    while (lines.next()) |line| {
+        if (first) {
+            first = false;
+            continue;
+        }
+        if (line.len != 0 and (line[0] == ' ' or line[0] == '\t')) return true;
+    }
+    return false;
+}
+
 /// The `boundary` parameter of a `multipart/*` Content-Type value, unquoting a
 /// quoted-string form. Returns null when absent or empty — Coraza treats a
 /// missing boundary as a strict multipart error.
