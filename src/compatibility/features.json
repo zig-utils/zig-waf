@@ -314,6 +314,23 @@
       "notes": "Owned typed IR, phase indexes, defaults, chains, action families, conservative prefilters, immutable macro programs, stable diagnostics, deterministic fingerprints, atomic component sharing, WAF generation pinning, corpus compilation, fuzzing, and ReleaseFast metrics are verified. WAF-12 owns complete directive-specific semantic validation."
     },
     {
+      "id": "engine.rule-execution",
+      "area": "engine",
+      "name": "Autonomous rule-execution engine",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/18",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/rule_eval.zig",
+        "src/runtime_operator.zig",
+        "src/engine.zig",
+        "src/c_api.zig"
+      ],
+      "notes": "The engine evaluates a rule set against a request on its own, in layers: rule_eval dispatches compile-free operators by name; RuntimeOperator compiles @rx/@pm/@ipMatch once and reuses them; Transaction.resolveTarget maps a variable name plus key selector to values (with the &count form); Transaction.evaluateRule resolves a rule's targets, applies its transformation pipeline, and runs the operator with !@op negation; and Transaction.evaluatePhase walks every executable head in a phase, evaluates whole chains, applies a fully-matched chain atomically, and halts on an enforced disruptive decision. Exposed to connectors as zig_waf_transaction_evaluate_phase. Verified end to end: a SQLi request is denied while a benign request passes. multiMatch checkpoints, macro-expanded operator arguments, and regex key selectors remain."
+    },
+    {
       "id": "engine.rule-configuration-overlays",
       "area": "engine",
       "name": "Rule defaults, removals, updates, markers, and authenticated remote rules",
