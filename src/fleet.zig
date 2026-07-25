@@ -116,6 +116,32 @@ pub const NodeRepository = struct {
         return self.conn.queryScalarParams(allocator, "SELECT count(*) FROM nodes WHERE status = $1", &.{status});
     }
 
+    /// Set (or overwrite) a label on a node — the `labels` jsonb map used to
+    /// segment the fleet (region, tier, canary) for targeted rollouts (#50).
+    /// Merges into any existing labels, so other keys are preserved.
+    pub fn setLabel(self: NodeRepository, node_id: [:0]const u8, key: [:0]const u8, value: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            "UPDATE nodes SET labels = labels || jsonb_build_object($2::text, $3::text) WHERE node_id = $1",
+            &.{ node_id, key, value },
+        );
+    }
+
+    /// The value of a node's label (caller frees), or null if the node or the
+    /// label key is absent.
+    pub fn labelOf(self: NodeRepository, allocator: std.mem.Allocator, node_id: [:0]const u8, key: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(allocator, "SELECT labels ->> $2 FROM nodes WHERE node_id = $1", &.{ node_id, key });
+    }
+
+    /// The node ids carrying `key` = `value`, ordered — a labeled cohort for a
+    /// segmented rollout (the row cursor yields column (0) node_id; caller
+    /// `deinit`s it).
+    pub fn withLabel(self: NodeRepository, key: [:0]const u8, value: [:0]const u8) pg.Error!pg.Rows {
+        return self.conn.query(
+            "SELECT node_id::text FROM nodes WHERE labels ->> $1 = $2 ORDER BY node_id",
+            &.{ key, value },
+        );
+    }
+
     /// How many active nodes have not sent a heartbeat within `max_age_seconds`
     /// (or have never been seen) — the "stale/unhealthy" count for fleet
     /// telemetry and alerting (#59).
@@ -821,6 +847,69 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
         const vb = (try rollout.assignedVersion(testing.allocator, b, "crs")).?;
         defer testing.allocator.free(vb);
         try testing.expectEqualStrings("3", vb);
+    }
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3)");
+}
+
+test "node labels segment the fleet for targeted selection" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3)") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const nodes = NodeRepository{ .conn = &conn };
+    const west1 = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const west2 = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    const east1 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    try nodes.enroll(west1, "edge-w1", "1.0");
+    try nodes.enroll(west2, "edge-w2", "1.0");
+    try nodes.enroll(east1, "edge-e1", "1.0");
+
+    // An unlabeled node reports null for a missing key.
+    try testing.expect((try nodes.labelOf(testing.allocator, west1, "region")) == null);
+
+    // Labels merge — setting a second key preserves the first.
+    try nodes.setLabel(west1, "region", "west");
+    try nodes.setLabel(west1, "tier", "canary");
+    try nodes.setLabel(west2, "region", "west");
+    try nodes.setLabel(east1, "region", "east");
+    {
+        const region = (try nodes.labelOf(testing.allocator, west1, "region")).?;
+        defer testing.allocator.free(region);
+        try testing.expectEqualStrings("west", region);
+        const tier = (try nodes.labelOf(testing.allocator, west1, "tier")).?;
+        defer testing.allocator.free(tier);
+        try testing.expectEqualStrings("canary", tier);
+    }
+
+    // The "west" cohort is exactly the two west nodes, ordered by id.
+    {
+        var rows = try nodes.withLabel("region", "west");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 2), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings(west1, rows.get(0));
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings(west2, rows.get(0));
+        try testing.expect(!rows.next());
+    }
+
+    // Overwriting a label changes cohort membership.
+    try nodes.setLabel(west2, "region", "east");
+    {
+        var rows = try nodes.withLabel("region", "west");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 1), rows.len());
     }
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets CASCADE");
