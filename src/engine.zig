@@ -4822,6 +4822,66 @@ test "evaluatePhase survives fuzzed request queries without crashing" {
     }
 }
 
+test "processRequestBody survives fuzzed bodies across content types without crashing" {
+    // Drive random bytes through each request-body processor (URL-encoded, JSON,
+    // XML, multipart) via the real engine path, so malformed bodies can never
+    // crash or leak — the parsers only reach the buffer via processRequestBody.
+    const input =
+        \\SecRule ARGS "@detectSQLi" "id:1,phase:2,deny,status:403"
+        \\SecRule REQUEST_BODY "@rx attack" "id:2,phase:2,pass,nolog"
+        \\SecRule ARGS_NAMES "@rx x" "id:3,phase:2,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bodyfuzz.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    const content_types = [_][]const u8{
+        "application/x-www-form-urlencoded",
+        "application/json",
+        "application/xml",
+        "multipart/form-data; boundary=fuzzbdy",
+    };
+    var prng = std.Random.DefaultPrng.init(0xB0D1_F0FF_5E7A);
+    const random = prng.random();
+    var body_buf: [512]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 4000) : (iteration += 1) {
+        const content_type = content_types[random.uintLessThan(usize, content_types.len)];
+        const body_len = random.uintLessThan(usize, body_buf.len + 1);
+        for (body_buf[0..body_len]) |*byte| {
+            // Bias toward structural bytes of each body grammar so the parsers
+            // are exercised, with raw bytes mixed in.
+            byte.* = switch (random.uintLessThan(u8, 16)) {
+                0 => '{',  1 => '}',  2 => '[',  3 => ']',
+                4 => '"',  5 => ':',  6 => ',',  7 => '=',
+                8 => '&',  9 => '<',  10 => '>', 11 => '\n',
+                12 => '-', 13 => '/',
+                else => random.int(u8),
+            };
+        }
+        const body = body_buf[0..body_len];
+
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443) catch continue;
+        tx.processUri("/x", "POST", "HTTP/1.1") catch continue;
+        tx.addRequestHeader("Content-Type", content_type) catch continue;
+        tx.processRequestHeaders() catch continue;
+        tx.evaluatePhase(std.testing.allocator, .request_headers) catch continue;
+        if ((tx.intervention() catch null) != null) continue;
+        tx.writeRequestBody(body) catch continue;
+        tx.processRequestBody() catch continue;
+        tx.evaluatePhase(std.testing.allocator, .request_body) catch {};
+        _ = tx.intervention() catch {};
+    }
+}
+
 test "evaluatePhase drives CRS-style anomaly scoring across rules" {
     // A detection rule adds to tx.score; a later rule blocks once the threshold
     // is crossed — the core CRS anomaly-scoring pattern, all inside one phase.
