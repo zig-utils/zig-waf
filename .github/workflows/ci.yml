@@ -96,6 +96,7 @@ jobs:
         working-directory: zig-waf
         run: >-
           zig build test-directive-corpus
+          -Ddirective-corpus-unsupported=examples/multithread/inspectfile_rules.conf
           -Ddirective-corpus=../owasp-crs/crs-setup.conf.example
           -Ddirective-corpus=../owasp-crs/plugins
           -Ddirective-corpus=../owasp-crs/rules

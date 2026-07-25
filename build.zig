@@ -258,6 +258,13 @@ pub fn build(b: *std.Build) void {
 
     const run_directive_corpus = b.addRunArtifact(parser_corpus);
     run_directive_corpus.addArg("--validate-directives");
+    // The directive corpus compiles plans too, so it needs the same declared
+    // boundary as the plan corpus.
+    if (b.option([]const []const u8, "directive-corpus-unsupported", "Corpus file expected to use an unimplemented operator (repeatable)")) |unsupported|
+        for (unsupported) |path| {
+            run_directive_corpus.addArg("--expect-unsupported");
+            run_directive_corpus.addArg(path);
+        };
     if (b.option([]const []const u8, "directive-corpus", "SecLang directive corpus file or directory (repeatable)")) |corpus_roots|
         run_directive_corpus.addArgs(corpus_roots);
     const directive_corpus_step = b.step("test-directive-corpus", "Validate stable directives beneath corpus roots");
