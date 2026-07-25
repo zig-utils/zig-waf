@@ -866,8 +866,8 @@ test "serializers survive tricky bytes and JSON formats stay parseable" {
             }
             string.* = buffer[0..len];
         }
-        var request_headers = [_]Header{ .{ .name = strings[8], .value = strings[9] } };
-        var response_headers = [_]Header{ .{ .name = strings[10], .value = strings[11] } };
+        var request_headers = [_]Header{.{ .name = strings[8], .value = strings[9] }};
+        var response_headers = [_]Header{.{ .name = strings[10], .value = strings[11] }};
         var messages = [_][]const u8{ strings[6], strings[7] };
         const record: AuditRecord = .{
             .boundary = strings[0],

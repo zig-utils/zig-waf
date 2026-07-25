@@ -141,12 +141,12 @@ test "random operators, patterns, and inputs never crash or leak" {
     var prng = std.Random.DefaultPrng.init(0x0FEED_0BEC_2210);
     const random = prng.random();
     const names = [_][]const u8{
-        "@rx",              "@pm",              "@ipMatch",   "@streq",             "@contains",
-        "@beginsWith",      "@detectSQLi",      "@detectXSS", "@validateByteRange", "@unknownOp",
+        "@rx",         "@pm",              "@ipMatch",   "@streq",             "@contains",
+        "@beginsWith", "@detectSQLi",      "@detectXSS", "@validateByteRange", "@unknownOp",
         // The from-file operators compile through the newline-delimited
         // compileFromFileBytes / compileIpMatchFromFileBytes paths (the compiler
         // substitutes file bytes for the filename), so feed them arbitrary bytes.
-        "@pmFromFile",      "@ipMatchFromFile", "@pmf",       "@ipMatchF",
+        "@pmFromFile", "@ipMatchFromFile", "@pmf",       "@ipMatchF",
     };
     var pattern_buf: [64]u8 = undefined;
     var input_buf: [128]u8 = undefined;

@@ -4858,10 +4858,20 @@ test "processRequestBody survives fuzzed bodies across content types without cra
             // Bias toward structural bytes of each body grammar so the parsers
             // are exercised, with raw bytes mixed in.
             byte.* = switch (random.uintLessThan(u8, 16)) {
-                0 => '{',  1 => '}',  2 => '[',  3 => ']',
-                4 => '"',  5 => ':',  6 => ',',  7 => '=',
-                8 => '&',  9 => '<',  10 => '>', 11 => '\n',
-                12 => '-', 13 => '/',
+                0 => '{',
+                1 => '}',
+                2 => '[',
+                3 => ']',
+                4 => '"',
+                5 => ':',
+                6 => ',',
+                7 => '=',
+                8 => '&',
+                9 => '<',
+                10 => '>',
+                11 => '\n',
+                12 => '-',
+                13 => '/',
                 else => random.int(u8),
             };
         }
