@@ -64,20 +64,33 @@ pub const RuntimeOperator = union(enum) {
         return self.match(input, profile).matched;
     }
 
-    /// One operator match: whether it matched, plus the regex capture outcome
-    /// (`@rx` only) so the caller can populate TX.0..TX.N when the rule captures.
-    /// Capture strings borrow `input` and are valid only while it is.
+    /// One operator match: whether it matched, plus whatever the operator produced
+    /// that a capturing rule can stage into TX.0..TX.N — regex captures for `@rx`,
+    /// or libinjection's fingerprint for `@detectSQLi`. Regex capture strings borrow
+    /// `input` and are valid only while it is; the fingerprint is held by value,
+    /// since it is derived rather than a slice of the input.
     pub const Match = struct {
         matched: bool,
         regex: ?operators.RegexOutcome = null,
+        sqli: ?operators.SqlInjection.Match = null,
     };
 
     pub fn match(self: *const RuntimeOperator, input: []const u8, profile: operators.Profile) Match {
         switch (self.*) {
-            .compile_free => |cf| return .{ .matched = switch (rule_eval.evaluate(cf.name, cf.parameter, input, profile)) {
-                .decided => |value| value,
-                else => false,
-            } },
+            .compile_free => |cf| {
+                // `@detectSQLi` yields a fingerprint that a capturing rule stores in
+                // TX.0, so it is evaluated here rather than through the boolean-only
+                // path that would discard it.
+                if (eqName(normalize(cf.name), "detectSQLi")) {
+                    var sqli: operators.SqlInjection = .{};
+                    const detected = sqli.evaluate(input);
+                    return .{ .matched = detected.matched, .sqli = detected };
+                }
+                return .{ .matched = switch (rule_eval.evaluate(cf.name, cf.parameter, input, profile)) {
+                    .decided => |value| value,
+                    else => false,
+                } };
+            },
             .regex => |*re| {
                 var worker = re.worker();
                 defer worker.deinit();

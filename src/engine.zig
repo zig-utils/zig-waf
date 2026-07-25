@@ -568,6 +568,11 @@ pub const MatchContext = struct {
     value: []const u8,
     source: collections.Source,
     captures: []const ?CaptureRange = &.{},
+    /// Capture text an operator *derived* rather than sliced out of the matched
+    /// value, so it has no byte range in it: `@detectSQLi` with `capture` stores
+    /// libinjection's fingerprint in TX.0, and a fingerprint (`s&1c`) is a summary
+    /// of the input, not a part of it. Borrowed for the duration of the commit.
+    derived_captures: []const []const u8 = &.{},
 };
 
 /// Borrowed transformed value and staged multi-match checkpoints. Executor
@@ -1034,8 +1039,22 @@ pub const Transaction = struct {
             return error.InvalidMatchContext;
         }
         if (context.captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
+        if (context.derived_captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
         var values: [10]collections.Value = undefined;
         var count: usize = 0;
+        // A derived capture describes the match rather than quoting it, so its
+        // source stays the matched value's — there is no offset within the value
+        // that would be truthful.
+        for (context.derived_captures) |derived| {
+            if (derived.len > self.waf.config.limits.max_match_value_bytes) return error.InvalidMatchContext;
+            values[count] = .{
+                .collection = .tx,
+                .key = capture_keys[count],
+                .value = derived,
+                .source = context.source,
+            };
+            count += 1;
+        }
         for (context.captures, 0..) |maybe_range, capture_index| {
             const range = maybe_range orelse continue;
             if (range.start > range.end or range.end > context.value.len) return error.InvalidMatchContext;
@@ -2615,17 +2634,17 @@ pub const Transaction = struct {
                     const result = self.transformation_executor.applyPipeline(transforms, resolved.value, true) catch {
                         const hit = operator.match(resolved.value, .modsecurity);
                         if (hit.matched != negated)
-                            return try matchContext(arena, resolved.name, resolved.value, hit.regex);
+                            return try matchContext(arena, resolved.name, resolved.value, hit.regex, hit.sqli);
                         continue;
                     };
                     for (result.checkpoints) |checkpoint| {
                         const hit = operator.match(checkpoint.bytes, .modsecurity);
                         if (hit.matched != negated)
-                            return try matchContext(arena, resolved.name, checkpoint.bytes, hit.regex);
+                            return try matchContext(arena, resolved.name, checkpoint.bytes, hit.regex, hit.sqli);
                     }
                     const hit = operator.match(result.bytes, .modsecurity);
                     if (hit.matched != negated)
-                        return try matchContext(arena, resolved.name, result.bytes, hit.regex);
+                        return try matchContext(arena, resolved.name, result.bytes, hit.regex, hit.sqli);
                 } else {
                     const transformed = if (transforms.len == 0)
                         resolved.value
@@ -2636,7 +2655,7 @@ pub const Transaction = struct {
                     };
                     const hit = operator.match(transformed, .modsecurity);
                     if (hit.matched != negated)
-                        return try matchContext(arena, resolved.name, transformed, hit.regex);
+                        return try matchContext(arena, resolved.name, transformed, hit.regex, hit.sqli);
                 }
             }
         }
@@ -3082,6 +3101,12 @@ pub const Transaction = struct {
             return error.InvalidMatchContext;
         }
         if (context.captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
+        if (context.derived_captures.len > self.waf.config.limits.max_captures) return error.TooManyCaptures;
+        // A derived capture is bounded like a matched value, since it is stored as
+        // one and an operator is not a trusted source of unbounded text.
+        for (context.derived_captures) |derived| {
+            if (derived.len > self.waf.config.limits.max_match_value_bytes) return error.InvalidMatchContext;
+        }
         _ = std.math.add(usize, context.source.offset, context.source.length) catch return error.InvalidMatchContext;
         for (context.captures) |maybe_range| if (maybe_range) |range| {
             if (range.start > range.end or range.end > context.value.len) return error.InvalidMatchContext;
@@ -3165,6 +3190,14 @@ pub const Transaction = struct {
         const empty_source: collections.Source = .{ .origin = context.source.origin, .offset = context.source.offset, .length = 0 };
         for (capture_keys) |key| try batch.putCopy(.tx, key, null, empty_source);
         var count: usize = 0;
+        // A derived capture (a `@detectSQLi` fingerprint) summarizes the match
+        // rather than quoting it, so it has no range within the value and keeps the
+        // matched value's source.
+        for (context.derived_captures) |derived| {
+            if (count == capture_keys.len) break;
+            try batch.putCopy(.tx, capture_keys[count], derived, context.source);
+            count += 1;
+        }
         for (context.captures, 0..) |maybe_range, capture_index| {
             const range = maybe_range orelse continue;
             const offset = context.source.offset + range.start;
@@ -3707,8 +3740,24 @@ fn validAddress(address: []const u8) bool {
 /// capture strings into byte ranges over that value (so a `capture` rule can
 /// stage TX.0..TX.N). Capture strings borrow `value`; ranges are computed
 /// against it and remain valid over the identical `arena` copy.
-fn matchContext(arena: std.mem.Allocator, name: []const u8, value: []const u8, regex: ?operators.RegexOutcome) std.mem.Allocator.Error!MatchContext {
+fn matchContext(
+    arena: std.mem.Allocator,
+    name: []const u8,
+    value: []const u8,
+    regex: ?operators.RegexOutcome,
+    sqli: ?operators.SqlInjection.Match,
+) std.mem.Allocator.Error!MatchContext {
     const owned = try arena.dupe(u8, value);
+    var derived: []const []const u8 = &.{};
+    // ModSecurity 3.0.16 stores libinjection's fingerprint in TX.0 for a capturing
+    // `@detectSQLi` (src/operators/detect_sqli.cc). The bytes are copied into the
+    // arena because the detector's result is held by value on the caller's stack.
+    if (sqli) |detected| if (detected.matched and detected.fingerprint_len != 0) {
+        const fingerprint = try arena.dupe(u8, detected.fingerprintBytes());
+        const slots = try arena.alloc([]const u8, 1);
+        slots[0] = fingerprint;
+        derived = slots;
+    };
     var captures: []const ?CaptureRange = &.{};
     if (regex) |outcome| if (outcome.capture_count != 0) {
         const ranges = try arena.alloc(?CaptureRange, outcome.capture_count);
@@ -3726,7 +3775,13 @@ fn matchContext(arena: std.mem.Allocator, name: []const u8, value: []const u8, r
         }
         captures = ranges;
     };
-    return .{ .name = name, .value = owned, .source = .{ .origin = .rule, .offset = 0, .length = owned.len }, .captures = captures };
+    return .{
+        .name = name,
+        .value = owned,
+        .source = .{ .origin = .rule, .offset = 0, .length = owned.len },
+        .captures = captures,
+        .derived_captures = derived,
+    };
 }
 
 /// Append a formatted fragment to an audit-message buffer using `arena`.
@@ -6893,4 +6948,121 @@ test "a dataset declared after the rules that read it still resolves" {
     try tx.processRequestHeaders();
     try tx.evaluatePhase(std.testing.allocator, .request_headers);
     try std.testing.expect((try tx.intervention()) != null);
+}
+
+test "a capturing @detectSQLi rule stores libinjection's fingerprint in TX.0" {
+    // ModSecurity 3.0.16 stores the fingerprint — not the matched input — in TX.0
+    // when the rule captures (src/operators/detect_sqli.cc). The fingerprint is a
+    // summary of the input's token shape, so it is derived rather than quoted.
+    const input =
+        \\SecRule ARGS "@detectSQLi" "id:1,phase:1,pass,nolog,capture,t:none,setvar:'tx.seen=%{TX.0}'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sqli.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?id=1'%20OR%20'1'='1", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+
+    // TX.0 is libinjection's fingerprint: short, and made of fingerprint
+    // characters rather than being a copy of the argument.
+    const captured = (try tx.collectionFirst(.tx, "0")).?.value;
+    try std.testing.expect(captured.len != 0);
+    try std.testing.expect(captured.len <= 8);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "OR") == null);
+    for (captured) |byte| try std.testing.expect(std.ascii.isPrint(byte));
+
+    // And it is the same value the detector reports for that input, rather than
+    // anything reconstructed here.
+    var detector: operators.SqlInjection = .{};
+    const expected = detector.evaluate("1' OR '1'='1");
+    try std.testing.expect(expected.matched);
+    try std.testing.expectEqualStrings(expected.fingerprintBytes(), captured);
+
+    // The setvar that read %{TX.0} saw the fingerprint too, so it is visible to
+    // rule logic and not only to the audit record.
+    const seen = (try tx.collectionFirst(.tx, "seen")).?.value;
+    try std.testing.expectEqualStrings(expected.fingerprintBytes(), seen);
+}
+
+test "a non-capturing @detectSQLi rule leaves TX.0 alone" {
+    // Upstream only stores the fingerprint when the rule has a capture action, so a
+    // rule without one must not overwrite whatever TX.0 already held.
+    const input =
+        \\SecAction "id:1,phase:1,pass,nolog,setvar:'tx.0=previous'"
+        \\SecRule ARGS "@detectSQLi" "id:2,phase:1,pass,nolog,t:none"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "nocapture.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?id=1'%20OR%20'1'='1", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    try std.testing.expectEqualStrings("previous", (try tx.collectionFirst(.tx, "0")).?.value);
+}
+
+test "derived captures are bounded like any other match evidence" {
+    var builder = Builder.init(std.testing.allocator);
+    var limits = Limits{};
+    limits.max_match_value_bytes = 8;
+    limits.max_captures = 2;
+    builder.setLimits(limits);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+
+    // An operator is not a trusted source of unbounded text, so a derived capture
+    // is measured against the same ceiling as a matched value.
+    const too_long = [_][]const u8{"0123456789"};
+    try std.testing.expectError(error.InvalidMatchContext, tx.replaceCaptures(.{
+        .name = "ARGS:id",
+        .value = "1' OR '1'='1",
+        .source = .{ .origin = .rule, .offset = 0, .length = 12 },
+        .derived_captures = &too_long,
+    }));
+
+    // And more derived captures than TX slots the configuration allows is a
+    // rejection rather than a silent truncation.
+    const too_many = [_][]const u8{ "a", "b", "c" };
+    try std.testing.expectError(error.TooManyCaptures, tx.replaceCaptures(.{
+        .name = "ARGS:id",
+        .value = "x",
+        .source = .{ .origin = .rule, .offset = 0, .length = 1 },
+        .derived_captures = &too_many,
+    }));
+
+    // A fingerprint-sized capture is accepted and lands in TX.0. The matched value
+    // is short here because this transaction's ceiling applies to it too.
+    const fingerprint = [_][]const u8{"s&1c"};
+    try std.testing.expectEqual(@as(usize, 1), try tx.replaceCaptures(.{
+        .name = "ARGS:id",
+        .value = "1' OR 1",
+        .source = .{ .origin = .rule, .offset = 0, .length = 7 },
+        .derived_captures = &fingerprint,
+    }));
+    try std.testing.expectEqualStrings("s&1c", (try tx.collectionFirst(.tx, "0")).?.value);
 }
