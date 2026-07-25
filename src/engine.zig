@@ -11,6 +11,7 @@ const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
 const request_buffer = @import("request_buffer.zig");
 const multipart = @import("multipart.zig");
+const runtime_operator = @import("runtime_operator.zig");
 const audit = @import("audit.zig");
 const xml = @import("xml");
 const selectors = @import("selectors.zig");
@@ -2485,6 +2486,54 @@ pub const Transaction = struct {
         return values.toOwnedSlice(arena); // unknown variable
     }
 
+    /// Evaluate one rule against the current transaction state, returning a
+    /// MatchContext for the first matching (target-value × operator) or null.
+    /// Ties the execution layers together: resolve each target to values, apply
+    /// the rule's transformation pipeline, compile and run the operator (with
+    /// `!@op` negation). The integration seam for a phase-evaluation loop and a
+    /// connector's inspection hook. Chains, multiMatch checkpoints,
+    /// macro-expanded operator arguments, and regex key selectors are handled by
+    /// later slices; a negated target (exclusion form) is skipped here.
+    pub fn evaluateRule(self: *Transaction, arena: std.mem.Allocator, rule_id: compiled_plan.RuleId) TransactionError!?MatchContext {
+        const plan = self.compiledPlan() orelse return null;
+        const rule_index: usize = @backingInt(rule_id);
+        if (rule_index >= plan.rules.len) return null;
+        const rule = plan.rules[rule_index];
+
+        const op_name = plan.string(rule.operator.name) orelse return null;
+        const op_param = plan.string(rule.operator.parameter) orelse "";
+        var operator = runtime_operator.RuntimeOperator.compile(arena, op_name, op_param) catch return null;
+        defer operator.deinit();
+
+        const transforms = plan.transformations[rule.transformations_start..][0..rule.transformations_count];
+        const targets = plan.targets[rule.targets_start..][0..rule.targets_count];
+        for (targets) |target| {
+            if (target.modifier == .negated) continue; // exclusion form
+            const variable_name = plan.string(target.collection) orelse continue;
+            const selector = if (target.selector) |sid| plan.string(sid) else null;
+            const count = target.modifier == .count;
+            const values = try self.resolveTarget(arena, variable_name, selector, count);
+            for (values) |resolved| {
+                const transformed = if (transforms.len == 0)
+                    resolved.value
+                else transformed: {
+                    const result = self.transformation_executor.applyPipeline(transforms, resolved.value, false) catch
+                        break :transformed resolved.value;
+                    break :transformed result.bytes;
+                };
+                if (operator.evaluate(transformed, .modsecurity) != rule.operator.negated) {
+                    const owned = try arena.dupe(u8, transformed);
+                    return MatchContext{
+                        .name = resolved.name,
+                        .value = owned,
+                        .source = .{ .origin = .rule, .offset = 0, .length = owned.len },
+                    };
+                }
+            }
+        }
+        return null;
+    }
+
     pub fn collectionTarget(self: *const Transaction, target: collections.Target, exclusions: []const collections.Target) TransactionError!?collections.TargetIterator {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         const availability = self.currentAvailability() orelse return null;
@@ -4564,6 +4613,48 @@ test "the sanitizeMatched action masks the matched variable" {
     // sanitizeMatched resolved ARGS:password and masked its body value.
     try std.testing.expect(std.mem.indexOf(u8, serial, "password=*******") != null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
+}
+
+test "evaluateRule matches a rule operator against resolved, transformed targets" {
+    const input =
+        \\SecRule ARGS "@rx attack" "id:1,phase:2,t:lowercase,deny"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "evaluate-rule.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A request whose arg contains "ATTACK" (matched after t:lowercase).
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?input=ATTACKER", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        const match = (try tx.evaluateRule(a, @fromBackingInt(0))).?;
+        try std.testing.expectEqualStrings("input", match.name);
+        // The value is the transformed (lowercased) arg the operator matched.
+        try std.testing.expectEqualStrings("attacker", match.value);
+    }
+
+    // A request with a benign arg does not match.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?input=hello", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try std.testing.expect((try tx.evaluateRule(a, @fromBackingInt(0))) == null);
+    }
 }
 
 test "resolveTarget yields scalar values, collection entries, and counts" {
