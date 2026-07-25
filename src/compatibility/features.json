@@ -17,7 +17,11 @@
       "modsecurity": false,
       "coraza": false,
       "crs_required": false,
-      "evidence": ["deps.yaml", "pantry.lock", ".github/workflows/ci.yml"],
+      "evidence": [
+        "deps.yaml",
+        "pantry.lock",
+        ".github/workflows/ci.yml"
+      ],
       "notes": "The exact compiler build is locked locally and in CI."
     },
     {
@@ -29,7 +33,10 @@
       "modsecurity": false,
       "coraza": false,
       "crs_required": false,
-      "evidence": [".github/workflows/ci.yml", "dependencies.lock.json"],
+      "evidence": [
+        ".github/workflows/ci.yml",
+        "dependencies.lock.json"
+      ],
       "notes": "Sibling repositories are locked by commit and checked out directly in CI."
     },
     {
@@ -280,8 +287,12 @@
       "modsecurity": true,
       "coraza": true,
       "crs_required": false,
-      "evidence": ["include/zig_waf.h", "src/c_api.zig", "tests/c_api_smoke.c"],
-      "notes": "Opaque ownership, sized structs, rule-set loading (zig_waf_create_with_rules compiles a SecLang config), the full transaction lifecycle, autonomous phase evaluation (zig_waf_transaction_evaluate_phase), feature discovery, errors, intervention retrieval, and audit-log serialization (zig_waf_transaction_serialize_audit_log + zig_waf_free) are implemented — the complete seam a native data plane (e.g. the rpx dataplane) links against to run traffic through the engine. The C smoke test drives the full flow (rules -> request -> evaluate -> 403). Callbacks and the ABI compatibility matrix remain."
+      "evidence": [
+        "include/zig_waf.h",
+        "src/c_api.zig",
+        "tests/c_api_smoke.c"
+      ],
+      "notes": "Opaque ownership, sized structs, rule-set loading (zig_waf_create_with_rules compiles a SecLang config), the full transaction lifecycle, autonomous phase evaluation (zig_waf_transaction_evaluate_phase), feature discovery, errors, intervention retrieval, and audit-log serialization (zig_waf_transaction_serialize_audit_log + zig_waf_free) are implemented \u2014 the complete seam a native data plane (e.g. the rpx dataplane) links against to run traffic through the engine. The C smoke test drives the full flow (rules -> request -> evaluate -> 403). Callbacks and the ABI compatibility matrix remain."
     },
     {
       "id": "tooling.cli",
@@ -292,7 +303,9 @@
       "modsecurity": false,
       "coraza": true,
       "crs_required": false,
-      "evidence": ["src/cli.zig"],
+      "evidence": [
+        "src/cli.zig"
+      ],
       "notes": "The zig-waf CLI parses, compiles, and directive-validates SecLang configs (validate), lists compiled rules with phase/id/action/location (explain), runs a synthetic request through the engine and reports the block/allow decision (test), and reports the version, exiting non-zero on rejection so rule sets can be gated in CI. The format, replay, and benchmark subcommands remain."
     },
     {
@@ -428,8 +441,13 @@
       "modsecurity": false,
       "coraza": false,
       "crs_required": false,
-      "evidence": ["deps.yaml", "pantry.lock"],
-      "notes": "Packages are locked; per-project cluster/port isolation is still required."
+      "evidence": [
+        "deps.yaml",
+        "pantry.lock",
+        "src/pg.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Packages are locked and the client links native libpq 18. Per-project cluster/port isolation and the documented production deployment profile are still required (#51)."
     },
     {
       "id": "ui.stx-embedded-assets",
@@ -440,7 +458,10 @@
       "modsecurity": false,
       "coraza": false,
       "crs_required": false,
-      "evidence": ["console/README.md", "dependencies.lock.json"],
+      "evidence": [
+        "console/README.md",
+        "dependencies.lock.json"
+      ],
       "notes": "The workspace and pinned STX source exist; the fingerprinted asset compiler remains."
     },
     {
@@ -466,6 +487,132 @@
       "crs_required": false,
       "evidence": [],
       "notes": "The adapter is scheduled after HTTP/1.1 framing and backpressure."
+    },
+    {
+      "id": "fleet.schema-migrations",
+      "area": "fleet",
+      "name": "Constrained fleet schema with range partitions and transactional migrations",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/52",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet.zig",
+        "src/pg.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Append-only migrations, each in its own transaction; roles, credentials, and saved searches constrained by the schema rather than by callers; security_events range-partitioned on occurred_at with BRIN on the timestamp and GIN on jsonb."
+    },
+    {
+      "id": "fleet.client-pools",
+      "area": "fleet",
+      "name": "libpq client with prepared statements, timeouts, cancellation, retries, and per-workload pools",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/53",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/pg.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Values are bound as text parameters throughout; binary format is deliberately unused because it would move timestamptz encoding onto the client. API, rollout, and ingestion have separate bounded pools so one cannot starve another."
+    },
+    {
+      "id": "fleet.signed-bundles-rollout",
+      "area": "fleet",
+      "name": "Ed25519-signed policy bundles, staged rollout, health gates, and drift detection",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/54",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Signing is asymmetric so nodes hold only the public key; verification fails closed. A rollout widens only when the cohort already on the version is responsive and has confirmed it; a node that has never reported counts as drifted."
+    },
+    {
+      "id": "fleet.durable-ingestion",
+      "area": "fleet",
+      "name": "Idempotent, zstd-compressed durable event queue with COPY ingestion and reconnect",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/55",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet.zig",
+        "src/zstd.zig",
+        "benchmarks/ingestion.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Re-sent batches deduplicate by (event_key, occurred_at); drain switches to COPY at the measured 24-event crossover (zig build bench-ingestion); snapshots survive an upgrade across format versions."
+    },
+    {
+      "id": "fleet.search-retention-export",
+      "area": "fleet",
+      "name": "Partition-pruned search, cursor pagination, retention, CSV export, and capacity forecasts",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/56",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Pagination is by (occurred_at, id) cursor, so a growing stream neither repeats nor skips rows. A stream with no measurable growth reports no forecast rather than a fabricated one."
+    },
+    {
+      "id": "fleet.sqlite-demo",
+      "area": "fleet",
+      "name": "SQLite mirror of the fleet repositories for demos and server-free tests",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/57",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/sqlite.zig",
+        "src/fleet_sqlite.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Mirrors the repository contracts and their guarantees (immutable versions, drift). Carries no fleet guarantees and is not a deployment target; signed bundles are deliberately not mirrored."
+    },
+    {
+      "id": "fleet.identity-rbac",
+      "area": "fleet",
+      "name": "Local authentication, RBAC, API tokens, sessions, and OIDC ID-token verification",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/58",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet_auth.zig",
+        "src/oidc.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "argon2id for passwords, SHA-256 for 256-bit generated credentials. Authorization is a total function over enumerated actions. OIDC takes the algorithm from the key, not the token header, so alg:none and HMAC confusion fail."
+    },
+    {
+      "id": "fleet.alerts-telemetry",
+      "area": "fleet",
+      "name": "Alert thresholds, deduplication, silences, signed webhooks, retry accounting, and Prometheus metrics",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/59",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/fleet.zig",
+        "src/fleet_metrics.zig",
+        "docs/fleet-storage.md"
+      ],
+      "notes": "Firing is one statement, so concurrent dispatchers deliver one alert. A metric that cannot be collected is omitted rather than reported as zero."
     }
   ]
 }
