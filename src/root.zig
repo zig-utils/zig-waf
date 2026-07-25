@@ -17,6 +17,7 @@ pub const phrase = @import("phrase.zig");
 pub const ip_match = @import("ip_match.zig");
 pub const operator_fuzz = @import("operator_fuzz.zig");
 pub const plan = @import("plan.zig");
+pub const plugin = @import("plugin.zig");
 pub const plan_fuzz = @import("plan_fuzz.zig");
 pub const rule_config = @import("rule_config.zig");
 pub const rule_config_evidence = @import("rule_config_evidence.zig");

@@ -765,7 +765,7 @@ pub fn compile(
     documents: []const seclang.parser.Document,
     limits: Limits,
 ) CompileError!*Plan {
-    return compileDetailed(allocator, registry, documents, limits, null, null);
+    return compileDetailed(allocator, registry, documents, limits, null, null, &.{});
 }
 
 /// Like `compile`, but with a `DataProvider` so `@pmFromFile` / `@ipMatchFromFile`
@@ -779,7 +779,21 @@ pub fn compileWithProvider(
     limits: Limits,
     data_provider: ?DataProvider,
 ) CompileError!*Plan {
-    return compileDetailed(allocator, registry, documents, limits, null, data_provider);
+    return compileDetailed(allocator, registry, documents, limits, null, data_provider, &.{});
+}
+
+/// Compile with the operator names a host's plugins provide (#23), so a rule may
+/// name `@geoLookup` when the host answers it — and still be refused when nothing
+/// does, rather than compiling into a rule that never matches.
+pub fn compileWithPlugins(
+    allocator: std.mem.Allocator,
+    registry: *const seclang.source.Registry,
+    documents: []const seclang.parser.Document,
+    limits: Limits,
+    data_provider: ?DataProvider,
+    plugin_operators: []const []const u8,
+) CompileError!*Plan {
+    return compileDetailed(allocator, registry, documents, limits, null, data_provider, plugin_operators);
 }
 
 /// Compile an include/remote source tree in textual directive order. Child
@@ -873,7 +887,7 @@ pub fn compileOutcome(
     limits: Limits,
 ) CompileError!CompileOutcome {
     var failure: ?Failure = null;
-    const plan = compileDetailed(allocator, registry, documents, limits, &failure, null) catch |cause| {
+    const plan = compileDetailed(allocator, registry, documents, limits, &failure, null, &.{}) catch |cause| {
         if (failure) |detail| {
             const code = diagnosticCode(cause) orelse return cause;
             return .{ .diagnostic = .{
@@ -895,11 +909,13 @@ fn compileDetailed(
     limits: Limits,
     failure: ?*?Failure,
     data_provider: ?DataProvider,
+    plugin_operators: []const []const u8,
 ) CompileError!*Plan {
     try limits.validate();
     if (documents.len > limits.max_documents) return error.TooManyDocuments;
     if (registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
     var compiler = Compiler.init(allocator, limits, failure, data_provider);
+    compiler.plugin_operators = plugin_operators;
     defer compiler.deinit();
     // Datasets first: a rule's operator is resolved as it is compiled, so every
     // declaration has to be known before any rule is looked at.
@@ -997,6 +1013,9 @@ const Compiler = struct {
     failure: ?*?Failure,
     /// Optional loader for `@pmFromFile` / `@ipMatchFromFile` data files.
     data_provider: ?DataProvider = null,
+    /// Operator names a host plugin provides (#23). A rule may name one of these
+    /// even though the engine has no built-in for it, because the host will answer.
+    plugin_operators: []const []const u8 = &.{},
     /// `SecDataset` declarations by name, collected before rules are compiled so a
     /// dataset may be declared anywhere in the configuration — including a file
     /// included after the rules that read it, which is how a bundled ruleset ships
@@ -1053,6 +1072,15 @@ const Compiler = struct {
     /// entries are borrowed from the parsed document, which outlives compilation.
     /// A later declaration of the same name replaces an earlier one, matching how
     /// Coraza's registry behaves.
+    /// Whether a host plugin answers to this operator name.
+    fn pluginProvides(self: *const Compiler, raw_name: []const u8) bool {
+        const name = if (raw_name.len != 0 and raw_name[0] == '@') raw_name[1..] else raw_name;
+        for (self.plugin_operators) |provided| {
+            if (std.ascii.eqlIgnoreCase(provided, name)) return true;
+        }
+        return false;
+    }
+
     fn collectDatasets(self: *Compiler, document: *const seclang.parser.Document) CompileError!void {
         for (document.directives.items) |directive| {
             // SecDataset is a generic directive to the parser, so it is recognized
@@ -1432,7 +1460,7 @@ const Compiler = struct {
         const default_id = self.active_defaults[phase - 1];
         const transformation_range = self.addTransformations(default_id, action_range) catch |cause|
             return self.fail(cause, actionSpan(directive), null);
-        if (!isImplementedOperator(parsed_operator.name))
+        if (!isImplementedOperator(parsed_operator.name) and !self.pluginProvides(parsed_operator.name))
             return self.fail(error.UnknownOperator, directive.operator().?.physical, null);
         const prefilter = try self.addPrefilter(parsed_operator);
         const operator_macro = self.addMacro(unquote(parsed_operator.parameter)) catch |cause|

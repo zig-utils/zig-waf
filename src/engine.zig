@@ -5,6 +5,7 @@ const action_config = @import("action_config.zig");
 const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
 const directives = @import("directives.zig");
+const plugin = @import("plugin.zig");
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
@@ -117,6 +118,8 @@ pub const Config = struct {
     limits: Limits = .{},
     macro_missing_policy: macros.MissingPolicy = .empty,
     persistent_backend: ?persistent.Backend = null,
+    /// Host-provided operators (#23); borrowed, never owned.
+    plugins: ?*const plugin.Registry = null,
     persistent_limits: persistent.Limits = .{},
     persistent_failure_policy: persistent.FailurePolicy = .fail_closed,
     persistent_required_features: persistent.BackendFeatureSet = persistent.BackendFeatureSet.core(),
@@ -212,6 +215,12 @@ pub const Builder = struct {
 
     pub fn setPersistentBackend(self: *Builder, backend: persistent.Backend) void {
         self.config.persistent_backend = backend;
+    }
+
+    /// Register host-provided operators (#23). The registry is borrowed, so the
+    /// caller keeps it alive for as long as the WAF and its transactions.
+    pub fn setPluginRegistry(self: *Builder, registry: *const plugin.Registry) void {
+        self.config.plugins = registry;
     }
 
     pub fn setPersistentLimits(self: *Builder, limits: persistent.Limits) void {
@@ -338,6 +347,7 @@ pub const Builder = struct {
             };
         };
         waf.* = .{
+            .plugins = self.config.plugins,
             .json_depth_limit = json_depth_limit,
             .allocator = self.allocator,
             .config = self.config,
@@ -374,6 +384,8 @@ pub const Waf = struct {
     /// The resolved JSON nesting ceiling: `SecRequestBodyJsonDepthLimit` when the
     /// configuration sets one, otherwise the build-time limit.
     json_depth_limit: usize,
+    /// Host-provided operators (#23), borrowed for this WAF's lifetime.
+    plugins: ?*const plugin.Registry,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
 
@@ -916,6 +928,8 @@ pub const Transaction = struct {
     waf: *const Waf,
     lifecycle: Lifecycle = .created,
     request_header_count: usize = 0,
+    /// Times a host plugin could not answer this transaction's operators (#23).
+    plugin_unavailable_count: usize = 0,
     request_header_bytes: usize = 0,
     response_header_count: usize = 0,
     response_header_bytes: usize = 0,
@@ -2730,6 +2744,9 @@ pub const Transaction = struct {
             .{ .value = rule.operator.parameter, .macro = rule.operator.macro },
             arena,
         ) catch return null;
+        // A host plugin owns this operator name: the engine has no built-in for it,
+        // and the rule only compiled because the plugin was registered.
+        const plugin_operator = if (self.waf.plugins) |registry| registry.findOperator(op_name) else null;
         var operator = runtime_operator.RuntimeOperator.compile(arena, op_name, op_param) catch return null;
         defer operator.deinit();
 
@@ -2769,13 +2786,42 @@ pub const Transaction = struct {
                             break :transformed resolved.value;
                         break :transformed result.bytes;
                     };
-                    const hit = operator.match(transformed, .modsecurity);
+                    const hit = if (plugin_operator) |provider|
+                        self.matchThroughPlugin(provider, op_param, transformed)
+                    else
+                        operator.match(transformed, .modsecurity);
                     if (hit.matched != negated)
                         return try matchContext(arena, resolved.name, transformed, hit.regex, hit.sqli, hit.identity);
                 }
             }
         }
         return null;
+    }
+
+    /// Evaluate a host-provided operator, counting the times it could not answer.
+    ///
+    /// An unavailable plugin does not match, but it is not the same as a clean
+    /// request: a GeoIP database that failed to load would otherwise show up as
+    /// every request being from nowhere in particular. The count makes the
+    /// unanswered question visible to the connector.
+    fn matchThroughPlugin(
+        self: *Transaction,
+        provider: *const plugin.Operator,
+        parameter: []const u8,
+        input: []const u8,
+    ) runtime_operator.RuntimeOperator.Match {
+        return switch (provider.evaluate(parameter, input)) {
+            .matched => |value| .{ .matched = value },
+            .unavailable => blk: {
+                self.plugin_unavailable_count += 1;
+                break :blk .{ .matched = false };
+            },
+        };
+    }
+
+    /// How many times a plugin operator could not answer during this transaction.
+    pub fn pluginUnavailableCount(self: *const Transaction) usize {
+        return self.plugin_unavailable_count;
     }
 
     pub fn collectionTarget(self: *const Transaction, target: collections.Target, exclusions: []const collections.Target) TransactionError!?collections.TargetIterator {
@@ -7698,4 +7744,98 @@ test "a truncated JSON body publishes what it read and reports the rest missing"
     // hiding its own contents from every rule.
     try std.testing.expectEqualStrings("seen", (try tx.collectionFirst(.args, "json.a")).?.value);
     try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
+}
+
+/// A host GeoIP lookup, for the plugin tests: it answers from a table instead of a
+/// MaxMind database, and can be switched to "database not loaded".
+const TestGeoPlugin = struct {
+    loaded: bool = true,
+
+    fn evaluate(context: *anyopaque, parameter: []const u8, input: []const u8) plugin.Outcome {
+        const self: *TestGeoPlugin = @ptrCast(@alignCast(context));
+        if (!self.loaded) return .unavailable;
+        // Everything in 203.0.113.0/24 is "SE" for the purposes of this test.
+        const country = if (std.mem.startsWith(u8, input, "203.0.113.")) "SE" else "NO";
+        return .{ .matched = std.mem.eql(u8, parameter, country) };
+    }
+
+    fn operator(self: *TestGeoPlugin) plugin.Operator {
+        return .{ .name = "geoLookup", .context = self, .evaluateFn = evaluate };
+    }
+};
+
+test "a host plugin provides an operator the engine has no built-in for" {
+    var geo = TestGeoPlugin{};
+    const provided = [_]plugin.Operator{geo.operator()};
+    const registry = plugin.Registry{ .operators = &provided };
+    try registry.validate();
+
+    const input =
+        \\SecRule REMOTE_ADDR "@geoLookup SE" "id:1,phase:1,deny,status:403,t:none,msg:'blocked country'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "geo.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+
+    // Without the plugin's name the rule cannot compile: an operator nothing
+    // implements would produce a rule that never matches.
+    try std.testing.expectError(
+        error.UnknownOperator,
+        compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{}),
+    );
+
+    var names: [4][]const u8 = undefined;
+    const plan = try compiled_plan.compileWithPlugins(
+        std.testing.allocator,
+        &parsed.registry,
+        &documents,
+        .{},
+        null,
+        registry.operatorNames(&names),
+    );
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setPluginRegistry(&registry);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A client the plugin places in the blocked country is denied.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("203.0.113.7", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqual(@as(u16, 403), (try tx.intervention()).?.status);
+        try std.testing.expectEqual(@as(usize, 0), tx.pluginUnavailableCount());
+    }
+
+    // A client elsewhere passes.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("198.51.100.9", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+        try std.testing.expectEqual(@as(usize, 0), tx.pluginUnavailableCount());
+    }
+
+    // A plugin that cannot answer does not match — but it is counted, because a
+    // database that failed to load would otherwise look exactly like a stream of
+    // requests from somewhere harmless.
+    {
+        geo.loaded = false;
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("203.0.113.7", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+        try std.testing.expectEqual(@as(usize, 1), tx.pluginUnavailableCount());
+    }
 }
