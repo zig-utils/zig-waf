@@ -104,7 +104,9 @@ export fn zig_waf_create(config: ?*const Config, out_waf: ?**WafHandle) callconv
 
 /// Create a WAF whose rule set is compiled from a SecLang configuration. On a
 /// parse or compile error the call fails with invalid_config; the caller can
-/// use the CLI (`zig-waf validate`) to see the diagnostics.
+/// use the CLI (`zig-waf validate`) to see the diagnostics. `@pmFromFile` /
+/// `@ipMatchFromFile` operators do not load their data files on this path (no
+/// data directory is known) — use `zig_waf_create_with_rules_at` for that.
 export fn zig_waf_create_with_rules(
     config: ?*const Config,
     rules_pointer: ?[*]const u8,
@@ -114,8 +116,54 @@ export fn zig_waf_create_with_rules(
     const output = out_waf orelse return .invalid_argument;
     output.* = undefined;
     const rules = bytes(rules_pointer, rules_len) orelse return .invalid_argument;
-    const gpa = std.heap.page_allocator;
+    return compileRules(config, rules, null, output);
+}
 
+/// Like `zig_waf_create_with_rules`, but resolves `@pmFromFile` /
+/// `@ipMatchFromFile` data files relative to `data_dir` (SecDataDir semantics),
+/// confined to that directory. Lets a connector load file-backed operators.
+export fn zig_waf_create_with_rules_at(
+    config: ?*const Config,
+    rules_pointer: ?[*]const u8,
+    rules_len: usize,
+    data_dir_pointer: ?[*]const u8,
+    data_dir_len: usize,
+    out_waf: ?**WafHandle,
+) callconv(.c) Status {
+    const output = out_waf orelse return .invalid_argument;
+    output.* = undefined;
+    const rules = bytes(rules_pointer, rules_len) orelse return .invalid_argument;
+    const data_dir = bytes(data_dir_pointer, data_dir_len) orelse return .invalid_argument;
+    if (data_dir.len == 0) return .invalid_argument;
+
+    // A blocking, thread-pool-free io for the one-shot compile-time file reads.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Canonicalize the data directory: it is the withinRoot confinement boundary
+    // and must match the canonical form of each resolved data-file path.
+    var dir = std.Io.Dir.cwd().openDir(io, data_dir, .{}) catch return .invalid_config;
+    defer dir.close(io);
+    var root_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const root_len = dir.realPath(io, &root_buffer) catch return .invalid_config;
+    var provider_context: DataDirProvider = .{ .io = io, .root = root_buffer[0..root_len] };
+    const provider: waf.plan.DataProvider = .{ .context = &provider_context, .readFn = DataDirProvider.read };
+    return compileRules(config, rules, provider, output);
+}
+
+/// Loads operator data files relative to (and confined within) `root`.
+const DataDirProvider = struct {
+    io: std.Io,
+    root: []const u8,
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8 {
+        _ = base_dir; // all data files resolve against the configured data dir
+        const self: *DataDirProvider = @ptrCast(@alignCast(context));
+        return waf.seclang.include.readDataFileAlloc(allocator, self.io, self.root, self.root, filename, 8 * 1024 * 1024, false);
+    }
+};
+
+/// Shared compile-and-build for the rule-set create paths.
+fn compileRules(config: ?*const Config, rules: []const u8, provider: ?waf.plan.DataProvider, output: **WafHandle) Status {
+    const gpa = std.heap.page_allocator;
     var parsed = waf.seclang.parser.parseBytesOutcome(gpa, "c-abi-rules", rules, .{}, .{}) catch return .out_of_memory;
     defer parsed.deinit();
     const document = switch (parsed.outcome) {
@@ -123,7 +171,7 @@ export fn zig_waf_create_with_rules(
         .diagnostic => return .invalid_config,
     };
     var documents = [_]waf.seclang.parser.Document{document};
-    const plan = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch return .invalid_config;
+    const plan = waf.plan.compileWithProvider(gpa, &parsed.registry, &documents, .{}, provider) catch return .invalid_config;
     defer plan.deinit();
 
     var builder = waf.Waf.Builder.init(gpa);
@@ -508,4 +556,54 @@ test "serialize_audit_log rejects an unknown format" {
     var len: usize = undefined;
     // 7 is not a valid format id (0..3 and the configured sentinel are).
     try testing.expectEqual(Status.invalid_argument, zig_waf_transaction_serialize_audit_log(tx, 7, &buffer, &len));
+}
+
+test "create_with_rules_at loads @pmFromFile data files from the data dir" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "shells.data", .data = "bin/cat\nbin/ls\n" });
+    var dir_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(testing.io, &dir_buffer);
+    const data_dir = dir_buffer[0..dir_len];
+
+    const rules = "SecRule ARGS \"@pmFromFile shells.data\" \"id:1,phase:1,deny,status:403,t:none\"";
+
+    // Without a data dir the file is not loaded, so a matching arg is allowed.
+    {
+        var handle: *WafHandle = undefined;
+        try testing.expectEqual(Status.ok, zig_waf_create_with_rules(null, rules.ptr, rules.len, &handle));
+        defer _ = zig_waf_destroy(handle);
+        try testing.expect(!requestBlocked(handle, "/x?c=/bin/cat"));
+    }
+    // With the data dir the file loads, so a matching arg is blocked while a
+    // non-matching one is allowed — proving the phrases came from the file.
+    {
+        var handle: *WafHandle = undefined;
+        try testing.expectEqual(Status.ok, zig_waf_create_with_rules_at(null, rules.ptr, rules.len, data_dir.ptr, data_dir.len, &handle));
+        defer _ = zig_waf_destroy(handle);
+        try testing.expect(requestBlocked(handle, "/x?c=/bin/cat"));
+        try testing.expect(!requestBlocked(handle, "/x?c=hello"));
+    }
+
+    // A missing / null data dir is an argument error.
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.invalid_argument, zig_waf_create_with_rules_at(null, rules.ptr, rules.len, null, 4, &handle));
+}
+
+/// Run a GET `uri` through phase 1 and report whether it is enforced-blocked.
+fn requestBlocked(handle: *WafHandle, uri: []const u8) bool {
+    var tx: *TransactionHandle = undefined;
+    if (zig_waf_transaction_create(handle, &tx) != .ok) return false;
+    defer zig_waf_transaction_destroy(tx);
+    const ip = "127.0.0.1";
+    _ = zig_waf_transaction_process_connection(tx, ip.ptr, ip.len, 1, ip.ptr, ip.len, 80);
+    const method = "GET";
+    const version = "HTTP/1.1";
+    _ = zig_waf_transaction_process_uri(tx, uri.ptr, uri.len, method.ptr, method.len, version.ptr, version.len);
+    _ = zig_waf_transaction_process_request_headers(tx);
+    _ = zig_waf_transaction_evaluate_phase(tx, 1);
+    var decision: CIntervention = std.mem.zeroes(CIntervention);
+    decision.struct_size = @sizeOf(CIntervention);
+    decision.abi_version = abi_version;
+    return zig_waf_transaction_intervention(tx, &decision) == .ok and decision.enforced != 0;
 }

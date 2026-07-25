@@ -99,6 +99,16 @@ zig_waf_status_t zig_waf_create_with_rules(
     const uint8_t *rules,
     size_t rules_len,
     zig_waf_t **out_waf);
+
+/* Like zig_waf_create_with_rules, but resolves @pmFromFile / @ipMatchFromFile
+ * data files relative to data_dir (SecDataDir semantics), confined to it. */
+zig_waf_status_t zig_waf_create_with_rules_at(
+    const zig_waf_config_t *config,
+    const uint8_t *rules,
+    size_t rules_len,
+    const uint8_t *data_dir,
+    size_t data_dir_len,
+    zig_waf_t **out_waf);
 zig_waf_status_t zig_waf_destroy(zig_waf_t *waf);
 
 zig_waf_status_t zig_waf_transaction_create(zig_waf_t *waf, zig_waf_transaction_t **out_transaction);
