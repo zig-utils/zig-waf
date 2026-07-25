@@ -28,6 +28,13 @@ const DataFileProvider = struct {
     }
 };
 
+/// Report a malformed or value-missing flag and exit; used by `test` argument
+/// parsing where a bad flag is a usage error, not a runtime condition.
+fn flagError(flag: []const u8) noreturn {
+    std.debug.print("zig-waf test: {s} requires a value\n", .{flag});
+    std.process.exit(2);
+}
+
 /// The configuration root for data-file resolution: the canonical directory
 /// holding `path`. Returns null if the path cannot be canonicalised (callers
 /// then compile without file-backed operator support).
@@ -73,7 +80,8 @@ fn usage() void {
         \\usage:
         \\  zig-waf validate <file.conf>...   parse, compile, and validate SecLang configs
         \\  zig-waf explain <file.conf>       list the compiled rules (phase, id, action, location)
-        \\  zig-waf test <file.conf> [METHOD] [URI] [BODY] [CONTENT-TYPE]   run a request through the engine and report the decision
+        \\  zig-waf test <file.conf> [METHOD] [URI] [BODY] [CONTENT-TYPE] [--status N] [--response-body TEXT] [--response-type CT]
+        \\      run a request (and optional simulated response) through the engine and report the decision
         \\  zig-waf version                   print the engine version
         \\  zig-waf help                      show this help
         \\
@@ -136,13 +144,46 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     };
     const method = args.next() orelse "GET";
     const uri = args.next() orelse "/";
-    // Optional request body and its content type, so request-body-phase rules
-    // (URL-encoded / JSON / multipart / XML processors) can be exercised. An
-    // empty body argument means "no body" — otherwise a GET would be sent with a
+    // Optional request body + content type (positional), so request-body-phase
+    // rules (URL-encoded / JSON / multipart / XML) can be exercised, plus
+    // optional `--status` / `--response-body` / `--response-type` flags that
+    // simulate a backend response for response-phase rules (CRS 95x data
+    // leakage). An empty body means "no body" — otherwise a GET would carry a
     // zero-length body and content-type headers, which protocol rules flag.
-    const body_arg = args.next();
-    const body: ?[]const u8 = if (body_arg) |value| (if (value.len == 0) null else value) else null;
-    const content_type = args.next() orelse "application/x-www-form-urlencoded";
+    var body: ?[]const u8 = null;
+    var content_type: []const u8 = "application/x-www-form-urlencoded";
+    var response_status: u16 = 200;
+    var response_body: ?[]const u8 = null;
+    var response_type: []const u8 = "text/html";
+    var positional: usize = 0;
+    while (args.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--")) {
+            if (std.mem.eql(u8, arg, "--status")) {
+                response_status = std.fmt.parseInt(u16, args.next() orelse flagError("--status"), 10) catch flagError("--status");
+            } else if (std.mem.eql(u8, arg, "--response-body")) {
+                const value = args.next() orelse flagError("--response-body");
+                response_body = if (value.len == 0) null else value;
+            } else if (std.mem.eql(u8, arg, "--response-type")) {
+                response_type = args.next() orelse flagError("--response-type");
+            } else {
+                std.debug.print("zig-waf test: unknown flag {s}\n", .{arg});
+                std.process.exit(2);
+            }
+        } else switch (positional) {
+            0 => {
+                body = if (arg.len == 0) null else arg;
+                positional += 1;
+            },
+            1 => {
+                content_type = arg;
+                positional += 1;
+            },
+            else => {
+                std.debug.print("zig-waf test: unexpected argument {s}\n", .{arg});
+                std.process.exit(2);
+            },
+        }
+    }
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
         std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
@@ -204,6 +245,25 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
         if (body) |bytes_body| try tx.writeRequestBody(bytes_body);
         try tx.processRequestBody();
         try tx.evaluatePhase(gpa, .request_body);
+    }
+
+    // Simulate the backend response so response-phase rules (CRS 95x data
+    // leakage / web shells) can be exercised. Only run if the request was not
+    // already blocked — a blocked request never reaches the origin.
+    if ((try tx.intervention()) == null) {
+        try tx.addResponseHeader("Content-Type", response_type);
+        if (response_body) |resp| {
+            var length_buffer: [20]u8 = undefined;
+            const length = std.fmt.bufPrint(&length_buffer, "{d}", .{resp.len}) catch unreachable;
+            try tx.addResponseHeader("Content-Length", length);
+        }
+        try tx.processResponseHeaders(response_status, "HTTP/1.1");
+        try tx.evaluatePhase(gpa, .response_headers);
+        if ((try tx.intervention()) == null) {
+            if (response_body) |resp| try tx.writeResponseBody(resp);
+            try tx.processResponseBody();
+            try tx.evaluatePhase(gpa, .response_body);
+        }
     }
 
     if (try tx.intervention()) |decision| {
