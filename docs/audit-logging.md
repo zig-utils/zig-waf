@@ -50,6 +50,30 @@ selectable, and the reserved `D`/`G`/`I`/`J`/`K` markers emit empty when chosen.
 Header-map key order is nondeterministic in Go's `encoding/json`, so the JSON
 family is schema-compatible with Coraza rather than byte-identical.
 
+## Delivery
+
+Formatted records are delivered across an I/O-free `Sink` boundary the
+connector owns (`src/audit_writer.zig`): `SerialWriter` appends each record and
+a newline (serial file, stdout/stderr, or a syslog/HTTPS sink), `CallbackWriter`
+hands each record to a callback, and `concurrentEntry` produces the ModSecurity
+concurrent-layout per-record path (`YYYYMMDD/YYYYMMDD-HHMM/YYYYMMDD-HHMMSS-<id>`)
+and combined-log index line. The core never blocks on I/O.
+
+## Redaction
+
+The ModSecurity `sanitise*` actions mask sensitive data before serialization:
+
+- `sanitizeRequestHeader:<name>` / `sanitizeResponseHeader:<name>` replace the
+  named header's value with a same-length run of `*`.
+- `sanitizeArg:<name>` masks the value of a request-body argument in place
+  (the bytes after the first `=` in the argument's raw `key=value` segment).
+- `sanitizeMatched` masks whichever variable the rule matched, dispatching to
+  header or argument masking by the matched variable's collection.
+
+Masking is fail-safe — it only ever masks more, never leaks — so it applies
+directly rather than through the staged rollback batch. `sanitizeMatchedBytes`
+(masking only the operator-matched byte sub-range) is not yet implemented.
+
 ## Qualification evidence
 
 - Unit tests in `src/audit.zig` cover each format (serial byte-exactly; the JSON

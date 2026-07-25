@@ -251,7 +251,7 @@
         "src/audit.zig",
         "src/engine.zig"
       ],
-      "notes": "A transaction snapshots into an AuditRecord (identity, connection endpoints, request line, request/response headers from their collections, bodies, status, timestamp, interruption, and part-H rule messages formatted in ModSecurity's RuleMessage::log layout) and serializes via serializeAuditLog in four formats honoring SecAuditLogParts: native serial (pinned to ModSecurity toOldAuditLogFormat), structured JSON and legacy JSON (Coraza schemas), and OCSF v1.2.0 Web Resources Activity (Coraza OCSF formatter). Audit writers (serial/concurrent/syslog/HTTPS, WAF-30) and redaction/telemetry (WAF-31) remain."
+      "notes": "A transaction snapshots into an AuditRecord (identity, connection endpoints, request line, request/response headers from their collections, bodies, status, timestamp, interruption, and part-H rule messages formatted in ModSecurity's RuleMessage::log layout) and serializes via serializeAuditLog in four formats honoring SecAuditLogParts: native serial (pinned to ModSecurity toOldAuditLogFormat), structured JSON and legacy JSON (Coraza schemas), and OCSF v1.2.0 Web Resources Activity (Coraza OCSF formatter). Delivery uses an I/O-free Sink boundary with serial, callback, and ModSecurity concurrent-layout writers (src/audit_writer.zig). Redaction ports the ModSecurity sanitise actions: sanitizeRequestHeader/sanitizeResponseHeader mask header values with same-length '*', sanitizeArg masks an argument value in the request body, and sanitizeMatched masks the matched variable. sanitizeMatchedBytes and the debug-log/Prometheus/OpenTelemetry telemetry (WAF-31) remain."
     },
     {
       "id": "engine.persistent-collections",
