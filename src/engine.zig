@@ -2554,6 +2554,16 @@ pub const Transaction = struct {
         if (rule_index >= plan.rules.len) return null;
         const rule = plan.rules[rule_index];
 
+        // `SecAction` (and any operator-less rule) always matches: it carries no
+        // target/operator, just actions to apply. Return an empty match context
+        // so the effect machinery runs its setvar/ctl/disruptive/flow actions.
+        if (rule.unconditional) return MatchContext{
+            .name = "",
+            .value = "",
+            .source = .{ .origin = .rule, .offset = 0, .length = 0 },
+            .captures = &.{},
+        };
+
         const op_name = plan.string(rule.operator.name) orelse return null;
         // Macro-expand the operator argument (e.g. `@rx %{TX.pattern}`); a
         // macro-free argument expands to its literal bytes.
@@ -3039,6 +3049,9 @@ pub const Transaction = struct {
     }
 
     fn validateMatchContext(self: *const Transaction, context: MatchContext) TransactionError!void {
+        // The empty context is the `SecAction`/unconditional-rule sentinel: no
+        // matched variable, no captures — nothing to validate.
+        if (context.name.len == 0 and context.value.len == 0 and context.captures.len == 0) return;
         if (context.name.len == 0 or context.name.len > self.waf.config.limits.max_match_name_bytes or
             context.value.len > self.waf.config.limits.max_match_value_bytes)
         {
@@ -4802,6 +4815,89 @@ test "evaluatePhase drives CRS-style anomaly scoring across rules" {
         try std.testing.expectEqualStrings("3", (try tx.collectionFirst(.tx, "score")).?.value);
         try std.testing.expect((try tx.intervention()) == null);
     }
+}
+
+test "SecAction applies its setvar effects unconditionally, as CRS init relies on" {
+    // The exact CRS shape: an unconditional `SecAction` seeds `tx.*` scoring
+    // constants, a detection rule increments a score by a macro that references
+    // one of those constants, and a blocking rule trips on the accumulated
+    // total. If `SecAction` did not run, the macro would expand to empty, the
+    // increment would add zero, and nothing would block — which is exactly the
+    // real-CRS false-negative this exercises.
+    const input =
+        \\SecAction "id:900,phase:1,pass,nolog,setvar:tx.critical_score=5,setvar:tx.anomaly=0"
+        \\SecRule ARGS "@detectSQLi" "id:942,phase:1,pass,nolog,capture,t:none,setvar:'tx.anomaly=+%{tx.critical_score}'"
+        \\SecRule TX:anomaly "@ge 5" "id:949,phase:1,deny,status:403,msg:'inbound anomaly'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "secaction.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // SQLi arg → detection fires → tx.anomaly = 0 + 5 = 5 ≥ 5 → blocked.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?id=1%27%20or%20%271%27%3D%271", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        // The SecAction-seeded constant is readable, proving it committed.
+        try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "critical_score")).?.value);
+        try std.testing.expectEqualStrings("5", (try tx.collectionFirst(.tx, "anomaly")).?.value);
+        try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
+    }
+
+    // Benign arg → no detection → tx.anomaly stays 0 → allowed.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?id=hello", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqualStrings("0", (try tx.collectionFirst(.tx, "anomaly")).?.value);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "SecAction honours disruptive and flow actions in rule order" {
+    // A `SecAction deny` must block outright, and a `SecAction skipAfter` must
+    // steer control flow — both are unconditional-rule behaviours CRS uses
+    // (e.g. paranoia-level skips and the 949 blocking stage).
+    const input =
+        \\SecRule ARGS "@rx ping" "id:1,phase:1,pass,nolog,setvar:tx.flag=1"
+        \\SecAction "id:2,phase:1,pass,nolog,skipAfter:END-BLOCK"
+        \\SecRule ARGS "@rx ." "id:3,phase:1,pass,nolog,setvar:tx.reached=1"
+        \\SecMarker "END-BLOCK"
+        \\SecRule TX:flag "@eq 1" "id:4,phase:1,deny,status:403,msg:'reached after skip'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "secaction-flow.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?a=ping", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    // The SecAction's skipAfter jumps over rule 3, so tx.reached is never set;
+    // rule 4 (after the marker) still runs and blocks on the flag rule 1 set.
+    try std.testing.expect((try tx.collectionFirst(.tx, "reached")) == null);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.tx, "flag")).?.value);
+    try std.testing.expectEqual(Intervention.Action.deny, (try tx.intervention()).?.action);
 }
 
 test "evaluatePhase autonomously runs a rule set and blocks a malicious request" {

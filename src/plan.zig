@@ -507,6 +507,9 @@ pub const Rule = struct {
     controls_start: u32,
     controls_count: u32,
     removed_by: ?DirectiveId,
+    /// True for `SecAction`: a rule with no operator or targets that always
+    /// matches and applies its actions in rule order (ModSecurity semantics).
+    unconditional: bool = false,
 };
 
 pub const RuleRemoval = struct {
@@ -987,8 +990,11 @@ const Compiler = struct {
                 const rule = self.rules.items[@backingInt(rule_id.?)];
                 action_range = .{ .start = rule.actions_start, .count = rule.actions_count };
             },
-            .sec_action => action_range = self.addActions(directive.parsed_actions) catch |cause|
-                return self.fail(cause, actionSpan(directive), null),
+            .sec_action => {
+                rule_id = try self.addUnconditionalRule(directive_id, directive);
+                const rule = self.rules.items[@backingInt(rule_id.?)];
+                action_range = .{ .start = rule.actions_start, .count = rule.actions_count };
+            },
             .sec_default_action => {
                 action_range = self.addActions(directive.parsed_actions) catch |cause|
                     return self.fail(cause, actionSpan(directive), null);
@@ -1306,6 +1312,7 @@ const Compiler = struct {
             .controls_start = 0,
             .controls_count = 0,
             .removed_by = null,
+            .unconditional = false,
         });
         if (pending) |previous_id| {
             const previous = &self.rules.items[@backingInt(previous_id)];
@@ -1323,6 +1330,70 @@ const Compiler = struct {
         }
         self.pending_chain = if (hasAction(directive.parsed_actions, "chain")) id else null;
         if (self.pending_chain == null) self.pending_chain_members = 0;
+        return id;
+    }
+
+    /// Compile a `SecAction` as an unconditional rule: it has no operator and no
+    /// targets, always matches, and applies its actions in phase/rule order.
+    /// This mirrors ModSecurity, where `SecAction` is a rule whose disruptive,
+    /// flow (skip/skipAfter), and non-disruptive (setvar/ctl/...) actions run
+    /// unconditionally — the mechanism CRS relies on to initialise `tx.*`
+    /// anomaly-score variables and to drive the blocking-evaluation stage.
+    fn addUnconditionalRule(self: *Compiler, directive_id: DirectiveId, directive: seclang.parser.Directive) CompileError!RuleId {
+        if (self.rules.items.len == self.limits.max_rules) return error.TooManyRules;
+        const targets_start = try typedIndex(self.targets.items.len);
+        const action_range = self.addActions(directive.parsed_actions) catch |cause|
+            return self.fail(cause, actionSpan(directive), null);
+        const id: RuleId = @fromBackingInt(try typedIndex(self.rules.items.len));
+        const parsed_phase = explicitPhase(directive.parsed_actions) catch
+            return self.fail(error.InvalidPhase, actionSpan(directive), null);
+        const phase = parsed_phase orelse 2;
+        const external_id = explicitRuleId(directive.parsed_actions) catch
+            return self.fail(error.InvalidRuleId, actionSpan(directive), null);
+        if (external_id) |value| {
+            if (self.rule_ids.get(value)) |first|
+                return self.fail(error.DuplicateRuleId, actionSpan(directive), first);
+            try self.rule_ids.put(self.allocator, value, directive.physical);
+        }
+        const default_id = self.active_defaults[phase - 1];
+        const empty = try self.interner.intern("");
+        try self.rules.append(self.allocator, .{
+            .directive = directive_id,
+            .source = directive.physical,
+            .external_id = external_id,
+            .phase = phase,
+            .default = default_id,
+            .chain_head = id,
+            .chain_next = null,
+            .chain_position = 0,
+            .targets_start = targets_start,
+            .targets_count = 0,
+            .operator = .{
+                .raw = empty,
+                .name = empty,
+                .parameter = empty,
+                .negated = false,
+                .implicit_regex = false,
+                .prefilter = null,
+                .macro = null,
+            },
+            .actions_start = action_range.start,
+            .actions_count = action_range.count,
+            .transformations_start = 0,
+            .transformations_count = 0,
+            .metadata = .{},
+            .effects_start = 0,
+            .effects_count = 0,
+            .disruptive = .{},
+            .flow = .{},
+            .controls_start = 0,
+            .controls_count = 0,
+            .removed_by = null,
+            .unconditional = true,
+        });
+        if (self.phase_rules[phase - 1].items.len == self.limits.max_rules_per_phase)
+            return error.TooManyRulesInPhase;
+        try self.phase_rules[phase - 1].append(self.allocator, id);
         return id;
     }
 
@@ -2944,15 +3015,18 @@ test "compiled plan owns compact strings rules and source locations" {
     defer compiled.deinit();
 
     try std.testing.expectEqual(@as(usize, 2), compiled.directives.len);
-    try std.testing.expectEqual(@as(usize, 1), compiled.rules.len);
+    // `SecAction pass` now compiles to an unconditional rule (rules[0]); the
+    // `SecRule` follows it (rules[1]).
+    try std.testing.expectEqual(@as(usize, 2), compiled.rules.len);
+    try std.testing.expect(compiled.rules[0].unconditional);
     try std.testing.expectEqual(@as(usize, 2), compiled.targets.len);
     try std.testing.expectEqualStrings("SecRule", compiled.string(compiled.directives[1].name).?);
-    try std.testing.expectEqualStrings("contains", compiled.string(compiled.rules[0].operator.name).?);
+    try std.testing.expectEqualStrings("contains", compiled.string(compiled.rules[1].operator.name).?);
     const source_text = try compiled.sourceSlice(compiled.directives[1].source);
     try std.testing.expectEqualStrings("SecRule", source_text[0..7]);
     const location = try compiled.sourceLocation(compiled.directives[1].source.source, compiled.directives[1].source.start);
     try std.testing.expectEqual(@as(u32, 2), location.line);
-    try std.testing.expectEqual(@as(usize, 1), compiled.phaseRules(2).len);
+    try std.testing.expectEqual(@as(usize, 2), compiled.phaseRules(2).len);
 }
 
 test "source tree compilation inserts children at directive positions" {
