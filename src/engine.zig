@@ -4717,6 +4717,50 @@ test "the sanitizeMatched action masks the matched variable" {
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
 }
 
+test "evaluatePhase survives fuzzed request queries without crashing" {
+    const input =
+        \\SecRule ARGS "@rx (?i)(select|union|drop)\s" "id:1,phase:1,t:lowercase,capture,deny,status:403"
+        \\SecRule ARGS "@detectSQLi" "id:2,phase:1,deny,status:403"
+        \\SecRule ARGS "@pm attack probe malware" "id:3,phase:1,pass,nolog,setvar:'tx.score=+1'"
+        \\SecRule TX:score "@ge 3" "id:100,phase:1,deny,status:403"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "fuzz.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A query-string charset that always survives request-target validation.
+    const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789&=%+.-_/'\"()[]";
+    var prng = std.Random.DefaultPrng.init(0xE7A1_C0DE_9F3B);
+    const random = prng.random();
+    var uri_buf: [320]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 3000) : (iteration += 1) {
+        const prefix = "/x?";
+        @memcpy(uri_buf[0..prefix.len], prefix);
+        const query_len = random.uintLessThan(usize, uri_buf.len - prefix.len);
+        for (uri_buf[prefix.len..][0..query_len]) |*byte| {
+            byte.* = charset[random.uintLessThan(usize, charset.len)];
+        }
+        const uri = uri_buf[0 .. prefix.len + query_len];
+
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443) catch continue;
+        tx.processUri(uri, "GET", "HTTP/1.1") catch continue;
+        tx.processRequestHeaders() catch continue;
+        // The whole execution path — target resolution, transforms, operators,
+        // captures, setvar, chains, disruptive apply — must never crash.
+        tx.evaluatePhase(std.testing.allocator, .request_headers) catch continue;
+        _ = tx.intervention() catch {};
+    }
+}
+
 test "evaluatePhase drives CRS-style anomaly scoring across rules" {
     // A detection rule adds to tx.score; a later rule blocks once the threshold
     // is crossed — the core CRS anomaly-scoring pattern, all inside one phase.
