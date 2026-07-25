@@ -89,6 +89,10 @@ pub const TokenLine = struct {
 
 pub fn tokenize(line: *const LogicalLine, allocator: std.mem.Allocator, limits: Limits) LexerError!TokenLine {
     try limits.validate();
+    // As in the line iterator: a backtick delimits a value only on a line that can
+    // carry a block. Everywhere else — a regex character class, for instance — it is
+    // an ordinary byte.
+    const block_capable = std.ascii.startsWithIgnoreCase(std.mem.trimStart(u8, line.text, " \t"), "SecDataset");
     var tokens: std.ArrayList(Token) = .empty;
     defer tokens.deinit(allocator);
     var token_start: ?usize = null;
@@ -119,7 +123,7 @@ pub fn tokenize(line: *const LogicalLine, allocator: std.mem.Allocator, limits: 
             if (closes) quote = null;
             continue;
         }
-        if (byte == '\'' or byte == '"' or byte == '`') {
+        if (byte == '\'' or byte == '"' or (block_capable and byte == '`')) {
             if (token_start == null) {
                 token_start = index;
                 first_quote = quoteOf(byte);
@@ -252,6 +256,19 @@ pub const LogicalLineIterator = struct {
                 separator_before_continuation = append_end != before_whitespace;
             }
 
+            // Only `SecDataset` takes a block, so only such a line may open one. A
+            // backtick anywhere else is an ordinary byte — OWASP CRS 4.28 has one
+            // inside a regex character class (rule 932370), and treating that as a
+            // block opener swallowed the rest of the rule.
+            const block_capable = blk: {
+                const prefix = "SecDataset";
+                const scan_start = if (text.items.len != 0) text.items else self.input.bytes[content_start..content_end];
+                var index: usize = 0;
+                while (index < scan_start.len and isHorizontalSpace(scan_start[index])) index += 1;
+                const rest_of_line = scan_start[index..];
+                break :blk rest_of_line.len >= prefix.len and std.ascii.eqlIgnoreCase(rest_of_line[0..prefix.len], prefix);
+            };
+
             if (append_end > content_start) {
                 if (segments.items.len == self.limits.max_segments_per_line) return error.TooManyLineSegments;
                 const length = append_end - content_start;
@@ -265,7 +282,7 @@ pub const LogicalLineIterator = struct {
                     },
                 });
                 try text.appendSlice(allocator, self.input.bytes[content_start..append_end]);
-                updateQuoteState(self.input.bytes[content_start..append_end], &active_quote, &quote_escape, &in_block);
+                updateQuoteState(self.input.bytes[content_start..append_end], &active_quote, &quote_escape, if (block_capable) &in_block else null);
             }
             if (has_continuation and separator_before_continuation and active_quote == null and text.items.len != 0) {
                 if (text.items.len == self.limits.max_logical_line_bytes) return error.LogicalLineTooLarge;
@@ -314,14 +331,16 @@ fn isHorizontalSpace(byte: u8) bool {
     return byte == ' ' or byte == '\t';
 }
 
-fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool, in_block: *bool) void {
+/// Track quoting across a line. `in_block` is null for a line that cannot contain a
+/// block, in which case a backtick is an ordinary byte.
+fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool, in_block: ?*bool) void {
     for (bytes) |byte| {
         // Inside a block only a backtick means anything: a quote or a backslash in a
         // dataset entry is data, not syntax.
-        if (in_block.*) {
-            if (byte == '`') in_block.* = false;
+        if (in_block) |flag| if (flag.*) {
+            if (byte == '`') flag.* = false;
             continue;
-        }
+        };
         if (escaped.*) {
             escaped.* = false;
             continue;
@@ -335,7 +354,7 @@ fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool, in_bl
         } else if (byte == '\'' or byte == '"') {
             active_quote.* = byte;
         } else if (byte == '`') {
-            in_block.* = true;
+            if (in_block) |flag| flag.* = true;
         }
     }
 }
@@ -478,4 +497,35 @@ test "a backtick outside a block still tokenizes as a delimiter" {
     defer token_line.deinit();
     try std.testing.expectEqual(@as(usize, 3), token_line.tokens.len);
     try std.testing.expectEqual(Quote.backtick, token_line.tokens[2].quote);
+}
+
+test "a backtick outside a dataset line is an ordinary byte" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    // OWASP CRS 4.28 rule 932370 carries a backtick inside a regex character class,
+    // and its rule continues across several lines. Treating that backtick as a
+    // block opener swallowed the continuation and broke the whole file.
+    const id = try registry.add(
+        "crs.conf",
+        "SecRule ARGS \"@rx (?:[\\n\\r;`\\{]|\\|\\|?)\" \\\n    \"id:932370,phase:2,block\"\nSecAction pass",
+        null,
+    );
+    var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
+    var rule = (try iterator.next(std.testing.allocator)).?;
+    defer rule.deinit();
+    // The continuation joined, so the actions are part of the same directive.
+    try std.testing.expect(std.mem.indexOf(u8, rule.text, "id:932370") != null);
+
+    var token_line = try tokenize(&rule, std.testing.allocator, .{});
+    defer token_line.deinit();
+    try std.testing.expectEqual(@as(usize, 4), token_line.tokens.len);
+    try std.testing.expectEqualStrings("SecRule", token_line.tokens[0].raw);
+    // The operator stayed one double-quoted token, backtick and all.
+    try std.testing.expectEqual(Quote.double, token_line.tokens[2].quote);
+    try std.testing.expect(std.mem.indexOfScalar(u8, token_line.tokens[2].raw, '`') != null);
+
+    // And the line after it is still its own directive rather than block content.
+    var following = (try iterator.next(std.testing.allocator)).?;
+    defer following.deinit();
+    try std.testing.expectEqualStrings("SecAction pass", following.text);
 }

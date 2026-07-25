@@ -9,6 +9,7 @@ const rule_config = @import("rule_config.zig");
 const remote_rules = @import("remote_rules.zig");
 const regex = @import("regex");
 const transformation_registry = @import("transformations.zig");
+const operator_registry = @import("operators.zig");
 
 pub const StringId = enum(u32) { _ };
 pub const DirectiveId = enum(u32) { _ };
@@ -189,6 +190,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     /// An action neither baseline implements, which is rejected rather than
     /// accepted and ignored — see `isUnimplementedAction`.
     UnimplementedAction,
+    /// An operator name nothing can evaluate. Compiling it would leave a rule that
+    /// never matches — see `isImplementedOperator`.
+    UnknownOperator,
 };
 
 /// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
@@ -1417,6 +1421,8 @@ const Compiler = struct {
         const default_id = self.active_defaults[phase - 1];
         const transformation_range = self.addTransformations(default_id, action_range) catch |cause|
             return self.fail(cause, actionSpan(directive), null);
+        if (!isImplementedOperator(parsed_operator.name))
+            return self.fail(error.UnknownOperator, directive.operator().?.physical, null);
         const prefilter = try self.addPrefilter(parsed_operator);
         const operator_macro = self.addMacro(unquote(parsed_operator.parameter)) catch |cause|
             return self.fail(cause, directive.operator().?.physical, null);
@@ -2908,6 +2914,32 @@ fn isUnimplementedAction(name: []const u8) bool {
         "sanitizeMatchedBytes", "sanitiseMatchedBytes",
         "append",               "prepend",
         "pause",
+    });
+}
+
+/// Whether an operator name resolves to something that can actually evaluate.
+///
+/// An operator this list does not name would compile, run, and never match, so a
+/// rule built on a typo — or on an operator zig-waf has not implemented — would sit
+/// in a ruleset looking like coverage while detecting nothing. That is the worst
+/// possible failure for a security control, so an unrecognized operator is a
+/// compile error instead. ModSecurity likewise refuses operators it does not
+/// implement rather than accepting them.
+///
+/// An empty name is `@rx`, the SecLang default.
+fn isImplementedOperator(raw_name: []const u8) bool {
+    const name = if (raw_name.len != 0 and raw_name[0] == '@') raw_name[1..] else raw_name;
+    if (name.len == 0) return true;
+    if (operator_registry.resolve(name) != null) return true;
+    if (operator_registry.resolveIdentity(name) != null) return true;
+    if (operator_registry.resolveValidation(name) != null) return true;
+    return equalsAny(name, &.{
+        "rx",              "rxGlobal",           "rsub",
+        "detectSQLi",      "detectXSS",          "validateByteRange",
+        "pm",              "pmf",                "pmFromFile",
+        "pmFromDataset",   "ipMatch",            "ipMatchF",
+        "ipMatchFromFile", "ipMatchFromDataset", "unconditionalMatch",
+        "noMatch",
     });
 }
 
