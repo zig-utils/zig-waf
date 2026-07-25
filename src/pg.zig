@@ -58,6 +58,7 @@ pub const Conn = struct {
         defer c.PQclear(result);
         if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.QueryFailed;
         if (c.PQntuples(result) == 0 or c.PQnfields(result) == 0) return null;
+        if (c.PQgetisnull(result, 0, 0) != 0) return null; // SQL NULL, not an empty string
         const value = c.PQgetvalue(result, 0, 0);
         return try allocator.dupe(u8, std.mem.span(value));
     }
@@ -87,6 +88,7 @@ pub const Conn = struct {
         defer c.PQclear(result);
         if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.QueryFailed;
         if (c.PQntuples(result) == 0 or c.PQnfields(result) == 0) return null;
+        if (c.PQgetisnull(result, 0, 0) != 0) return null; // SQL NULL, not an empty string
         return try allocator.dupe(u8, std.mem.span(c.PQgetvalue(result, 0, 0)));
     }
 
@@ -322,6 +324,14 @@ test "connects and runs a scalar query" {
     const value = (try conn.queryScalar(testing.allocator, "SELECT 1 + 1")).?;
     defer testing.allocator.free(value);
     try testing.expectEqualStrings("2", value);
+
+    // A SQL NULL result is reported as null — distinct from an empty string, so
+    // callers can tell "no value" from "the value is the empty string".
+    try testing.expect((try conn.queryScalar(testing.allocator, "SELECT NULL::text")) == null);
+    const empty = (try conn.queryScalarParams(testing.allocator, "SELECT $1::text", &.{""})).?;
+    defer testing.allocator.free(empty);
+    try testing.expectEqualStrings("", empty);
+    try testing.expect((try conn.queryScalarParams(testing.allocator, "SELECT NULLIF($1::text, 'x')", &.{"x"})) == null);
 }
 
 test "migrations apply once, are idempotent, and are transactional" {
