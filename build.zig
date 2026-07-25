@@ -134,6 +134,30 @@ pub fn build(b: *std.Build) void {
     const pg_test_step = b.step("pg-test", "Run PostgreSQL integration tests (needs PG_TEST_DSN)");
     pg_test_step.dependOn(&run_pg_tests.step);
 
+    // SQLite embedded backend (#57): an in-process, serverless store mirroring
+    // the PostgreSQL client for single-node deployments and dependency-free
+    // tests. Kept out of the default `test` step (it links libsqlite3); run it
+    // with `zig build sqlite-test`. libsqlite3 resolves from the platform SDK.
+    const sqlite_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/sqlite_c.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const sqlite_c_module = sqlite_translate.createModule();
+    const sqlite_module = b.createModule(.{
+        .root_source_file = b.path("src/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sqlite_module.addImport("sqlite3", sqlite_c_module);
+    sqlite_module.linkSystemLibrary("sqlite3", .{});
+    const sqlite_tests = b.addTest(.{ .root_module = sqlite_module });
+    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
+    const sqlite_test_step = b.step("sqlite-test", "Run SQLite backend tests");
+    sqlite_test_step.dependOn(&run_sqlite_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
