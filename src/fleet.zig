@@ -94,9 +94,39 @@ pub const EventRepository = struct {
         );
     }
 
+    /// Record an event at an explicit time — used by ingestion replay and by
+    /// retention tests. `occurred_at` is any value libpq accepts for timestamptz
+    /// (e.g. "2020-01-01T00:00:00Z" or "now() - interval '40 days'" is NOT valid
+    /// here — pass a literal timestamp).
+    pub fn recordAt(self: EventRepository, node_id: [:0]const u8, occurred_at: [:0]const u8, action: [:0]const u8, uri: [:0]const u8, message: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            "INSERT INTO security_events (node_id, occurred_at, action, uri, message) VALUES ($1, $2, $3, $4, $5)",
+            &.{ node_id, occurred_at, action, uri, message },
+        );
+    }
+
     /// How many events a node has recorded (caller frees the text count).
     pub fn countForNode(self: EventRepository, allocator: std.mem.Allocator, node_id: [:0]const u8) pg.Error!?[]u8 {
         return self.conn.queryScalarParams(allocator, "SELECT count(*) FROM security_events WHERE node_id = $1", &.{node_id});
+    }
+
+    /// Delete events older than `retention_days` (retention policy #56). Returns
+    /// the number of rows deleted (caller frees the text count).
+    pub fn pruneOlderThan(self: EventRepository, allocator: std.mem.Allocator, retention_days: u32) pg.Error!?[]u8 {
+        var days_buffer: [16]u8 = undefined;
+        const days = std.fmt.bufPrint(&days_buffer, "{d}", .{retention_days}) catch return error.QueryFailed;
+        days_buffer[days.len] = 0;
+        // make_interval(days => $1::int) keeps the interval parameterized.
+        return self.conn.queryScalarParams(
+            allocator,
+            \\WITH deleted AS (
+            \\  DELETE FROM security_events
+            \\  WHERE occurred_at < now() - make_interval(days => $1::int)
+            \\  RETURNING 1
+            \\) SELECT count(*) FROM deleted
+        ,
+            &.{days_buffer[0..days.len :0]},
+        );
     }
 };
 
@@ -180,6 +210,37 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+}
+
+test "event retention prunes only events past the window" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const events = EventRepository{ .conn = &conn };
+    const node_id = "33333333-3333-3333-3333-333333333333";
+    try events.record(node_id, "deny", "/recent", "kept"); // occurred now()
+    try events.recordAt(node_id, "2020-01-01T00:00:00Z", "deny", "/old", "aged out");
+
+    // Prune everything older than 30 days: the 2020 event goes, the recent stays.
+    const deleted = (try events.pruneOlderThan(testing.allocator, 30)).?;
+    defer testing.allocator.free(deleted);
+    try testing.expectEqualStrings("1", deleted);
+    const remaining = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(remaining);
+    try testing.expectEqualStrings("1", remaining);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
