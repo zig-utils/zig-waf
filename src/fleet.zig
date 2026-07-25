@@ -100,6 +100,41 @@ pub const EventRepository = struct {
     }
 };
 
+/// Store and retrieve versioned rule-set bundles that are rolled out to nodes
+/// (#54). Each (name, version) is immutable once published; nodes fetch the
+/// latest, and a rollback re-selects an earlier version.
+pub const RulesetRepository = struct {
+    conn: *pg.Conn,
+
+    /// Publish a new immutable bundle version. Re-publishing an existing
+    /// (name, version) is a conflict (QueryFailed) — versions never change.
+    pub fn publish(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, content: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            "INSERT INTO rulesets (name, version, content) VALUES ($1, $2, $3)",
+            &.{ name, version, content },
+        );
+    }
+
+    /// The content of the highest-numbered version of `name` (caller frees), or
+    /// null if the ruleset has never been published.
+    pub fn latest(self: RulesetRepository, allocator: std.mem.Allocator, name: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT content FROM rulesets WHERE name = $1 ORDER BY version DESC LIMIT 1",
+            &.{name},
+        );
+    }
+
+    /// The content of a specific version (for rollout/rollback), or null.
+    pub fn atVersion(self: RulesetRepository, allocator: std.mem.Allocator, name: [:0]const u8, version: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT content FROM rulesets WHERE name = $1 AND version = $2",
+            &.{ name, version },
+        );
+    }
+};
+
 // ---- tests --------------------------------------------------------------
 
 const testing = std.testing;
@@ -145,6 +180,42 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+}
+
+test "ruleset repository publishes immutable versions and rolls back" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const rulesets = RulesetRepository{ .conn = &conn };
+    try rulesets.publish("crs", "1", "SecRuleEngine On # v1");
+    try rulesets.publish("crs", "2", "SecRuleEngine On # v2");
+
+    // latest() returns the highest version.
+    const latest = (try rulesets.latest(testing.allocator, "crs")).?;
+    defer testing.allocator.free(latest);
+    try testing.expectEqualStrings("SecRuleEngine On # v2", latest);
+
+    // A specific earlier version is retrievable (rollback).
+    const v1 = (try rulesets.atVersion(testing.allocator, "crs", "1")).?;
+    defer testing.allocator.free(v1);
+    try testing.expectEqualStrings("SecRuleEngine On # v1", v1);
+
+    // Versions are immutable: re-publishing (name, version) conflicts.
+    try testing.expectError(error.QueryFailed, rulesets.publish("crs", "2", "tampered"));
+    try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
