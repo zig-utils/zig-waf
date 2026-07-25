@@ -240,6 +240,10 @@ pub fn migrate(conn: *Conn, allocator: std.mem.Allocator, migrations: []const Mi
 
 const testing = std.testing;
 
+test {
+    _ = @import("fleet_sqlite.zig");
+}
+
 test "connection runs statements, bound params, and scalar reads" {
     var conn = try Conn.openMemory();
     defer conn.close();
