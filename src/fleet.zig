@@ -147,6 +147,22 @@ pub const migrations = [_]pg.Migration{
         // authenticity. NULL means the webhook is delivered unsigned.
         .sql = "ALTER TABLE alert_rules ADD COLUMN secret text",
     },
+    .{
+        .version = 7,
+        .name = "event_idempotency_keys",
+        // A node-assigned idempotency key per event (#55). A node that never
+        // received the acknowledgement for a drained batch re-sends it; the
+        // unique key makes the re-ingestion a no-op instead of a duplicate.
+        // A partitioned table's unique index must include the partition column,
+        // so the key is (event_key, occurred_at) — which is exactly the identity
+        // of a replayed event, since the node stamps occurred_at before queuing.
+        // NULL keys are distinct in PostgreSQL, so events without a key (the
+        // legacy path) still insert unconditionally.
+        .sql =
+        \\ALTER TABLE security_events ADD COLUMN event_key text;
+        \\CREATE UNIQUE INDEX security_events_key_idx ON security_events (event_key, occurred_at);
+        ,
+    },
 };
 
 /// The hex HMAC-SHA256 signature of `payload` under `secret` (#59). Receivers
@@ -248,6 +264,12 @@ pub const Event = struct {
     action: [:0]const u8,
     uri: [:0]const u8,
     message: [:0]const u8,
+    /// The node's idempotency key for this event (#55) — any value unique to the
+    /// event on that node, e.g. a transaction id. When set, re-ingesting the same
+    /// key at the same `occurred_at` is silently skipped rather than duplicated,
+    /// so a node may safely re-send a batch it never saw acknowledged. null means
+    /// "no key": the event is always inserted.
+    key: ?[:0]const u8 = null,
 };
 
 /// Ingestion and per-node counts for the security-event stream (#55/#56).
@@ -258,18 +280,26 @@ pub const EventRepository = struct {
     /// fsync) covers the whole batch, which is how a drained event queue reaches
     /// PostgreSQL efficiently. The batch is all-or-nothing — any failure rolls
     /// the whole batch back.
-    pub fn recordBatch(self: EventRepository, batch: []const Event) pg.Error!void {
+    ///
+    /// Ingestion is idempotent: an event carrying a `key` that was already
+    /// ingested at the same `occurred_at` is skipped, so a node that re-sends an
+    /// unacknowledged batch does not duplicate events. Returns the number of
+    /// events actually inserted; `batch.len` minus that is the number deduplicated.
+    pub fn recordBatch(self: EventRepository, batch: []const Event) pg.Error!usize {
         try self.conn.exec("BEGIN");
+        var inserted: usize = 0;
         for (batch) |event| {
-            self.conn.execParams(
-                "INSERT INTO security_events (node_id, occurred_at, action, uri, message) VALUES ($1, $2, $3, $4, $5)",
-                &.{ event.node_id, event.occurred_at, event.action, event.uri, event.message },
-            ) catch |err| {
+            inserted += self.conn.execParamsOptCount(
+                \\INSERT INTO security_events (node_id, occurred_at, action, uri, message, event_key)
+                \\VALUES ($1, $2, $3, $4, $5, $6)
+                \\ON CONFLICT (event_key, occurred_at) DO NOTHING
+            , &.{ event.node_id, event.occurred_at, event.action, event.uri, event.message, event.key }) catch |err| {
                 self.conn.exec("ROLLBACK") catch {};
                 return err;
             };
         }
         try self.conn.exec("COMMIT");
+        return inserted;
     }
 
     pub fn record(self: EventRepository, node_id: [:0]const u8, action: [:0]const u8, uri: [:0]const u8, message: [:0]const u8) pg.Error!void {
@@ -457,7 +487,7 @@ pub const EventSpool = struct {
             .uri = owned.uri,
             .message = owned.message,
         };
-        try repository.recordBatch(batch); // kept on failure — nothing freed yet
+        _ = try repository.recordBatch(batch); // kept on failure — nothing freed yet
         const drained = self.events.items.len;
         for (self.events.items) |*event| event.deinit(self.allocator);
         self.events.clearRetainingCapacity();
@@ -1041,7 +1071,7 @@ test "batched event ingestion commits the whole batch atomically" {
         .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:01Z", .action = "deny", .uri = "/b", .message = "2" },
         .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:02Z", .action = "pass", .uri = "/c", .message = "3" },
     };
-    try events.recordBatch(&batch);
+    try testing.expectEqual(@as(usize, 3), try events.recordBatch(&batch));
     const count = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("3", count);
@@ -1055,6 +1085,54 @@ test "batched event ingestion commits the whole batch atomically" {
     const after = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(after);
     try testing.expectEqualStrings("3", after); // unchanged — the good row rolled back too
+}
+
+test "keyed event ingestion is idempotent across a re-sent batch" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const events = EventRepository{ .conn = conn };
+    const node_id = "55555555-5555-5555-5555-555555555555";
+    const batch = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "2024-03-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "1", .key = "txn-1" },
+        .{ .node_id = node_id, .occurred_at = "2024-03-01T00:00:01Z", .action = "deny", .uri = "/b", .message = "2", .key = "txn-2" },
+    };
+    try testing.expectEqual(@as(usize, 2), try events.recordBatch(&batch));
+
+    // The node never saw the acknowledgement and re-sends the same batch: every
+    // event is recognized by its key and skipped, so nothing is duplicated.
+    try testing.expectEqual(@as(usize, 0), try events.recordBatch(&batch));
+
+    // A re-send that also carries new events ingests only the new ones.
+    const overlapping = [_]Event{
+        batch[1],
+        .{ .node_id = node_id, .occurred_at = "2024-03-01T00:00:02Z", .action = "pass", .uri = "/c", .message = "3", .key = "txn-3" },
+    };
+    try testing.expectEqual(@as(usize, 1), try events.recordBatch(&overlapping));
+
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("3", count);
+
+    // Keyless events carry no identity, so they are always ingested — two
+    // otherwise-identical unkeyed events are two events.
+    const unkeyed = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "2024-03-02T00:00:00Z", .action = "deny", .uri = "/d", .message = "4" },
+        .{ .node_id = node_id, .occurred_at = "2024-03-02T00:00:00Z", .action = "deny", .uri = "/d", .message = "4" },
+    };
+    try testing.expectEqual(@as(usize, 2), try events.recordBatch(&unkeyed));
+
+    // The same key at a different occurred_at is a different event: the key
+    // deduplicates a replay, not two genuine events that share a transaction id.
+    const later = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "2024-03-03T00:00:00Z", .action = "deny", .uri = "/a", .message = "5", .key = "txn-1" },
+    };
+    try testing.expectEqual(@as(usize, 1), try events.recordBatch(&later));
+
+    const total = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(total);
+    try testing.expectEqualStrings("6", total);
 }
 
 test "ruleset repository publishes immutable versions and rolls back" {

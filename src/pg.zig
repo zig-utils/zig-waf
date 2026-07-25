@@ -95,6 +95,25 @@ pub const Conn = struct {
         }
     }
 
+    /// Like `execParamsOpt`, but returns how many rows the statement actually
+    /// affected (libpq's command tuples). This is how an idempotent
+    /// `INSERT ... ON CONFLICT DO NOTHING` reports whether the row was new: 1 for
+    /// an insert, 0 when an existing row already carried the same key.
+    pub fn execParamsOptCount(self: *Conn, sql: [:0]const u8, params: []const ?[:0]const u8) Error!usize {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = if (param) |p| p.ptr else null;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0);
+        defer c.PQclear(result);
+        switch (c.PQresultStatus(result)) {
+            c.PGRES_COMMAND_OK, c.PGRES_TUPLES_OK => {},
+            else => return error.QueryFailed,
+        }
+        const tuples = std.mem.span(c.PQcmdTuples(result));
+        if (tuples.len == 0) return 0; // not a row-affecting command
+        return std.fmt.parseInt(usize, tuples, 10) catch error.QueryFailed;
+    }
+
     /// Like `queryScalar`, but with text-format bind parameters.
     pub fn queryScalarParams(self: *Conn, allocator: std.mem.Allocator, sql: [:0]const u8, params: []const [:0]const u8) Error!?[]u8 {
         if (params.len > max_params) return error.QueryFailed;
