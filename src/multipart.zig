@@ -269,6 +269,56 @@ pub fn scanAnomalies(body: []const u8, boundary: []const u8, anomalies: *Anomali
     }
 }
 
+/// The longest safe filename `safeFileName` will produce, leaving room for a
+/// connector's own prefix within a typical 255-byte filesystem limit.
+pub const max_safe_filename = 128;
+
+/// Reduce an uploaded part's `filename` to something safe to use as a *name*
+/// (#26). The result contains only ASCII letters, digits, dot, dash, and
+/// underscore; never a path separator, never a leading dot, and never empty.
+///
+/// A multipart filename is attacker-controlled and is not a path, however much it
+/// looks like one. `../../etc/crontab`, `C:\windows\system32\x`, and a name
+/// containing a NUL are all things clients send, and a connector that joins one to
+/// an upload directory writes wherever the client chose. This exists so a connector
+/// never has to decide how to make one safe, and so the answer is the same
+/// everywhere. The original filename is still published verbatim in FILES_NAMES,
+/// because rules must see what was actually sent.
+///
+/// Returns the safe name written into `out`, which must be at least
+/// `max_safe_filename` bytes.
+pub fn safeFileName(filename: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= max_safe_filename);
+    // Take the last path component under either separator, so a traversal prefix
+    // is discarded rather than escaped.
+    var base = filename;
+    if (std.mem.lastIndexOfAny(u8, base, "/\\")) |index| base = base[index + 1 ..];
+
+    var written: usize = 0;
+    for (base) |byte| {
+        if (written == max_safe_filename) break;
+        const keep = switch (byte) {
+            'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => true,
+            else => false,
+        };
+        // Anything else — including NUL, spaces, and control bytes — becomes an
+        // underscore rather than being dropped, so two distinct names cannot
+        // collapse into one by deletion alone.
+        out[written] = if (keep) byte else '_';
+        // A leading dot would make the file hidden, and a name that is only dots is
+        // a directory reference.
+        if (written == 0 and out[written] == '.') out[written] = '_';
+        written += 1;
+    }
+    if (written == 0) {
+        // An empty or fully stripped name still needs to be a name.
+        const fallback = "upload";
+        @memcpy(out[0..fallback.len], fallback);
+        return out[0..fallback.len];
+    }
+    return out[0..written];
+}
+
 /// Whether a part's raw header block uses obsolete line folding — a continuation
 /// line starting with space or tab. Parsers differ on whether the folded value
 /// belongs to the previous header, which is exactly the ambiguity worth flagging.
@@ -678,4 +728,42 @@ test "random bytes never crash the reader and yield only borrowed slices" {
             }
         }
     }
+}
+
+test "an uploaded filename is reduced to something safe to use as a name" {
+    var buffer: [max_safe_filename]u8 = undefined;
+
+    // Ordinary names survive.
+    try std.testing.expectEqualStrings("photo.jpg", safeFileName("photo.jpg", &buffer));
+    try std.testing.expectEqualStrings("my-file_1.tar.gz", safeFileName("my-file_1.tar.gz", &buffer));
+
+    // Traversal and absolute paths lose everything but the last component, under
+    // either separator, so joining the result to an upload directory cannot escape
+    // it.
+    try std.testing.expectEqualStrings("crontab", safeFileName("../../etc/crontab", &buffer));
+    try std.testing.expectEqualStrings("passwd", safeFileName("/etc/passwd", &buffer));
+    try std.testing.expectEqualStrings("x", safeFileName("C:\\windows\\system32\\x", &buffer));
+
+    // A NUL, control bytes, spaces, and shell metacharacters become underscores
+    // rather than being dropped, so two distinct names cannot collapse into one.
+    try std.testing.expectEqualStrings("a_b", safeFileName("a\x00b", &buffer));
+    try std.testing.expectEqualStrings("a_b_c", safeFileName("a b;c", &buffer));
+    // A shell-injection attempt containing a separator keeps only what follows the
+    // last one, which is stricter still.
+    try std.testing.expectEqualStrings("_", safeFileName("$(rm -rf /)", &buffer));
+    try std.testing.expectEqualStrings("__rm_-rf_", safeFileName("$(rm -rf)", &buffer));
+
+    // A leading dot would hide the file; a name of only dots is a directory
+    // reference.
+    try std.testing.expectEqualStrings("_bashrc", safeFileName(".bashrc", &buffer));
+    try std.testing.expectEqualStrings("_.", safeFileName("..", &buffer));
+
+    // Nothing usable still yields a name.
+    try std.testing.expectEqualStrings("upload", safeFileName("", &buffer));
+    try std.testing.expectEqualStrings("upload", safeFileName("/", &buffer));
+
+    // And the result is bounded, whatever the client sent.
+    var long: [500]u8 = @splat('a');
+    const bounded = safeFileName(&long, &buffer);
+    try std.testing.expectEqual(@as(usize, max_safe_filename), bounded.len);
 }
