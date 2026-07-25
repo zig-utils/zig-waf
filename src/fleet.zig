@@ -7,6 +7,7 @@ const std = @import("std");
 /// The libpq client this schema and its repositories are built on, re-exported
 /// so a caller of `fleet` needs only one import.
 pub const pg = @import("pg.zig");
+const zstd = @import("zstd");
 
 /// Every fleet migration, in version order. Append-only.
 pub const migrations = [_]pg.Migration{
@@ -594,11 +595,13 @@ pub const EventSpool = struct {
     // ---- crash durability (#55) ----------------------------------------
     //
     // The queue is snapshotted to a single file so a crash or restart loses at
-    // most the events enqueued since the last `persist`. The format is
-    // self-describing and length-prefixed: a magic, a format version, a u32 event
-    // count, then per event five (u32 length, bytes) fields and a presence-flagged
-    // idempotency key, all little-endian. `restore` bounds every read against the
-    // file so a truncated or corrupt snapshot is rejected rather than trusted.
+    // most the events enqueued since the last `persist`. The file is a plaintext
+    // header — a magic and a format version, so a restore knows what it is looking
+    // at before spending work on the body — followed by a Zstandard frame holding
+    // the events: a u32 count, then per event five (u32 length, bytes) fields and a
+    // presence-flagged idempotency key, all little-endian. `restore` bounds every
+    // read against the decoded body, so a truncated or corrupt snapshot is
+    // rejected rather than trusted.
     //
     // A restart is exactly when a node is upgraded, so the version that finds a
     // pending snapshot is often not the one that wrote it: snapshots written
@@ -607,7 +610,10 @@ pub const EventSpool = struct {
 
     /// Identifies a snapshot carrying the header the first format lacked.
     const snapshot_magic = "WAFSPOOL";
-    const snapshot_version: u32 = 2;
+    /// Version 2 stores the events verbatim; version 3 stores the same encoding
+    /// compressed. Both are read, so an upgrade never discards a pending queue.
+    const snapshot_version_plain: u32 = 2;
+    const snapshot_version_compressed: u32 = 3;
 
     /// A generous ceiling on a snapshot we will read back, guarding against a
     /// corrupt or hostile length header claiming a huge file.
@@ -621,8 +627,6 @@ pub const EventSpool = struct {
     pub fn persist(self: *const EventSpool, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) error{ OutOfMemory, WriteFailed }!void {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
-        try buffer.appendSlice(self.allocator, snapshot_magic);
-        try appendU32(&buffer, self.allocator, snapshot_version);
         try appendU32(&buffer, self.allocator, @intCast(self.events.items.len));
         for (self.events.items) |event| {
             inline for (.{ event.node_id, event.occurred_at, event.action, event.uri, event.message }) |field| {
@@ -637,7 +641,21 @@ pub const EventSpool = struct {
                 try buffer.appendSlice(self.allocator, key);
             }
         }
-        dir.writeFile(io, .{ .sub_path = sub_path, .data = buffer.items }) catch return error.WriteFailed;
+        // The header stays readable without decompressing anything, so a restore
+        // knows which format it is looking at before it spends work on the body.
+        const frame = zstd.compress(self.allocator, buffer.items, zstd.default_level) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            // Compression itself has no failure mode over a valid input buffer;
+            // report anything else as the write failure it would become.
+            else => return error.WriteFailed,
+        };
+        defer self.allocator.free(frame);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, snapshot_magic);
+        try appendU32(&out, self.allocator, snapshot_version_compressed);
+        try out.appendSlice(self.allocator, frame);
+        dir.writeFile(io, .{ .sub_path = sub_path, .data = out.items }) catch return error.WriteFailed;
     }
 
     /// Reload a snapshot written by `persist` into this (expected empty) queue.
@@ -650,28 +668,45 @@ pub const EventSpool = struct {
             else => return error.ReadFailed,
         };
         defer self.allocator.free(bytes);
-        var cursor: usize = 0;
+
         // No magic means a snapshot from before keys were carried; its events
         // restore without one.
         const keyed = std.mem.startsWith(u8, bytes, snapshot_magic);
+        var cursor: usize = if (keyed) snapshot_magic.len else 0;
+        var body = bytes;
+        var decompressed: ?[]u8 = null;
+        defer if (decompressed) |owned| self.allocator.free(owned);
         if (keyed) {
-            cursor = snapshot_magic.len;
-            if (try readU32(bytes, &cursor) != snapshot_version) return error.CorruptSnapshot;
+            switch (try readU32(bytes, &cursor)) {
+                snapshot_version_plain => {},
+                snapshot_version_compressed => {
+                    const owned = zstd.decompress(self.allocator, bytes[cursor..], max_snapshot_bytes) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        // A frame that is not the frame it claims to be, or that
+                        // declares more than a snapshot may hold, is corrupt.
+                        error.CorruptFrame, error.FrameTooLarge, error.UnknownContentSize => return error.CorruptSnapshot,
+                    };
+                    decompressed = owned;
+                    body = owned;
+                    cursor = 0;
+                },
+                else => return error.CorruptSnapshot,
+            }
         }
-        const count = try readU32(bytes, &cursor);
+        const count = try readU32(body, &cursor);
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            const node_id = try readField(bytes, &cursor);
-            const occurred_at = try readField(bytes, &cursor);
-            const action = try readField(bytes, &cursor);
-            const uri = try readField(bytes, &cursor);
-            const message = try readField(bytes, &cursor);
-            const key = if (keyed) try readOptionalField(bytes, &cursor) else null;
+            const node_id = try readField(body, &cursor);
+            const occurred_at = try readField(body, &cursor);
+            const action = try readField(body, &cursor);
+            const uri = try readField(body, &cursor);
+            const message = try readField(body, &cursor);
+            const key = if (keyed) try readOptionalField(body, &cursor) else null;
             try self.enqueueRaw(node_id, occurred_at, action, uri, message, key);
         }
         // Trailing bytes after the declared events mean the snapshot is not what
         // it claims — reject rather than silently ignore the tail.
-        if (cursor != bytes.len) return error.CorruptSnapshot;
+        if (cursor != body.len) return error.CorruptSnapshot;
     }
 
     fn appendU32(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) error{OutOfMemory}!void {
@@ -1347,6 +1382,64 @@ test "COPY ingestion round-trips awkward fields and deduplicates by key" {
     try testing.expectEqual(@as(usize, 1), try events.recordBatchCopy(testing.allocator, &.{
         .{ .node_id = node_id, .occurred_at = "2024-05-02T00:00:00Z", .action = "deny", .uri = "/f", .message = "after failure", .key = "copy-4" },
     }));
+}
+
+test "a snapshot is compressed, and an uncompressed one still restores" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A node buffering events during an outage queues many that differ only in
+    // their query string — the redundancy compression exists to remove.
+    var raw_bytes: usize = 0;
+    {
+        var spool = EventSpool.init(testing.allocator, 512);
+        defer spool.deinit();
+        var buffer: [64]u8 = undefined;
+        for (0..200) |index| {
+            const uri = try std.fmt.bufPrint(&buffer, "/search?q={d}", .{index});
+            buffer[uri.len] = 0;
+            try spool.enqueue(.{
+                .node_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                .occurred_at = "2024-09-01T00:00:00Z",
+                .action = "deny",
+                .uri = buffer[0..uri.len :0],
+                .message = "SQL injection detected",
+            });
+        }
+        for (spool.events.items) |event| {
+            raw_bytes += event.node_id.len + event.occurred_at.len + event.action.len + event.uri.len + event.message.len;
+        }
+        try spool.persist(io, tmp.dir, "compressed.bin");
+    }
+
+    const stat = try tmp.dir.statFile(io, "compressed.bin", .{});
+    try testing.expect(stat.size * 4 < raw_bytes);
+
+    var recovered = EventSpool.init(testing.allocator, 512);
+    defer recovered.deinit();
+    try recovered.restore(io, tmp.dir, "compressed.bin");
+    try testing.expectEqual(@as(usize, 200), recovered.len());
+    try testing.expectEqualStrings("/search?q=199", recovered.events.items[199].uri);
+
+    // A snapshot written before the body was compressed declares version 2 and
+    // stores the events verbatim. A node upgrading with a pending queue must still
+    // recover it, so that format is read as well.
+    const plain: []const u8 = "WAFSPOOL" ++ &([_]u8{ 2, 0, 0, 0 } ++ // version 2, plaintext body
+        [_]u8{ 1, 0, 0, 0 } ++ // one event
+        [_]u8{ 4, 0, 0, 0 } ++ "node".* ++
+        [_]u8{ 1, 0, 0, 0 } ++ "t".* ++
+        [_]u8{ 4, 0, 0, 0 } ++ "deny".* ++
+        [_]u8{ 2, 0, 0, 0 } ++ "/p".* ++
+        [_]u8{ 5, 0, 0, 0 } ++ "plain".* ++
+        [_]u8{1} ++ [_]u8{ 3, 0, 0, 0 } ++ "key".*);
+    try tmp.dir.writeFile(io, .{ .sub_path = "plain.bin", .data = plain });
+    var from_plain = EventSpool.init(testing.allocator, 8);
+    defer from_plain.deinit();
+    try from_plain.restore(io, tmp.dir, "plain.bin");
+    try testing.expectEqual(@as(usize, 1), from_plain.len());
+    try testing.expectEqualStrings("plain", from_plain.events.items[0].message);
+    try testing.expectEqualStrings("key", from_plain.events.items[0].key.?);
 }
 
 test "a drain at the threshold ingests through COPY" {
