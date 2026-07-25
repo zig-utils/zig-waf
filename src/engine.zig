@@ -7263,3 +7263,52 @@ test "URLENCODED_ERROR reports a malformed escape in the query or body" {
         try std.testing.expectEqual(@as(u16, 400), (try tx.intervention()).?.status);
     }
 }
+
+test "duplicate and conflicting request headers stay visible to rules" {
+    // A WAF's job with request smuggling is visibility: the proxy decides whether to
+    // reject, but a rule can only detect a duplicated Host or a Content-Length paired
+    // with Transfer-Encoding if every header reaches the collection. Collapsing
+    // duplicates would hide exactly the requests worth catching.
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("Host", "example.com");
+    try tx.addRequestHeader("Host", "evil.example.net");
+    try tx.addRequestHeader("Content-Length", "10");
+    try tx.addRequestHeader("Transfer-Encoding", "chunked");
+    try tx.processRequestHeaders();
+
+    // Both Host values are present, so a rule counting them can act.
+    try std.testing.expectEqual(@as(usize, 2), (try tx.collectionCount(.{ .collection = .request_headers, .selector = .{ .key = "Host" } }, &.{})).?);
+    // And both framing headers are visible together, which is the smuggling signal.
+    try std.testing.expectEqual(@as(usize, 1), (try tx.collectionCount(.{ .collection = .request_headers, .selector = .{ .key = "Content-Length" } }, &.{})).?);
+    try std.testing.expectEqual(@as(usize, 1), (try tx.collectionCount(.{ .collection = .request_headers, .selector = .{ .key = "Transfer-Encoding" } }, &.{})).?);
+
+    // A rule detecting the conflicting pair fires.
+    const input =
+        \\SecRule &REQUEST_HEADERS:Host "@gt 1" "id:1,phase:1,deny,status:400,t:none,msg:'duplicate Host'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "smuggle.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var rule_builder = Builder.init(std.testing.allocator);
+    rule_builder.setRetainedPlan(plan);
+    const rule_waf = try rule_builder.build();
+    defer rule_waf.deinit() catch unreachable;
+
+    var rule_tx = rule_waf.newTransaction();
+    defer rule_tx.deinit();
+    try rule_tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try rule_tx.processUri("/", "POST", "HTTP/1.1");
+    try rule_tx.addRequestHeader("Host", "example.com");
+    try rule_tx.addRequestHeader("Host", "evil.example.net");
+    try rule_tx.processRequestHeaders();
+    try rule_tx.evaluatePhase(std.testing.allocator, .request_headers);
+    try std.testing.expectEqual(@as(u16, 400), (try rule_tx.intervention()).?.status);
+}

@@ -780,7 +780,13 @@ fn validValues(compiled: *const plan_mod.Plan, entry: *const Entry, arguments: [
         .unsigned => validateUnsigned(entry.id, value),
         .limit_action => enumValue(value, &.{ "Reject", "ProcessPartial" }),
         .byte_separator => value.len == 1,
-        .cookie_format => enumValue(value, &.{ "0", "1" }),
+        // Only the Netscape format (0) is accepted. RFC 2965 cookies (1) are not
+        // parsed by anything here: ModSecurity 3.0.16's parser rejects
+        // `SecCookieFormat 1` outright ("is not yet supported") and Coraza 3.7.0
+        // ignores the directive entirely. Accepting the value would promise a
+        // different cookie parse than the one that actually runs, and cookies
+        // parsed differently by a WAF and its origin is precisely a bypass.
+        .cookie_format => enumValue(value, &.{"0"}),
         .audit_engine => enumValue(value, &.{ "On", "Off", "RelevantOnly" }),
         .audit_log_type => enumValue(value, &.{ "Serial", "Concurrent", "HTTPS" }),
         .audit_log_format => enumValue(value, &.{ "Native", "JSON", "LegacyJSON", "OCSF" }),
@@ -1422,4 +1428,20 @@ fn compileTestPlan(input: []const u8) !*plan_mod.Plan {
     defer parsed.deinit();
     var documents = [_]seclang.parser.Document{parsed.document};
     return plan_mod.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+}
+
+test "SecCookieFormat accepts only the format that is actually parsed" {
+    // Netscape cookies (0) are what the parser implements, so that value validates.
+    const accepted = try compileTestPlan("SecCookieFormat 0");
+    defer accepted.deinit();
+    try std.testing.expect(validatePlan(accepted, .full()) == .valid);
+
+    // RFC 2965 cookies (1) are not parsed by anything here, and neither baseline
+    // implements them either: ModSecurity 3.0.16's parser rejects the value and
+    // Coraza 3.7.0 ignores the directive entirely. Accepting it would promise a
+    // cookie parse that never happens — and a WAF parsing cookies differently from
+    // its origin is how a rule gets bypassed.
+    const rejected = try compileTestPlan("SecCookieFormat 1");
+    defer rejected.deinit();
+    try std.testing.expectEqual(DiagnosticCode.invalid_value, validatePlan(rejected, .full()).diagnostic.code);
 }
