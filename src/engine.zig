@@ -2537,7 +2537,12 @@ pub const Transaction = struct {
         const rule = plan.rules[rule_index];
 
         const op_name = plan.string(rule.operator.name) orelse return null;
-        const op_param = plan.string(rule.operator.parameter) orelse "";
+        // Macro-expand the operator argument (e.g. `@rx %{TX.pattern}`); a
+        // macro-free argument expands to its literal bytes.
+        const op_param = self.expandEffectText(
+            .{ .value = rule.operator.parameter, .macro = rule.operator.macro },
+            arena,
+        ) catch return null;
         var operator = runtime_operator.RuntimeOperator.compile(arena, op_name, op_param) catch return null;
         defer operator.deinit();
 
@@ -4689,6 +4694,37 @@ test "evaluatePhase autonomously runs a rule set and blocks a malicious request"
         try tx.evaluatePhase(std.testing.allocator, .request_headers);
         try std.testing.expect((try tx.intervention()) == null);
     }
+}
+
+test "evaluateRule expands a macro in the operator argument" {
+    const input =
+        \\SecRule ARGS "@streq %{TX.secret}" "id:1,phase:1,deny"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "macro-op.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?token=hunter2", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    // The operator argument %{TX.secret} resolves to "hunter2" at match time.
+    try tx.setCollectionValue(.tx, "secret", "hunter2", .{ .origin = .rule, .offset = 0, .length = 7 });
+
+    const match = (try tx.evaluateRule(a, @fromBackingInt(0))).?;
+    try std.testing.expectEqualStrings("token", match.name);
+    try std.testing.expectEqualStrings("hunter2", match.value);
 }
 
 test "evaluateRule matches a rule operator against resolved, transformed targets" {
