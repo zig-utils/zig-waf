@@ -175,6 +175,96 @@ pub const migrations = [_]pg.Migration{
         // and is invisible if only the desired state is recorded.
         .sql = "ALTER TABLE node_rulesets ADD COLUMN running_version integer",
     },
+    .{
+        .version = 9,
+        .name = "administration",
+        // Console identity and administration (#52). Roles are a fixed set rather
+        // than free text, so an unknown role cannot be stored and later be
+        // interpreted as some default; secrets are stored only as hashes, so the
+        // table is not itself a credential; and every administrative change is
+        // recorded, because "who changed this policy" is the first question after an
+        // incident.
+        .sql =
+        \\CREATE TABLE users (
+        \\  id             bigserial PRIMARY KEY,
+        \\  email          text NOT NULL UNIQUE,
+        \\  role           text NOT NULL CHECK (role IN ('viewer', 'operator', 'admin')),
+        \\  password_hash  text,
+        \\  oidc_subject   text UNIQUE,
+        \\  disabled_at    timestamptz,
+        \\  created_at     timestamptz NOT NULL DEFAULT now(),
+        \\  CHECK (password_hash IS NOT NULL OR oidc_subject IS NOT NULL)
+        \\);
+        \\
+        \\CREATE TABLE api_tokens (
+        \\  id           bigserial PRIMARY KEY,
+        \\  user_id      bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        \\  name         text NOT NULL,
+        \\  token_hash   text NOT NULL UNIQUE,
+        \\  expires_at   timestamptz,
+        \\  revoked_at   timestamptz,
+        \\  last_used_at timestamptz,
+        \\  created_at   timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\CREATE INDEX api_tokens_user_idx ON api_tokens (user_id);
+        \\
+        \\CREATE TABLE sessions (
+        \\  id           bigserial PRIMARY KEY,
+        \\  user_id      bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        \\  token_hash   text NOT NULL UNIQUE,
+        \\  expires_at   timestamptz NOT NULL,
+        \\  revoked_at   timestamptz,
+        \\  created_at   timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\CREATE INDEX sessions_expiry_idx ON sessions (expires_at);
+        \\
+        \\CREATE TABLE saved_searches (
+        \\  id          bigserial PRIMARY KEY,
+        \\  user_id     bigint NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+        \\  name        text NOT NULL,
+        \\  query       jsonb NOT NULL,
+        \\  created_at  timestamptz NOT NULL DEFAULT now(),
+        \\  UNIQUE (user_id, name)
+        \\);
+        \\
+        \\CREATE TABLE settings (
+        \\  key         text PRIMARY KEY,
+        \\  value       jsonb NOT NULL,
+        \\  updated_at  timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\
+        \\CREATE TABLE admin_log (
+        \\  id          bigserial PRIMARY KEY,
+        \\  actor       text NOT NULL,
+        \\  action      text NOT NULL,
+        \\  target      text NOT NULL,
+        \\  detail      jsonb NOT NULL DEFAULT '{}',
+        \\  occurred_at timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\CREATE INDEX admin_log_occurred_idx ON admin_log (occurred_at DESC);
+        ,
+    },
+    .{
+        .version = 10,
+        .name = "search_indexes",
+        // Index types matched to how each column is searched (#52).
+        //
+        // BRIN replaces the standalone B-tree on the event stream's timestamp:
+        // events arrive in time order, so the physical order already matches the
+        // indexed order and a range query needs only a summary per block range,
+        // where the B-tree cost far more space to answer the same question. The
+        // composite (node_id, occurred_at) B-tree stays — it serves per-node lookups
+        // that a summary cannot.
+        //
+        // GIN on the jsonb columns, so a containment query (`labels @> '{"tier":
+        // "canary"}'`) is indexed rather than a scan of every row.
+        .sql =
+        \\DROP INDEX security_events_occurred_idx;
+        \\CREATE INDEX security_events_occurred_brin_idx ON security_events USING brin (occurred_at);
+        \\CREATE INDEX nodes_labels_gin_idx ON nodes USING gin (labels);
+        \\CREATE INDEX saved_searches_query_gin_idx ON saved_searches USING gin (query);
+        ,
+    },
 };
 
 /// The hex HMAC-SHA256 signature of `payload` under `secret` (#59). Receivers
@@ -1239,7 +1329,11 @@ test "the fleet schema applies to a clean database and is idempotent" {
     try testing.expectEqual(@as(usize, 0), try apply(conn, testing.allocator)); // idempotent
 
     // The core tables exist and are usable.
-    for ([_][:0]const u8{ "nodes", "rulesets", "security_events", "alert_rules" }) |table_name| {
+    for ([_][:0]const u8{
+        "nodes",          "rulesets", "security_events", "alert_rules",
+        "node_rulesets",  "users",    "api_tokens",      "sessions",
+        "saved_searches", "settings", "admin_log",       "alert_deliveries",
+    }) |table_name| {
         var buffer: [128]u8 = undefined;
         const query = std.fmt.bufPrint(&buffer, "SELECT to_regclass('{s}') IS NOT NULL", .{table_name}) catch unreachable;
         buffer[query.len] = 0;
@@ -1260,6 +1354,164 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
+}
+
+test "the administration schema constrains what can be stored" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    // A role outside the fixed set is rejected. Free-text roles are how an
+    // unrecognized value ends up being treated as some default at read time.
+    try testing.expectError(error.QueryFailed, conn.execParams(
+        "INSERT INTO users (email, role, password_hash) VALUES ($1, $2, $3)",
+        &.{ "a@example.com", "superuser", "hash" },
+    ));
+    try conn.execParams(
+        "INSERT INTO users (email, role, password_hash) VALUES ($1, $2, $3)",
+        &.{ "a@example.com", "admin", "hash" },
+    );
+
+    // An identity with no way to authenticate at all is rejected: a user needs
+    // either a password or a federated subject.
+    try testing.expectError(error.QueryFailed, conn.execParams(
+        "INSERT INTO users (email, role) VALUES ($1, $2)",
+        &.{ "b@example.com", "viewer" },
+    ));
+    // A federated user needs no password.
+    try conn.execParams(
+        "INSERT INTO users (email, role, oidc_subject) VALUES ($1, $2, $3)",
+        &.{ "b@example.com", "viewer", "sub-123" },
+    );
+    // Emails and federated subjects identify one user each.
+    try testing.expectError(error.QueryFailed, conn.execParams(
+        "INSERT INTO users (email, role, password_hash) VALUES ($1, $2, $3)",
+        &.{ "a@example.com", "viewer", "hash" },
+    ));
+    try testing.expectError(error.QueryFailed, conn.execParams(
+        "INSERT INTO users (email, role, oidc_subject) VALUES ($1, $2, $3)",
+        &.{ "c@example.com", "viewer", "sub-123" },
+    ));
+
+    // Token and session hashes are unique, so a stored hash identifies at most one
+    // credential.
+    try conn.exec(
+        \\INSERT INTO api_tokens (user_id, name, token_hash)
+        \\SELECT id, 'ci', 'token-hash' FROM users WHERE email = 'a@example.com'
+    );
+    try testing.expectError(error.QueryFailed, conn.exec(
+        \\INSERT INTO api_tokens (user_id, name, token_hash)
+        \\SELECT id, 'other', 'token-hash' FROM users WHERE email = 'a@example.com'
+    ));
+
+    // Credentials belong to a user and do not outlive them.
+    try conn.exec("DELETE FROM users WHERE email = 'a@example.com'");
+    const orphans = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM api_tokens")).?;
+    defer testing.allocator.free(orphans);
+    try testing.expectEqualStrings("0", orphans);
+
+    // A saved search is named once per user.
+    try conn.exec(
+        \\INSERT INTO saved_searches (user_id, name, query)
+        \\SELECT id, 'denied today', '{"action":"deny"}' FROM users WHERE email = 'b@example.com'
+    );
+    try testing.expectError(error.QueryFailed, conn.exec(
+        \\INSERT INTO saved_searches (user_id, name, query)
+        \\SELECT id, 'denied today', '{"action":"pass"}' FROM users WHERE email = 'b@example.com'
+    ));
+
+    // Settings are keyed, so a value is replaced rather than duplicated.
+    try conn.exec("INSERT INTO settings (key, value) VALUES ('retention_days', '90')");
+    try conn.exec(
+        \\INSERT INTO settings (key, value) VALUES ('retention_days', '30')
+        \\ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+    );
+    const retention = (try conn.queryScalar(testing.allocator, "SELECT value::text FROM settings WHERE key = 'retention_days'")).?;
+    defer testing.allocator.free(retention);
+    try testing.expectEqualStrings("30", retention);
+}
+
+test "the schema indexes each column the way it is searched" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    // BRIN for the event stream's timestamp (events arrive in time order, so a
+    // block-range summary answers a range query), GIN for the jsonb columns (so a
+    // containment query is indexed rather than a scan).
+    const expected = [_]struct { index: [:0]const u8, method: [:0]const u8 }{
+        .{ .index = "security_events_occurred_brin_idx", .method = "brin" },
+        .{ .index = "nodes_labels_gin_idx", .method = "gin" },
+        .{ .index = "saved_searches_query_gin_idx", .method = "gin" },
+        .{ .index = "nodes_status_idx", .method = "btree" },
+    };
+    for (expected) |entry| {
+        const method = (try conn.queryScalarParams(
+            testing.allocator,
+            \\SELECT am.amname FROM pg_class i
+            \\JOIN pg_am am ON am.oid = i.relam
+            \\JOIN pg_namespace n ON n.oid = i.relnamespace
+            \\WHERE i.relname = $1 AND n.nspname = current_schema()
+        ,
+            &.{entry.index},
+        )).?;
+        defer testing.allocator.free(method);
+        try testing.expectEqualStrings(entry.method, method);
+    }
+
+    // The indexes have to actually apply to the operators these columns are
+    // queried with — a GIN index built with the wrong opclass would exist, and be
+    // useless for `@>`. Planner preference is not asserted: on a table small enough
+    // for a fast test a sequential scan is genuinely cheaper, and forcing the
+    // comparison would only measure the fixture. Disabling sequential scans asks
+    // the narrower question this can answer — can the index serve the query at all.
+    try conn.exec(
+        \\INSERT INTO nodes (node_id, hostname, labels)
+        \\SELECT gen_random_uuid(), 'edge-' || g, jsonb_build_object('tier', 'steady')
+        \\FROM generate_series(1, 200) g
+    );
+    try conn.exec(
+        \\INSERT INTO nodes (node_id, hostname, labels)
+        \\SELECT gen_random_uuid(), 'canary-' || g, jsonb_build_object('tier', 'canary')
+        \\FROM generate_series(1, 3) g
+    );
+    try conn.exec("ANALYZE nodes");
+    try conn.exec("SET enable_seqscan = off");
+    try testing.expect(try planUses(conn, "SELECT count(*) FROM nodes WHERE labels @> '{\"tier\":\"canary\"}'::jsonb", "nodes_labels_gin_idx"));
+
+    // The same for BRIN over the event stream's timestamp and a range query.
+    try conn.exec(
+        \\INSERT INTO security_events (node_id, occurred_at, action, uri)
+        \\SELECT gen_random_uuid(), '2024-01-01T00:00:00Z'::timestamptz + (g || ' minutes')::interval, 'deny', '/x'
+        \\FROM generate_series(1, 500) g
+    );
+    try conn.exec("ANALYZE security_events");
+    // A partitioned table's plan names the partition's index, not the parent's, so
+    // the child attached to the BRIN index is what to look for.
+    const child = (try conn.queryScalar(testing.allocator,
+        \\SELECT c.relname FROM pg_inherits i
+        \\JOIN pg_class c ON c.oid = i.inhrelid
+        \\WHERE i.inhparent = 'security_events_occurred_brin_idx'::regclass
+    )).?;
+    defer testing.allocator.free(child);
+    try testing.expect(try planUses(
+        conn,
+        "SELECT count(*) FROM security_events WHERE occurred_at BETWEEN '2024-01-01T00:00:00Z' AND '2024-01-01T02:00:00Z'",
+        child,
+    ));
+}
+
+/// Whether `sql`'s query plan mentions `index_name`.
+fn planUses(conn: *pg.Conn, sql: [:0]const u8, index_name: []const u8) pg.Error!bool {
+    var buffer: [512]u8 = undefined;
+    const explain = std.fmt.bufPrint(&buffer, "EXPLAIN {s}", .{sql}) catch return error.QueryFailed;
+    buffer[explain.len] = 0;
+    var rows = try conn.query(buffer[0..explain.len :0], &.{});
+    defer rows.deinit();
+    while (rows.next()) {
+        if (std.mem.indexOf(u8, rows.get(0), index_name) != null) return true;
+    }
+    return false;
 }
 
 test "event retention prunes only events past the window" {

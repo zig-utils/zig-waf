@@ -69,6 +69,26 @@ version. Existing migrations are never edited; a change is a new version.
 | `security_events` | The event stream, range-partitioned on `occurred_at` |
 | `alert_rules` | Alert definitions, webhook targets, per-rule secrets |
 | `alert_deliveries` | Webhook delivery attempts and their outcomes |
+| `users` | Console identities: role, password hash or federated subject |
+| `api_tokens`, `sessions` | Credentials, stored only as hashes |
+| `saved_searches` | Named event queries per user |
+| `settings` | Keyed control-plane configuration |
+| `admin_log` | Every administrative change, with actor and target |
+
+The schema constrains what can be stored rather than trusting writers: roles are a
+fixed set, so an unrecognized value cannot be stored and later read as some default;
+a user must have either a password hash or a federated subject, so no identity
+exists that cannot authenticate; credentials are unique by hash and cascade with
+their user; and secrets are stored only as hashes, so the table is not itself a
+credential.
+
+Index types match how each column is searched. BRIN covers the event stream's
+timestamp — events arrive in time order, so the physical order already matches the
+indexed order and a range query needs only a summary per block range, where the
+B-tree it replaced cost far more space for the same question. GIN covers the jsonb
+columns, so a label containment query is indexed rather than a scan. The composite
+`(node_id, occurred_at)` B-tree remains for per-node lookups, which a summary cannot
+serve.
 
 ## Nodes and rollout
 
