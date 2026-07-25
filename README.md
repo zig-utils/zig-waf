@@ -43,6 +43,9 @@ The bounded syntax and include contracts are documented in
 The typed byte semantics, compatibility profiles, ownership, and security
 constraints for transformations are documented in
 [`docs/transformations.md`](docs/transformations.md).
+The fleet schema, repositories, and the durability and idempotency guarantees of
+event ingestion are documented in
+[`docs/fleet-storage.md`](docs/fleet-storage.md).
 
 ## License
 
