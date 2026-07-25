@@ -281,7 +281,19 @@
       "coraza": true,
       "crs_required": false,
       "evidence": ["include/zig_waf.h", "src/c_api.zig", "tests/c_api_smoke.c"],
-      "notes": "Opaque ownership, sized structs, lifecycle, feature discovery, and errors are implemented; callbacks and ABI matrix remain."
+      "notes": "Opaque ownership, sized structs, the full transaction lifecycle, feature discovery, errors, intervention retrieval, and audit-log serialization (zig_waf_transaction_serialize_audit_log + zig_waf_free) are implemented — the integration seam a native data plane (e.g. the rpx dataplane) links against. Callbacks and the ABI compatibility matrix remain."
+    },
+    {
+      "id": "tooling.cli",
+      "area": "tooling",
+      "name": "Config validate, explain, and version CLI",
+      "status": "partial",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/34",
+      "modsecurity": false,
+      "coraza": true,
+      "crs_required": false,
+      "evidence": ["src/cli.zig"],
+      "notes": "The zig-waf CLI parses, compiles, and directive-validates SecLang configs (validate), lists compiled rules with phase/id/action/location (explain), and reports the version, exiting non-zero on rejection so rule sets can be gated in CI. The format, test, replay, and benchmark subcommands remain."
     },
     {
       "id": "engine.immutable-structural-plans",
