@@ -613,6 +613,20 @@
         "docs/fleet-storage.md"
       ],
       "notes": "Firing is one statement, so concurrent dispatchers deliver one alert. A metric that cannot be collected is omitted rather than reported as zero."
+    },
+    {
+      "id": "engine.json-body-processor",
+      "area": "engine",
+      "name": "Streaming JSON body processor with bounded depth and duplicate-key exposure",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/27",
+      "modsecurity": false,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "src/engine.zig"
+      ],
+      "notes": "Flattens by streaming rather than materializing a value tree. A duplicated key publishes every value under the same argument, because parsers disagree about which one wins and inspecting only one leaves the other unfiltered; refusing such a body would publish no arguments at all, making one repeated key a bypass. Nesting is bounded by SecRequestBodyJsonDepthLimit (Coraza's 1024 default), since flattening costs a frame per level. A truncated body is inspected as far as it was read and reports REQBODY_PROCESSOR_ERROR. Dotted json.* keys, array indices, and array-length entries match Coraza."
     }
   ]
 }
