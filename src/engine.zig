@@ -1944,78 +1944,112 @@ pub const Transaction = struct {
     /// body processor's request/response split.
     const BodyTarget = enum { request, response };
 
+    /// Flatten a JSON body into arguments, streaming it rather than materializing a
+    /// value tree (#27).
+    ///
+    /// Streaming is what makes the two policies below expressible at all, and both
+    /// of them are security properties rather than preferences:
+    ///
+    ///   * **Duplicate keys publish every value.** `{"u":"guest","u":"admin"}` is
+    ///     accepted by every JSON parser and they disagree about which value wins,
+    ///     so the WAF must see both — inspecting only one leaves the other
+    ///     unfiltered for whatever the application picks. Refusing such a body
+    ///     outright would be worse still: no argument would be inspected at all,
+    ///     which is a bypass with a single repeated key.
+    ///   * **Depth is bounded.** Nesting costs a frame here and in every consumer,
+    ///     so an unbounded body is a crash any client can cause.
     fn parseJsonBody(self: *Transaction, target: BodyTarget, body: []const u8) TransactionError!void {
-        var parsed = std.json.parseFromSlice(std.json.Value, self.waf.allocator, body, .{}) catch {
-            switch (target) {
-                .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
-                .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
-            }
-            return;
-        };
-        defer parsed.deinit();
+        const gpa = self.waf.allocator;
+        var scanner = std.json.Scanner.initCompleteInput(gpa, body);
+        defer scanner.deinit();
+
+        // The dotted key being built, e.g. "json.user.roles.0".
         var key: std.ArrayList(u8) = .empty;
-        defer key.deinit(self.waf.allocator);
-        try key.appendSlice(self.waf.allocator, "json");
-        self.flattenJson(target, &key, parsed.value, 0) catch |err| switch (err) {
-            // A body deeper than the limit is refused as a processor error, the same
-            // way malformed JSON is: the arguments it would have produced are not
-            // published, so no rule sees a half-flattened body.
-            error.JsonTooDeep => switch (target) {
-                .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
-                .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
-            },
-            else => |other| return other,
-        };
+        defer key.deinit(gpa);
+        try key.appendSlice(gpa, "json");
+
+        var frames: std.ArrayList(JsonFrame) = .empty;
+        defer frames.deinit(gpa);
+        // Outside any container the next token is the document's own value.
+        var expect_key = false;
+
+        while (true) {
+            const token = scanner.nextAlloc(gpa, .alloc_if_needed) catch {
+                return self.flagBodyProcessorError(target);
+            };
+            switch (token) {
+                .end_of_document => break,
+                .object_end, .array_end => {
+                    const frame = frames.pop() orelse return self.flagBodyProcessorError(target);
+                    key.shrinkRetainingCapacity(frame.path_len);
+                    // Coraza publishes an array's length under the array's own key.
+                    if (frame.kind == .array and frame.count > 0) {
+                        var buffer: [24]u8 = undefined;
+                        try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buffer, "{d}", .{frame.count}) catch unreachable);
+                    }
+                    expect_key = frames.items.len != 0 and frames.items[frames.items.len - 1].kind == .object;
+                    if (frames.items.len != 0 and frames.items[frames.items.len - 1].kind == .array) {
+                        frames.items[frames.items.len - 1].count += 1;
+                    }
+                },
+                .object_begin, .array_begin => {
+                    if (frames.items.len >= self.waf.json_depth_limit) return self.flagBodyProcessorError(target);
+                    try frames.append(gpa, .{
+                        .kind = if (token == .object_begin) .object else .array,
+                        .path_len = key.items.len,
+                    });
+                    expect_key = token == .object_begin;
+                    if (token == .array_begin) try self.pushJsonIndex(&key, 0);
+                },
+                else => {
+                    const text = jsonTokenText(token) orelse return self.flagBodyProcessorError(target);
+                    defer if (token == .allocated_string or token == .allocated_number) gpa.free(text);
+                    const top = if (frames.items.len != 0) &frames.items[frames.items.len - 1] else null;
+                    if (expect_key) {
+                        // An object key: replace the previous sibling's segment, so
+                        // a duplicated key produces a second value under the same
+                        // path rather than replacing the first.
+                        key.shrinkRetainingCapacity(top.?.path_len);
+                        try key.append(gpa, '.');
+                        try key.appendSlice(gpa, text);
+                        expect_key = false;
+                        continue;
+                    }
+                    try self.addJsonArg(target, key.items, text);
+                    if (top) |frame| switch (frame.kind) {
+                        .object => expect_key = true,
+                        .array => {
+                            frame.count += 1;
+                            key.shrinkRetainingCapacity(frame.path_len);
+                            try self.pushJsonIndex(&key, frame.count);
+                        },
+                    };
+                },
+            }
+        }
+        // A truncated body leaves containers open; its arguments were published as
+        // they were read, and the error says the rest is missing.
+        if (frames.items.len != 0) return self.flagBodyProcessorError(target);
     }
 
-    fn flattenJson(
-        self: *Transaction,
-        target: BodyTarget,
-        key: *std.ArrayList(u8),
-        value: std.json.Value,
-        depth: usize,
-    ) (TransactionError || error{JsonTooDeep})!void {
-        // Checked before descending, so the frame that would exceed the limit is
-        // never entered.
-        if (depth > self.waf.json_depth_limit) return error.JsonTooDeep;
-        const gpa = self.waf.allocator;
-        switch (value) {
-            .object => |object| {
-                var it = object.iterator();
-                while (it.next()) |entry| {
-                    const base = key.items.len;
-                    try key.append(gpa, '.');
-                    try key.appendSlice(gpa, entry.key_ptr.*);
-                    try self.flattenJson(target, key, entry.value_ptr.*, depth + 1);
-                    key.shrinkRetainingCapacity(base);
-                }
-            },
-            .array => |array| {
-                for (array.items, 0..) |item, index| {
-                    const base = key.items.len;
-                    try key.append(gpa, '.');
-                    var idx_buf: [24]u8 = undefined;
-                    try key.appendSlice(gpa, std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable);
-                    try self.flattenJson(target, key, item, depth + 1);
-                    key.shrinkRetainingCapacity(base);
-                }
-                if (array.items.len > 0) {
-                    var buf: [24]u8 = undefined;
-                    try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{array.items.len}) catch unreachable);
-                }
-            },
-            .string => |string| try self.addJsonArg(target, key.items, string),
-            .null => try self.addJsonArg(target, key.items, ""),
-            .bool => |boolean| try self.addJsonArg(target, key.items, if (boolean) "true" else "false"),
-            .integer => |integer| {
-                var buf: [24]u8 = undefined;
-                try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{integer}) catch unreachable);
-            },
-            .float => |float| {
-                var buf: [32]u8 = undefined;
-                try self.addJsonArg(target, key.items, std.fmt.bufPrint(&buf, "{d}", .{float}) catch unreachable);
-            },
-            .number_string => |raw| try self.addJsonArg(target, key.items, raw),
+    const JsonFrame = struct {
+        kind: enum { object, array },
+        /// The key length to restore when this container closes.
+        path_len: usize,
+        /// Elements seen so far, which is both the next index and the length.
+        count: usize = 0,
+    };
+
+    fn pushJsonIndex(self: *Transaction, key: *std.ArrayList(u8), index: usize) TransactionError!void {
+        var buffer: [24]u8 = undefined;
+        try key.append(self.waf.allocator, '.');
+        try key.appendSlice(self.waf.allocator, std.fmt.bufPrint(&buffer, "{d}", .{index}) catch unreachable);
+    }
+
+    fn flagBodyProcessorError(self: *Transaction, target: BodyTarget) TransactionError!void {
+        switch (target) {
+            .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
+            .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
         }
     }
 
@@ -3878,6 +3912,20 @@ fn matchContext(
 }
 
 /// Append a formatted fragment to an audit-message buffer using `arena`.
+/// The text a scalar JSON token carries. Literals render as they do in the value
+/// tree (`null` as the empty string, booleans as their words) so streaming and the
+/// previous tree-based flattening publish identical arguments.
+fn jsonTokenText(token: std.json.Token) ?[]const u8 {
+    return switch (token) {
+        .string, .allocated_string => |text| text,
+        .number, .allocated_number => |text| text,
+        .true => "true",
+        .false => "false",
+        .null => "",
+        else => null,
+    };
+}
+
 fn auditAppend(list: *std.ArrayList(u8), arena: std.mem.Allocator, comptime fmt: []const u8, args: anytype) std.mem.Allocator.Error!void {
     const rendered = try std.fmt.allocPrint(arena, fmt, args);
     try list.appendSlice(arena, rendered);
@@ -7570,5 +7618,84 @@ test "SecRequestBodyJsonDepthLimit overrides the build-time JSON depth" {
     try tx.processRequestHeaders();
     try tx.writeRequestBody("{\"a\":{\"b\":{\"c\":{\"d\":1}}}}");
     try tx.processRequestBody();
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
+}
+
+test "duplicate JSON keys publish every value rather than none" {
+    // Every JSON parser accepts {"u":"guest","u":"admin"} and they disagree about
+    // which value wins, so the WAF has to see both: inspecting one leaves the other
+    // unfiltered for whatever the application picks. Refusing the body would be
+    // worse — no argument would be inspected at all, making a single repeated key a
+    // bypass.
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("Content-Type", "application/json");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("{\"u\":\"guest\",\"u\":\"admin\",\"n\":1}");
+    try tx.processRequestBody();
+
+    // The body parsed, so the rest of it is inspected too.
+    try std.testing.expectEqualStrings("0", (try tx.scalar(.reqbody_processor_error)).?.value);
+    try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.args, "json.n")).?.value);
+
+    // Both values for the repeated key are present under the same argument.
+    try std.testing.expectEqual(@as(usize, 2), (try tx.collectionCount(.{ .collection = .args, .selector = .{ .key = "json.u" } }, &.{})).?);
+
+    // A rule inspecting ARGS sees the value a naive parser would have discarded.
+    const input =
+        \\SecRule ARGS:json.u "@streq admin" "id:1,phase:2,deny,status:403,t:none,msg:'privileged value'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "dup.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var rule_builder = Builder.init(std.testing.allocator);
+    rule_builder.setRetainedPlan(plan);
+    const rule_waf = try rule_builder.build();
+    defer rule_waf.deinit() catch unreachable;
+
+    // The privileged value is second here and first in the next request; both are
+    // caught, because which one a parser keeps is exactly what must not matter.
+    for ([_][]const u8{
+        "{\"u\":\"guest\",\"u\":\"admin\"}",
+        "{\"u\":\"admin\",\"u\":\"guest\"}",
+    }) |body| {
+        var rule_tx = rule_waf.newTransaction();
+        defer rule_tx.deinit();
+        try rule_tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try rule_tx.processUri("/api", "POST", "HTTP/1.1");
+        try rule_tx.addRequestHeader("Content-Type", "application/json");
+        try rule_tx.processRequestHeaders();
+        try rule_tx.writeRequestBody(body);
+        try rule_tx.processRequestBody();
+        try rule_tx.evaluatePhase(std.testing.allocator, .request_body);
+        try std.testing.expectEqual(@as(u16, 403), (try rule_tx.intervention()).?.status);
+    }
+}
+
+test "a truncated JSON body publishes what it read and reports the rest missing" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("Content-Type", "application/json");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("{\"a\":\"seen\",\"b\":");
+    try tx.processRequestBody();
+
+    // Streaming means what was read is inspected, rather than a truncated body
+    // hiding its own contents from every rule.
+    try std.testing.expectEqualStrings("seen", (try tx.collectionFirst(.args, "json.a")).?.value);
     try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
 }
