@@ -292,6 +292,21 @@ pub const Conn = struct {
         return try allocator.dupe(u8, std.mem.span(c.PQgetvalue(result, 0, 0)));
     }
 
+    /// Like `query`, but a parameter may be null to bind SQL NULL — for a query
+    /// whose shape does not change when a value is absent, such as a pagination
+    /// cursor that is null on the first page.
+    pub fn queryOpt(self: *Conn, sql: [:0]const u8, params: []const ?[:0]const u8) Error!Rows {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = if (param) |p| p.ptr else null;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0) orelse return error.QueryFailed;
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            c.PQclear(result);
+            return error.QueryFailed;
+        }
+        return .{ .result = result, .count = c.PQntuples(result) };
+    }
+
     /// Run a parameterized query and return a row cursor. The caller iterates
     /// with `next()`, reads borrowed column text with `get()`, and must
     /// `deinit()` to release the result.

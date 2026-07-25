@@ -484,6 +484,34 @@ pub const EventRepository = struct {
         );
     }
 
+    /// A page of a node's events, oldest-first from a cursor (#56). Paging by
+    /// `(occurred_at, id)` rather than an OFFSET means a page is defined by where
+    /// the last one ended, so events arriving between requests neither shift rows
+    /// into a page already shown nor skip rows the reader never saw — which is
+    /// exactly what OFFSET does on a stream that is still growing.
+    ///
+    /// Pass a null cursor for the first page, then the last row's `(occurred_at,
+    /// id)`. The cursor yields (0) occurred_at, (1) id, (2) action, (3) uri; the
+    /// caller `deinit`s it.
+    pub fn pageForNode(
+        self: EventRepository,
+        node_id: [:0]const u8,
+        after_occurred_at: ?[:0]const u8,
+        after_id: ?[:0]const u8,
+        limit: [:0]const u8,
+    ) pg.Error!pg.Rows {
+        // The row-value comparison is what makes the cursor a single position in the
+        // ordering rather than two independent bounds.
+        return self.conn.queryOpt(
+            \\SELECT occurred_at::text, id::text, coalesce(action, ''), coalesce(uri, '')
+            \\FROM security_events
+            \\WHERE node_id = $1
+            \\  AND ($2::timestamptz IS NULL OR (occurred_at, id) > ($2::timestamptz, $3::bigint))
+            \\ORDER BY occurred_at, id
+            \\LIMIT $4::int
+        , &.{ node_id, after_occurred_at, after_id, limit });
+    }
+
     /// Delete events older than `retention_days` (retention policy #56). Returns
     /// the number of rows deleted (caller frees the text count).
     pub fn pruneOlderThan(self: EventRepository, allocator: std.mem.Allocator, retention_days: u32) pg.Error!?[]u8 {
@@ -879,6 +907,54 @@ pub const EventSpool = struct {
     }
 };
 
+/// Named event queries a user can return to (#56). The query is stored as jsonb
+/// and interpreted by the console, not spliced into SQL here: a saved search is
+/// user-authored, and turning one into a statement is how a search feature becomes
+/// an injection vector.
+pub const SavedSearchRepository = struct {
+    conn: *pg.Conn,
+
+    /// Save (or replace) a named search for a user. Replacing rather than erroring
+    /// is what "save" means in a console — the second save of a refined search is
+    /// an edit, not a conflict.
+    pub fn save(self: SavedSearchRepository, email: [:0]const u8, name: [:0]const u8, query_json: [:0]const u8) pg.Error!void {
+        const inserted = try self.conn.execParamsOptCount(
+            \\INSERT INTO saved_searches (user_id, name, query)
+            \\SELECT id, $2, $3::jsonb FROM users WHERE email = $1
+            \\ON CONFLICT (user_id, name) DO UPDATE SET query = EXCLUDED.query
+        , &.{ email, name, query_json });
+        if (inserted == 0) return error.QueryFailed; // no such user
+    }
+
+    /// A saved search's query document (caller frees), or null if the user has no
+    /// search by that name.
+    pub fn load(self: SavedSearchRepository, allocator: std.mem.Allocator, email: [:0]const u8, name: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            \\SELECT s.query::text FROM saved_searches s JOIN users u ON u.id = s.user_id
+            \\WHERE u.email = $1 AND s.name = $2
+        ,
+            &.{ email, name },
+        );
+    }
+
+    /// A user's saved searches by name, ordered. The cursor yields (0) name,
+    /// (1) query; the caller `deinit`s it.
+    pub fn list(self: SavedSearchRepository, email: [:0]const u8) pg.Error!pg.Rows {
+        return self.conn.query(
+            \\SELECT s.name, s.query::text FROM saved_searches s JOIN users u ON u.id = s.user_id
+            \\WHERE u.email = $1 ORDER BY s.name
+        , &.{email});
+    }
+
+    pub fn delete(self: SavedSearchRepository, email: [:0]const u8, name: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            \\DELETE FROM saved_searches
+            \\WHERE name = $2 AND user_id = (SELECT id FROM users WHERE email = $1)
+        , &.{ email, name });
+    }
+};
+
 /// Monthly range partitions for the security-event stream (#56). Creating the
 /// upcoming month's partition ahead of time keeps inserts routing to a bounded
 /// child table; dropping an old month is O(1) retention (the whole partition
@@ -913,6 +989,88 @@ pub const EventPartitions = struct {
         buffer[sql.len] = 0;
         try self.conn.exec(buffer[0..sql.len :0]);
     }
+
+    /// Every partition of the event stream with the bytes it occupies and the rows
+    /// it holds, newest first — the input to a capacity forecast (#56). The cursor
+    /// yields (0) partition name, (1) total bytes including indexes and TOAST,
+    /// (2) live row estimate; the caller `deinit`s it.
+    ///
+    /// The row count is PostgreSQL's estimate from the last ANALYZE rather than a
+    /// COUNT, because a forecast does not need an exact number and scanning every
+    /// partition to produce one would cost more than the answer is worth.
+    pub fn sizes(self: EventPartitions) pg.Error!pg.Rows {
+        return self.conn.query(
+            \\SELECT c.relname,
+            \\       pg_total_relation_size(c.oid)::text,
+            \\       greatest(c.reltuples, 0)::bigint::text
+            \\FROM pg_inherits i
+            \\JOIN pg_class c ON c.oid = i.inhrelid
+            \\WHERE i.inhparent = 'security_events'::regclass
+            \\ORDER BY c.relname DESC
+        , &.{});
+    }
+
+    /// How many days of retention the event stream's current size and growth
+    /// support within `budget_bytes`, and what it is using now (#56).
+    ///
+    /// Growth is measured from the last `sample_days` of ingested events, so a fleet
+    /// that has just been enrolled forecasts from what it is actually doing rather
+    /// than from a configured guess. A stream with no measurable growth has no
+    /// forecast — reporting a very large number of days would be a fabrication, so
+    /// `days_remaining` is null instead.
+    pub fn forecast(self: EventPartitions, budget_bytes: u64, sample_days: u32) pg.Error!Forecast {
+        var sample_buffer: [16]u8 = undefined;
+        const sample = std.fmt.bufPrint(&sample_buffer, "{d}", .{sample_days}) catch return error.QueryFailed;
+        sample_buffer[sample.len] = 0;
+
+        var rows = try self.conn.query(
+            \\WITH total AS (
+            \\  SELECT coalesce(sum(pg_total_relation_size(c.oid)), 0) AS bytes,
+            \\         greatest(coalesce(sum(greatest(c.reltuples, 0)), 0), 1) AS rows
+            \\  FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+            \\  WHERE i.inhparent = 'security_events'::regclass
+            \\), recent AS (
+            \\  SELECT count(*) AS events FROM security_events
+            \\  WHERE occurred_at > now() - make_interval(days => $1::int)
+            \\)
+            \\SELECT total.bytes::text,
+            \\       (total.bytes / total.rows)::bigint::text,
+            \\       (recent.events / greatest($1::int, 1))::bigint::text
+            \\FROM total, recent
+        , &.{sample_buffer[0..sample.len :0]});
+        defer rows.deinit();
+        if (!rows.next()) return error.QueryFailed;
+
+        const used = std.fmt.parseInt(u64, rows.get(0), 10) catch return error.QueryFailed;
+        const bytes_per_event = std.fmt.parseInt(u64, rows.get(1), 10) catch return error.QueryFailed;
+        const events_per_day = std.fmt.parseInt(u64, rows.get(2), 10) catch return error.QueryFailed;
+        const daily_bytes = bytes_per_event * events_per_day;
+        return .{
+            .used_bytes = used,
+            .bytes_per_event = bytes_per_event,
+            .events_per_day = events_per_day,
+            .days_remaining = if (daily_bytes == 0 or used >= budget_bytes)
+                null
+            else
+                (budget_bytes - used) / daily_bytes,
+        };
+    }
+
+    /// What the event stream costs and how long the budget lasts at the observed
+    /// rate.
+    pub const Forecast = struct {
+        /// Bytes the stream occupies now, including indexes and TOAST.
+        used_bytes: u64,
+        /// Average bytes an event costs, measured rather than assumed — an event's
+        /// size depends on its URIs and messages.
+        bytes_per_event: u64,
+        /// Events per day over the sample window.
+        events_per_day: u64,
+        /// Days until the budget is reached at that rate, or null when growth is not
+        /// measurable or the budget is already exceeded — cases where any number
+        /// would be invented.
+        days_remaining: ?u64,
+    };
 };
 
 /// Alert rules and webhook targets (#59): when an event with a matching action
@@ -1354,6 +1512,171 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
+}
+
+test "event pages are stable while the stream grows" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const events = EventRepository{ .conn = conn };
+    const node_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    for (0..5) |index| {
+        var at_buffer: [64]u8 = undefined;
+        var uri_buffer: [16]u8 = undefined;
+        const at = try std.fmt.bufPrint(&at_buffer, "2024-10-01T00:00:0{d}Z", .{index});
+        at_buffer[at.len] = 0;
+        const uri = try std.fmt.bufPrint(&uri_buffer, "/{d}", .{index});
+        uri_buffer[uri.len] = 0;
+        try events.recordAt(node_id, at_buffer[0..at.len :0], "deny", uri_buffer[0..uri.len :0], "x");
+    }
+
+    // First page: the two oldest events.
+    var cursor_at: [64]u8 = undefined;
+    var cursor_at_len: usize = 0;
+    var cursor_id: [32]u8 = undefined;
+    var cursor_id_len: usize = 0;
+    {
+        var rows = try events.pageForNode(node_id, null, null, "2");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 2), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("/0", rows.get(3));
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("/1", rows.get(3));
+        // Remember where the page ended.
+        cursor_at_len = rows.get(0).len;
+        @memcpy(cursor_at[0..cursor_at_len], rows.get(0));
+        cursor_at[cursor_at_len] = 0;
+        cursor_id_len = rows.get(1).len;
+        @memcpy(cursor_id[0..cursor_id_len], rows.get(1));
+        cursor_id[cursor_id_len] = 0;
+    }
+
+    // An event arriving *before* the cursor while the reader is paging. With an
+    // OFFSET this would push a row already shown onto the next page; from a cursor
+    // the next page still begins exactly where the last one ended.
+    try events.recordAt(node_id, "2024-09-01T00:00:00Z", "deny", "/inserted", "earlier");
+    {
+        var rows = try events.pageForNode(
+            node_id,
+            cursor_at[0..cursor_at_len :0],
+            cursor_id[0..cursor_id_len :0],
+            "2",
+        );
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 2), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("/2", rows.get(3));
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("/3", rows.get(3));
+    }
+
+    // Paging past the end yields nothing rather than repeating the last page.
+    {
+        var rows = try events.pageForNode(node_id, "2030-01-01T00:00:00Z", "0", "10");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.len());
+    }
+}
+
+test "saved searches are stored per user and never spliced into SQL" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    try conn.execParams(
+        "INSERT INTO users (email, role, password_hash) VALUES ($1, 'operator', 'hash')",
+        &.{"op@example.com"},
+    );
+    const searches = SavedSearchRepository{ .conn = conn };
+
+    try searches.save("op@example.com", "denied today", "{\"action\":\"deny\",\"since\":\"today\"}");
+    {
+        const loaded = (try searches.load(testing.allocator, "op@example.com", "denied today")).?;
+        defer testing.allocator.free(loaded);
+        try testing.expect(std.mem.indexOf(u8, loaded, "\"deny\"") != null);
+    }
+
+    // Saving the same name again is an edit, which is what "save" means in a
+    // console — not a conflict the user has to resolve.
+    try searches.save("op@example.com", "denied today", "{\"action\":\"deny\",\"since\":\"week\"}");
+    {
+        const loaded = (try searches.load(testing.allocator, "op@example.com", "denied today")).?;
+        defer testing.allocator.free(loaded);
+        try testing.expect(std.mem.indexOf(u8, loaded, "week") != null);
+    }
+
+    // A search name is user-authored text, and the query is user-authored JSON.
+    // Neither reaches SQL as syntax: this name and query round-trip verbatim
+    // instead of terminating a statement.
+    const hostile_name = "'; DROP TABLE saved_searches; --";
+    try searches.save("op@example.com", hostile_name, "{\"uri\":\"' OR 1=1 --\"}");
+    {
+        const loaded = (try searches.load(testing.allocator, "op@example.com", hostile_name)).?;
+        defer testing.allocator.free(loaded);
+        try testing.expect(std.mem.indexOf(u8, loaded, "OR 1=1") != null);
+    }
+    const still_there = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM saved_searches")).?;
+    defer testing.allocator.free(still_there);
+    try testing.expectEqualStrings("2", still_there);
+
+    {
+        var rows = try searches.list("op@example.com");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 2), rows.len());
+    }
+
+    try searches.delete("op@example.com", "denied today");
+    try testing.expect((try searches.load(testing.allocator, "op@example.com", "denied today")) == null);
+
+    // A search cannot be saved for an unknown user.
+    try testing.expectError(error.QueryFailed, searches.save("nobody@example.com", "x", "{}"));
+}
+
+test "capacity is forecast from measured size and growth" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const partitions = EventPartitions{ .conn = conn };
+    // No events yet: there is no growth to extrapolate, so there is no forecast.
+    // Reporting a huge number of days would be a fabrication.
+    try conn.exec("ANALYZE security_events");
+    {
+        const empty = try partitions.forecast(1024 * 1024, 7);
+        try testing.expect(empty.days_remaining == null);
+        try testing.expectEqual(@as(u64, 0), empty.events_per_day);
+    }
+
+    // A day's worth of events, recent enough to be inside the sample window.
+    try conn.exec(
+        \\INSERT INTO security_events (node_id, occurred_at, action, uri, message)
+        \\SELECT 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee', now() - make_interval(hours => (g % 20)),
+        \\       'deny', '/search?q=' || g, 'SQL injection detected'
+        \\FROM generate_series(1, 700) g
+    );
+    try conn.exec("ANALYZE security_events");
+
+    const forecast = try partitions.forecast(64 * 1024 * 1024, 1);
+    // Every figure is measured, so each must be non-zero once there are events.
+    try testing.expect(forecast.used_bytes > 0);
+    try testing.expect(forecast.bytes_per_event > 0);
+    try testing.expect(forecast.events_per_day > 0);
+    try testing.expect(forecast.days_remaining != null);
+
+    // A budget already exceeded has no days remaining rather than a negative or
+    // wrapped number.
+    const exceeded = try partitions.forecast(1, 1);
+    try testing.expect(exceeded.days_remaining == null);
+
+    // Per-partition sizes are reported for the capacity view.
+    var rows = try partitions.sizes();
+    defer rows.deinit();
+    try testing.expect(rows.len() >= 1); // at least the default partition
+    try testing.expect(rows.next());
+    try testing.expect(std.mem.startsWith(u8, rows.get(0), "security_events"));
+    try testing.expect((std.fmt.parseInt(u64, rows.get(1), 10) catch 0) > 0);
 }
 
 test "the administration schema constrains what can be stored" {

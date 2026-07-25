@@ -161,9 +161,27 @@ partition drop instead of a bulk delete. `EventPartitions.ensureMonth` creates
 the upcoming month ahead of time; `dropMonth` removes an aged one with its rows.
 `pruneOlderThan` remains for a row-level policy inside a retained partition.
 
-`recentForNode` serves event search and transaction detail. `exportCsv` renders a
-node's events as RFC 4180 CSV, quoting fields and doubling embedded quotes so a
-URI or message containing commas, quotes, or newlines round-trips intact.
+`recentForNode` serves event search and transaction detail. `pageForNode` pages from
+a `(occurred_at, id)` cursor rather than an OFFSET: a page is defined by where the
+last one ended, so events arriving between requests neither shift rows into a page
+already shown nor skip rows the reader never saw — which is precisely what OFFSET
+does on a stream that is still growing.
+
+`exportCsv` renders a node's events as RFC 4180 CSV, quoting fields and doubling
+embedded quotes so a URI or message containing commas, quotes, or newlines
+round-trips intact.
+
+`SavedSearchRepository` stores named queries per user as jsonb, interpreted by the
+console. The query is never spliced into SQL here: a saved search is user-authored,
+and turning one into a statement is how a search feature becomes an injection
+vector.
+
+`EventPartitions.sizes` reports bytes and estimated rows per partition, and
+`forecast` turns the measured size and the observed ingestion rate into days of
+retention remaining within a byte budget. Every figure is measured rather than
+configured — an event's size depends on its URIs and messages — and a stream with no
+measurable growth, or a budget already exceeded, reports no forecast rather than a
+fabricated number.
 
 ## Alerts
 
