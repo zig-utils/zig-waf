@@ -188,3 +188,37 @@ PG_TEST_DSN="host=$PWD port=5456 user=waf dbname=postgres" zig build pg-test
 ```
 
 `zig build sqlite-test` covers the embedded backend and needs no server.
+
+## Identity and authorization
+
+`fleet_auth.zig` holds console identity: local password login, roles, API tokens,
+and sessions. Two kinds of secret are protected differently on purpose. A password
+is chosen by a person, so it is low-entropy and worth attacking offline: it is
+stored as an argon2id hash, whose cost is the defence. A token or session id is
+generated here with 256 bits of entropy, so guessing it is not a threat and only a
+stolen database matters: those are stored as SHA-256 hashes. Using argon2 for them
+would put a deliberately expensive hash on every API request — a denial-of-service
+vector bought for no security.
+
+A secret exists in recoverable form exactly once, when it is issued. Authentication
+failure is uniform: an unknown email, a disabled account, a federated account with
+no password, and a wrong password are all "no", because which one it was is what an
+attacker probing for accounts wants to learn. Disabling a user immediately
+invalidates its tokens and sessions without having to find them; expiry is checked
+by authentication itself rather than trusting housekeeping to have run; and
+revocation is recorded rather than deleted, so a credential that was used stays
+accounted for.
+
+Authorization is a total function from role to enumerated action, so a new action
+must be classified to be permitted anywhere, and a role that does not parse grants
+nothing rather than defaulting.
+
+`oidc.zig` verifies ID tokens for federated login. The algorithm is a property of
+the *key*, never of the token's header, so a token cannot nominate how it is
+verified — which is what defeats `alg: none` and the algorithm-confusion attack that
+turns a provider's public key into an HMAC secret. Issuer, audience, expiry, issued-
+at, and nonce are all required to match, the nonce in constant time. Accounts link by
+subject, not email: an email address can be reassigned, and a linkage by email would
+hand the new holder the old account. Discovery and JWKS fetching stay with the
+caller, which owns HTTP and its destination policy, so verification is a pure
+function of its inputs.
