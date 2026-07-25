@@ -55,6 +55,47 @@ pub const Status = enum {
 
 pub const WriteError = std.mem.Allocator.Error || SinkError || error{ InvalidLimits, BodyLimitRejected };
 
+/// A `Sink` backed by a file the caller opened, for spooling an oversized body or
+/// an uploaded file to disk (#25).
+///
+/// The engine never opens this itself. Spooling is deliberately the connector's
+/// job: the request path must not block on a filesystem, and where uploads may be
+/// written (`SecUploadDir`/`SecTmpDir`), with what permissions, and whether they
+/// survive the transaction (`SecUploadKeepFiles`) are deployment decisions the WAF
+/// core has no business making. This type exists so a connector does not have to
+/// reimplement the boundary — it owns the handle, counts what it wrote, and
+/// reports disk exhaustion as such rather than as a generic failure.
+pub const FileSink = struct {
+    io: std.Io,
+    file: std.Io.File,
+    written: u64 = 0,
+    /// A ceiling of its own, so a body that slipped past the buffer's limits — or a
+    /// misconfigured limit — cannot fill the disk.
+    max_bytes: u64,
+
+    pub fn init(io: std.Io, file: std.Io.File, max_bytes: u64) FileSink {
+        return .{ .io = io, .file = file, .max_bytes = max_bytes };
+    }
+
+    pub fn sink(self: *FileSink) Sink {
+        return .{ .context = self, .writeFn = writeThrough };
+    }
+
+    fn writeThrough(context: *anyopaque, bytes: []const u8) SinkError!void {
+        const self: *FileSink = @ptrCast(@alignCast(context));
+        if (bytes.len > self.max_bytes - self.written) return error.DiskExhausted;
+        // Positional writes at the running offset: the sink owns the file's
+        // position, so a caller sharing the handle cannot interleave into the body.
+        self.file.writePositionalAll(self.io, bytes, self.written) catch |err| return switch (err) {
+            // A full filesystem is the failure worth naming: it is operational, not
+            // a bug in the request, and an operator needs to tell them apart.
+            error.NoSpaceLeft, error.DiskQuota => error.DiskExhausted,
+            else => error.SinkWriteFailed,
+        };
+        self.written += bytes.len;
+    }
+};
+
 pub const Buffer = struct {
     allocator: std.mem.Allocator,
     limits: Limits,
@@ -248,4 +289,39 @@ test "a zero total limit is rejected" {
     // in_memory_limit above total_limit is valid — the total cap triggers first.
     var buffer = try Buffer.init(std.testing.allocator, .{ .in_memory_limit = 100, .total_limit = 50 }, .reject, null);
     buffer.deinit();
+}
+
+test "a file sink spools the overflow and bounds what it writes" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(io, "spool.bin", .{ .read = true });
+    defer file.close(io);
+    var file_sink = FileSink.init(io, file, 1024);
+
+    var buffer = try Buffer.init(std.testing.allocator, .{ .in_memory_limit = 8, .total_limit = 64 }, .process_partial, file_sink.sink());
+    defer buffer.deinit();
+
+    try buffer.write("0123456789ABCDEF");
+    // The first eight bytes stay in memory; the rest went to the file, and the body
+    // is marked spooled so a processor knows it is not looking at the whole thing.
+    try std.testing.expectEqualStrings("01234567", buffer.inMemory());
+    try std.testing.expect(buffer.isSpooled());
+    try std.testing.expectEqual(@as(usize, 8), buffer.spilled_bytes);
+    try std.testing.expectEqual(@as(u64, 8), file_sink.written);
+
+    const spooled = try tmp.dir.readFileAlloc(io, "spool.bin", std.testing.allocator, .limited(1024));
+    defer std.testing.allocator.free(spooled);
+    try std.testing.expectEqualStrings("89ABCDEF", spooled);
+
+    // The sink has a ceiling of its own, so a misconfigured buffer limit cannot
+    // fill the disk through it.
+    var small = try tmp.dir.createFile(io, "small.bin", .{});
+    defer small.close(io);
+    var bounded = FileSink.init(io, small, 4);
+    var bounded_buffer = try Buffer.init(std.testing.allocator, .{ .in_memory_limit = 0, .total_limit = 64 }, .process_partial, bounded.sink());
+    defer bounded_buffer.deinit();
+    try bounded_buffer.write("abcd");
+    try std.testing.expectError(error.DiskExhausted, bounded_buffer.write("efgh"));
 }
