@@ -302,6 +302,53 @@ pub const EventRepository = struct {
         return inserted;
     }
 
+    /// Ingest a batch with `COPY` instead of a statement per event (#55) — one
+    /// round trip and one parse for the whole batch, which is what a busy node's
+    /// drain needs. Same guarantees as `recordBatch`: one transaction, and keys
+    /// already ingested are skipped. Returns the number of events inserted.
+    ///
+    /// COPY cannot upsert, so the batch lands in a transaction-scoped staging
+    /// table and is inserted from there with the same conflict handling. Events
+    /// are copied in PostgreSQL's *text* format so the server parses timestamps
+    /// exactly as it does everywhere else; the binary format would mean
+    /// reimplementing its timestamptz encoding on the client, and any drift
+    /// between the two would silently mis-date events.
+    pub fn recordBatchCopy(self: EventRepository, allocator: std.mem.Allocator, batch: []const Event) pg.Error!usize {
+        if (batch.len == 0) return 0;
+
+        var payload: std.ArrayList(u8) = .empty;
+        defer payload.deinit(allocator);
+        for (batch) |event| {
+            inline for (.{ event.node_id, event.occurred_at, event.action, event.uri, event.message }) |field| {
+                try pg.copyEscape(&payload, allocator, field);
+                try payload.append(allocator, '\t');
+            }
+            // An absent key is a SQL NULL, which is COPY's \N — not the two-character
+            // text "\N", which is why it is written unescaped.
+            if (event.key) |key| try pg.copyEscape(&payload, allocator, key) else try payload.appendSlice(allocator, "\\N");
+            try payload.append(allocator, '\n');
+        }
+
+        try self.conn.exec("BEGIN");
+        errdefer self.conn.exec("ROLLBACK") catch {};
+        try self.conn.exec(
+            \\CREATE TEMP TABLE event_batch (
+            \\  node_id uuid, occurred_at timestamptz, action text, uri text, message text, event_key text
+            \\) ON COMMIT DROP
+        );
+        try self.conn.copyIn(
+            "COPY event_batch (node_id, occurred_at, action, uri, message, event_key) FROM STDIN",
+            payload.items,
+        );
+        const inserted = try self.conn.execParamsOptCount(
+            \\INSERT INTO security_events (node_id, occurred_at, action, uri, message, event_key)
+            \\SELECT node_id, occurred_at, action, uri, message, event_key FROM event_batch
+            \\ON CONFLICT (event_key, occurred_at) DO NOTHING
+        , &.{});
+        try self.conn.exec("COMMIT");
+        return inserted;
+    }
+
     pub fn record(self: EventRepository, node_id: [:0]const u8, action: [:0]const u8, uri: [:0]const u8, message: [:0]const u8) pg.Error!void {
         try self.conn.execParams(
             "INSERT INTO security_events (node_id, occurred_at, action, uri, message) VALUES ($1, now(), $2, $3, $4)",
@@ -1121,6 +1168,75 @@ test "keyed event ingestion is idempotent across a re-sent batch" {
     const total = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(total);
     try testing.expectEqualStrings("6", total);
+}
+
+test "COPY ingestion round-trips awkward fields and deduplicates by key" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const events = EventRepository{ .conn = conn };
+    const node_id = "77777777-7777-7777-7777-777777777777";
+    const batch = [_]Event{
+        // Fields carrying COPY's own delimiters: a tab, a newline, and a
+        // backslash must survive rather than shifting the columns after them.
+        .{ .node_id = node_id, .occurred_at = "2024-05-01T00:00:00Z", .action = "deny", .uri = "/a\tb", .message = "line\nbreak", .key = "copy-1" },
+        .{ .node_id = node_id, .occurred_at = "2024-05-01T00:00:01Z", .action = "deny", .uri = "/c\\d", .message = "back\\slash", .key = "copy-2" },
+        // A keyless event, which must be stored with a NULL key rather than the
+        // literal text "\N".
+        .{ .node_id = node_id, .occurred_at = "2024-05-01T00:00:02Z", .action = "pass", .uri = "/e", .message = "no key" },
+    };
+    try testing.expectEqual(@as(usize, 3), try events.recordBatchCopy(testing.allocator, &batch));
+
+    // Re-copying the same batch ingests only the keyless event, whose NULL key
+    // carries no identity; the two keyed events are recognized and skipped.
+    try testing.expectEqual(@as(usize, 1), try events.recordBatchCopy(testing.allocator, &batch));
+
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("4", count);
+
+    // The awkward fields came back byte-for-byte.
+    const uri = (try conn.queryScalarParams(
+        testing.allocator,
+        "SELECT uri FROM security_events WHERE event_key = $1",
+        &.{"copy-1"},
+    )).?;
+    defer testing.allocator.free(uri);
+    try testing.expectEqualStrings("/a\tb", uri);
+    const message = (try conn.queryScalarParams(
+        testing.allocator,
+        "SELECT message FROM security_events WHERE event_key = $1",
+        &.{"copy-1"},
+    )).?;
+    defer testing.allocator.free(message);
+    try testing.expectEqualStrings("line\nbreak", message);
+    const escaped = (try conn.queryScalarParams(
+        testing.allocator,
+        "SELECT uri || ' ' || message FROM security_events WHERE event_key = $1",
+        &.{"copy-2"},
+    )).?;
+    defer testing.allocator.free(escaped);
+    try testing.expectEqualStrings("/c\\d back\\slash", escaped);
+
+    // The keyless events really are NULL-keyed, not the text "\N".
+    const nulls = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE event_key IS NULL")).?;
+    defer testing.allocator.free(nulls);
+    try testing.expectEqualStrings("2", nulls);
+
+    // A batch the server rejects leaves nothing behind, staging table included.
+    const bad = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "not-a-timestamp", .action = "deny", .uri = "/x", .message = "bad", .key = "copy-3" },
+    };
+    try testing.expectError(error.QueryFailed, events.recordBatchCopy(testing.allocator, &bad));
+    const after = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("4", after);
+
+    // The failed batch's rollback left the connection usable.
+    try testing.expectEqual(@as(usize, 1), try events.recordBatchCopy(testing.allocator, &.{
+        .{ .node_id = node_id, .occurred_at = "2024-05-02T00:00:00Z", .action = "deny", .uri = "/f", .message = "after failure", .key = "copy-4" },
+    }));
 }
 
 test "a spool drain survives the server severing the connection" {

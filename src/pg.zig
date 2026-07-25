@@ -134,6 +134,31 @@ pub const Conn = struct {
         return std.fmt.parseInt(usize, tuples, 10) catch error.QueryFailed;
     }
 
+    /// Stream `data` into the server with `COPY … FROM STDIN` (#55) — one round
+    /// trip and one parse for a whole batch, instead of a statement per row.
+    ///
+    /// `data` is the COPY payload in PostgreSQL's text format: tab-separated
+    /// fields, one newline-terminated row each, `\N` for NULL, and backslash
+    /// escapes for tabs, newlines, carriage returns, and backslashes
+    /// (`copyEscape` produces exactly this). COPY cannot upsert, so callers that
+    /// need idempotency copy into a staging table and insert from it.
+    pub fn copyIn(self: *Conn, copy_sql: [:0]const u8, data: []const u8) Error!void {
+        const start = c.PQexec(self.handle, copy_sql.ptr);
+        defer c.PQclear(start);
+        if (c.PQresultStatus(start) != c.PGRES_COPY_IN) return error.QueryFailed;
+        if (c.PQputCopyData(self.handle, data.ptr, @intCast(data.len)) != 1) return error.QueryFailed;
+        // A null error message ends the stream successfully; a non-null one would
+        // ask the server to fail the COPY.
+        if (c.PQputCopyEnd(self.handle, null) != 1) return error.QueryFailed;
+        // Drain every result the COPY produced, keeping the first status.
+        var failed = false;
+        while (c.PQgetResult(self.handle)) |result| {
+            if (c.PQresultStatus(result) != c.PGRES_COMMAND_OK) failed = true;
+            c.PQclear(result);
+        }
+        if (failed) return error.QueryFailed;
+    }
+
     /// Like `queryScalar`, but with text-format bind parameters.
     pub fn queryScalarParams(self: *Conn, allocator: std.mem.Allocator, sql: [:0]const u8, params: []const [:0]const u8) Error!?[]u8 {
         if (params.len > max_params) return error.QueryFailed;
@@ -162,6 +187,20 @@ pub const Conn = struct {
         return .{ .result = result, .count = c.PQntuples(result) };
     }
 };
+
+/// Append `field` to a COPY text-format payload, escaping the four characters
+/// that would otherwise end the field, the row, or the escape itself. Without
+/// this, a URI containing a tab or a message containing a newline would shift
+/// every following column.
+pub fn copyEscape(out: *std.ArrayList(u8), allocator: std.mem.Allocator, field: []const u8) error{OutOfMemory}!void {
+    for (field) |byte| switch (byte) {
+        '\\' => try out.appendSlice(allocator, "\\\\"),
+        '\t' => try out.appendSlice(allocator, "\\t"),
+        '\n' => try out.appendSlice(allocator, "\\n"),
+        '\r' => try out.appendSlice(allocator, "\\r"),
+        else => try out.append(allocator, byte),
+    };
+}
 
 /// A forward cursor over a query result. Column values are borrowed from the
 /// result and valid only until `deinit`.
