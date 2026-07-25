@@ -2486,6 +2486,42 @@ pub const Transaction = struct {
         return values.toOwnedSlice(arena); // unknown variable
     }
 
+    /// Evaluate every executable rule in `phase` against the current transaction
+    /// state and apply the ones that match — the autonomous rule-execution loop
+    /// a connector runs each phase. For each executable head the cursor yields,
+    /// the whole chain is evaluated (all members must match); a fully-matched
+    /// chain is applied as one atomic effect batch, and an enforced disruptive
+    /// decision halts the phase. Per-rule scratch (compiled operators, resolved
+    /// values) lives in an arena reset between rules to bound memory.
+    pub fn evaluatePhase(self: *Transaction, allocator: std.mem.Allocator, phase: Phase) TransactionError!void {
+        const plan = self.compiledPlan() orelse return;
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        defer arena.deinit();
+
+        var cursor = try PhaseCursor.init(self, phase);
+        while (try cursor.next()) |head_id| {
+            _ = arena.reset(.retain_capacity);
+            const scratch = arena.allocator();
+
+            var matches: std.ArrayList(MatchedRule) = .empty;
+            var member: ?compiled_plan.RuleId = head_id;
+            var chain_matched = true;
+            while (member) |rule_id| {
+                const context = (try self.evaluateRule(scratch, rule_id)) orelse {
+                    chain_matched = false;
+                    break;
+                };
+                try matches.append(scratch, .{ .rule = rule_id, .context = context });
+                member = plan.rules[@backingInt(rule_id)].chain_next;
+            }
+
+            if (chain_matched and matches.items.len != 0) {
+                _ = try self.applyMatchedChain(matches.items);
+                if (self.isPhaseInterrupted()) break;
+            }
+        }
+    }
+
     /// Evaluate one rule against the current transaction state, returning a
     /// MatchContext for the first matching (target-value × operator) or null.
     /// Ties the execution layers together: resolve each target to values, apply
@@ -4613,6 +4649,46 @@ test "the sanitizeMatched action masks the matched variable" {
     // sanitizeMatched resolved ARGS:password and masked its body value.
     try std.testing.expect(std.mem.indexOf(u8, serial, "password=*******") != null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
+}
+
+test "evaluatePhase autonomously runs a rule set and blocks a malicious request" {
+    const input =
+        \\SecRule ARGS "@rx select.*from" "id:1,phase:1,t:lowercase,deny,status:403,msg:'SQLi'"
+        \\SecRule ARGS "@rx benign-never-matches-xyz" "id:2,phase:1,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "phase.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A request whose arg contains a SQLi pattern is blocked.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?q=SELECT%20*%20FROM%20users", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        const decision = (try tx.intervention()).?;
+        try std.testing.expectEqual(Intervention.Action.deny, decision.action);
+        try std.testing.expectEqual(@as(u16, 403), decision.status);
+    }
+
+    // A benign request passes with no intervention.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?q=hello+world", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
 }
 
 test "evaluateRule matches a rule operator against resolved, transformed targets" {
