@@ -70,6 +70,11 @@ pub const Limits = struct {
     max_header_count: usize = 256,
     max_header_bytes: usize = 64 * 1024,
     max_request_body_bytes: usize = 16 * 1024 * 1024,
+    /// How deeply a JSON body may nest before it is refused (#27). Flattening
+    /// descends one frame per level, so an unbounded body is a stack overflow —
+    /// a crash any client can cause with a few kilobytes of `[`. Coraza's default
+    /// (1024) is used, and `SecRequestBodyJsonDepthLimit` overrides it.
+    max_json_depth: usize = 1024,
     max_response_body_bytes: usize = 16 * 1024 * 1024,
     max_scalar_value_bytes: usize = 32 * 1024,
     max_scalar_storage_bytes: usize = 256 * 1024,
@@ -311,6 +316,17 @@ pub const Builder = struct {
             .configuration => |configuration| configuration,
             .diagnostic => unreachable,
         } else null;
+        const json_depth_limit = blk: {
+            const configuration = if (directive_configuration) |*value| value else break :blk self.config.limits.max_json_depth;
+            const directive = configuration.latest(.sec_request_body_json_depth_limit) orelse
+                break :blk self.config.limits.max_json_depth;
+            var values = directive.values();
+            const decoded = values.next() orelse break :blk self.config.limits.max_json_depth;
+            break :blk switch (decoded.value) {
+                .unsigned => |limit| if (limit == 0) self.config.limits.max_json_depth else @as(usize, @intCast(limit)),
+                else => self.config.limits.max_json_depth,
+            };
+        };
         const transformation_cache_enabled = self.config.transformation_cache_enabled orelse blk: {
             const configuration = if (directive_configuration) |*value| value else break :blk false;
             const directive = configuration.latest(.sec_cache_transformations) orelse break :blk false;
@@ -322,6 +338,7 @@ pub const Builder = struct {
             };
         };
         waf.* = .{
+            .json_depth_limit = json_depth_limit,
             .allocator = self.allocator,
             .config = self.config,
             .io = self.io,
@@ -354,6 +371,9 @@ pub const Waf = struct {
     plan: ?*compiled_plan.Plan,
     directive_configuration: ?directives.Configuration,
     transformation_cache_enabled: bool,
+    /// The resolved JSON nesting ceiling: `SecRequestBodyJsonDepthLimit` when the
+    /// configuration sets one, otherwise the build-time limit.
+    json_depth_limit: usize,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
 
@@ -1936,10 +1956,28 @@ pub const Transaction = struct {
         var key: std.ArrayList(u8) = .empty;
         defer key.deinit(self.waf.allocator);
         try key.appendSlice(self.waf.allocator, "json");
-        try self.flattenJson(target, &key, parsed.value);
+        self.flattenJson(target, &key, parsed.value, 0) catch |err| switch (err) {
+            // A body deeper than the limit is refused as a processor error, the same
+            // way malformed JSON is: the arguments it would have produced are not
+            // published, so no rule sees a half-flattened body.
+            error.JsonTooDeep => switch (target) {
+                .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
+                .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
+            },
+            else => |other| return other,
+        };
     }
 
-    fn flattenJson(self: *Transaction, target: BodyTarget, key: *std.ArrayList(u8), value: std.json.Value) TransactionError!void {
+    fn flattenJson(
+        self: *Transaction,
+        target: BodyTarget,
+        key: *std.ArrayList(u8),
+        value: std.json.Value,
+        depth: usize,
+    ) (TransactionError || error{JsonTooDeep})!void {
+        // Checked before descending, so the frame that would exceed the limit is
+        // never entered.
+        if (depth > self.waf.json_depth_limit) return error.JsonTooDeep;
         const gpa = self.waf.allocator;
         switch (value) {
             .object => |object| {
@@ -1948,7 +1986,7 @@ pub const Transaction = struct {
                     const base = key.items.len;
                     try key.append(gpa, '.');
                     try key.appendSlice(gpa, entry.key_ptr.*);
-                    try self.flattenJson(target, key, entry.value_ptr.*);
+                    try self.flattenJson(target, key, entry.value_ptr.*, depth + 1);
                     key.shrinkRetainingCapacity(base);
                 }
             },
@@ -1958,7 +1996,7 @@ pub const Transaction = struct {
                     try key.append(gpa, '.');
                     var idx_buf: [24]u8 = undefined;
                     try key.appendSlice(gpa, std.fmt.bufPrint(&idx_buf, "{d}", .{index}) catch unreachable);
-                    try self.flattenJson(target, key, item);
+                    try self.flattenJson(target, key, item, depth + 1);
                     key.shrinkRetainingCapacity(base);
                 }
                 if (array.items.len > 0) {
@@ -7448,4 +7486,89 @@ test "multipart anomalies are reported as flags a rule can act on" {
         try tx.evaluatePhase(std.testing.allocator, .request_body);
         try std.testing.expectEqual(@as(u16, 400), (try tx.intervention()).?.status);
     }
+}
+
+test "a deeply nested JSON body is refused instead of overflowing the stack" {
+    // Flattening descends one frame per level, and std.json happily parses a
+    // hundred thousand levels, so an unbounded body is a crash any client can cause
+    // with a few kilobytes of '['. The limit is what stands between the two.
+    var builder = Builder.init(std.testing.allocator);
+    var limits = Limits{};
+    limits.max_json_depth = 32;
+    builder.setLimits(limits);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // Within the limit: flattened normally.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "application/json");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("{\"a\":{\"b\":{\"c\":\"deep enough\"}}}");
+        try tx.processRequestBody();
+        // The flag is published as 0 from the start, so "no error" is 0 rather than
+        // an absent variable.
+        try std.testing.expectEqualStrings("0", (try tx.scalar(.reqbody_processor_error)).?.value);
+        try std.testing.expectEqualStrings("deep enough", (try tx.collectionFirst(.args, "json.a.b.c")).?.value);
+    }
+
+    // Past the limit: refused as a processor error, and nothing is published — a
+    // half-flattened body would be worse than none, since a rule would see some
+    // arguments and conclude it had seen them all.
+    {
+        var deep: [4096]u8 = undefined;
+        @memset(deep[0..2048], '[');
+        @memset(deep[2048..], ']');
+
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "application/json");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody(&deep);
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
+        try std.testing.expect((try tx.collectionFirst(.args, "json.0")) == null);
+    }
+
+    // The transaction survives it and keeps working, which is the whole point.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api?q=1", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try std.testing.expectEqualStrings("1", (try tx.collectionFirst(.args, "q")).?.value);
+    }
+}
+
+test "SecRequestBodyJsonDepthLimit overrides the build-time JSON depth" {
+    const input =
+        \\SecRequestBodyJsonDepthLimit 2
+        \\SecRule ARGS "@rx ." "id:1,phase:2,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "depth.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // Two levels is within the configured limit; three is not.
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/api", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("Content-Type", "application/json");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("{\"a\":{\"b\":{\"c\":{\"d\":1}}}}");
+    try tx.processRequestBody();
+    try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
 }
