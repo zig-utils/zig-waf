@@ -343,9 +343,6 @@ pub const TestSchema = struct {
         const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
         const value = std.mem.span(raw);
         if (value.len == 0) return error.SkipZigTest;
-        const dsn = try allocator.allocSentinel(u8, value.len, 0);
-        errdefer allocator.free(dsn);
-        @memcpy(dsn, value);
 
         var name_buffer: [64]u8 = undefined;
         const generated = std.fmt.bufPrint(&name_buffer, "waf_test_{d}_{d}", .{
@@ -356,14 +353,25 @@ pub const TestSchema = struct {
         errdefer allocator.free(name);
         @memcpy(name, generated);
 
+        // Put the schema in the connection string rather than `SET`ting it on the
+        // session, so it survives a `reset` — which the reconnect tests rely on.
+        //
+        // Notices are silenced with it: libpq prints them to stderr, and the
+        // schema teardown alone emits one per dropped table. Under the build
+        // runner that stderr traffic shares a stream with the test protocol.
+        const dsn = try allocator.printSentinel(
+            "{s} options='-csearch_path={s} -cclient_min_messages=warning'",
+            .{ value, name },
+            0,
+        );
+        errdefer allocator.free(dsn);
+
         var conn = try Conn.open(dsn);
         errdefer conn.close();
         // A crashed earlier run can leave the schema behind, so drop first.
         var sql_buffer: [256]u8 = undefined;
         try conn.exec(try bufSqlZ(&sql_buffer, "DROP SCHEMA IF EXISTS {s} CASCADE", .{name}));
         try conn.exec(try bufSqlZ(&sql_buffer, "CREATE SCHEMA {s}", .{name}));
-        // Unqualified names now resolve to this schema for the whole session.
-        try conn.exec(try bufSqlZ(&sql_buffer, "SET search_path = {s}", .{name}));
         return .{ .dsn = dsn, .name = name, .conn = conn };
     }
 
