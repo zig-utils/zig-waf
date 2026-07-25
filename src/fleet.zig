@@ -1076,6 +1076,71 @@ pub const RolloutRepository = struct {
         );
     }
 
+    /// How the cohort already assigned a version is faring — the evidence a staged
+    /// rollout needs before it widens (#54).
+    pub const CohortHealth = struct {
+        /// Nodes assigned this version.
+        assigned: usize,
+        /// Of those, how many have not been seen within the heartbeat window.
+        unresponsive: usize,
+        /// Of those, how many have not confirmed they are running it.
+        unconfirmed: usize,
+
+        /// Whether the cohort is evidence the version is safe to widen to: it has
+        /// to exist, every node has to be responsive, and every node has to have
+        /// confirmed the version it runs.
+        pub fn isHealthy(self: CohortHealth) bool {
+            return self.assigned > 0 and self.unresponsive == 0 and self.unconfirmed == 0;
+        }
+    };
+
+    /// Measure the cohort assigned `version`, counting a node as unresponsive when
+    /// its last heartbeat is older than `max_age_seconds` (or it has never sent
+    /// one).
+    pub fn healthOfVersion(
+        self: RolloutRepository,
+        ruleset_name: [:0]const u8,
+        version: [:0]const u8,
+        max_age_seconds: u32,
+    ) pg.Error!CohortHealth {
+        var seconds_buffer: [16]u8 = undefined;
+        const seconds = std.fmt.bufPrint(&seconds_buffer, "{d}", .{max_age_seconds}) catch return error.QueryFailed;
+        seconds_buffer[seconds.len] = 0;
+        var rows = try self.conn.query(
+            \\SELECT count(*),
+            \\  count(*) FILTER (WHERE n.last_seen_at IS NULL OR n.last_seen_at < now() - make_interval(secs => $3::int)),
+            \\  count(*) FILTER (WHERE nr.running_version IS DISTINCT FROM nr.version)
+            \\FROM node_rulesets nr JOIN nodes n USING (node_id)
+            \\WHERE nr.ruleset_name = $1 AND nr.version = $2::int
+        , &.{ ruleset_name, version, seconds_buffer[0..seconds.len :0] });
+        defer rows.deinit();
+        if (!rows.next()) return error.QueryFailed; // aggregates always return a row
+        return .{
+            .assigned = std.fmt.parseInt(usize, rows.get(0), 10) catch return error.QueryFailed,
+            .unresponsive = std.fmt.parseInt(usize, rows.get(1), 10) catch return error.QueryFailed,
+            .unconfirmed = std.fmt.parseInt(usize, rows.get(2), 10) catch return error.QueryFailed,
+        };
+    }
+
+    /// Widen a rollout to the whole fleet only if the cohort already on `version`
+    /// is healthy — the gate between a canary and everyone (#54). Returns the
+    /// number of nodes moved, or null when the gate held the rollout back.
+    ///
+    /// An empty cohort fails the gate. Rolling out to the fleet on the strength of
+    /// a canary that was never actually deployed is exactly the mistake a gate
+    /// exists to prevent, so the absence of evidence is not treated as evidence.
+    pub fn advanceIfHealthy(
+        self: RolloutRepository,
+        allocator: std.mem.Allocator,
+        ruleset_name: [:0]const u8,
+        version: [:0]const u8,
+        max_age_seconds: u32,
+    ) pg.Error!?[]u8 {
+        const health = try self.healthOfVersion(ruleset_name, version, max_age_seconds);
+        if (!health.isHealthy()) return null;
+        return self.assignAll(allocator, ruleset_name, version);
+    }
+
     /// A node reports the version it is actually running (#54), normally on its
     /// heartbeat. A node with no assignment for this ruleset has nothing to drift
     /// from, so the report is ignored rather than inventing an assignment.
@@ -1822,6 +1887,85 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
         const vb2 = (try rollout.assignedVersion(testing.allocator, b, "crs")).?;
         defer testing.allocator.free(vb2);
         try testing.expectEqualStrings("3", vb2); // unlabeled node b untouched
+    }
+}
+
+test "a rollout widens only when its canary cohort is healthy" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const nodes = NodeRepository{ .conn = conn };
+    const rollout = RolloutRepository{ .conn = conn };
+    const canary = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const rest1 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    const rest2 = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    for ([_][:0]const u8{ canary, rest1, rest2 }) |node| try nodes.enroll(node, "edge", "1.0");
+
+    // Nothing has been canaried: the gate holds, because rolling out to the fleet
+    // on the strength of a canary that was never deployed is the mistake it exists
+    // to prevent.
+    try testing.expect((try rollout.advanceIfHealthy(testing.allocator, "crs", "2", 60)) == null);
+    {
+        const health = try rollout.healthOfVersion("crs", "2", 60);
+        try testing.expectEqual(@as(usize, 0), health.assigned);
+        try testing.expect(!health.isHealthy());
+    }
+
+    // Canary the version. It is assigned but unconfirmed, so the gate still holds:
+    // the node has not said it is running the new policy.
+    try rollout.assign(canary, "crs", "2");
+    try nodes.heartbeat(canary);
+    {
+        const health = try rollout.healthOfVersion("crs", "2", 60);
+        try testing.expectEqual(@as(usize, 1), health.assigned);
+        try testing.expectEqual(@as(usize, 0), health.unresponsive);
+        try testing.expectEqual(@as(usize, 1), health.unconfirmed);
+    }
+    try testing.expect((try rollout.advanceIfHealthy(testing.allocator, "crs", "2", 60)) == null);
+
+    // The canary confirms it is running v2 and is heartbeating, so the cohort is
+    // healthy and the rollout widens to the whole fleet.
+    try rollout.reportRunning(canary, "crs", "2");
+    {
+        const health = try rollout.healthOfVersion("crs", "2", 60);
+        try testing.expect(health.isHealthy());
+    }
+    for ([_][:0]const u8{ rest1, rest2 }) |node| try nodes.heartbeat(node);
+    {
+        const rolled = (try rollout.advanceIfHealthy(testing.allocator, "crs", "2", 60)).?;
+        defer testing.allocator.free(rolled);
+        try testing.expectEqualStrings("3", rolled);
+    }
+
+    // A canary that stops heartbeating fails the gate for the next version, even
+    // though it has confirmed the version it runs — an unresponsive node is not
+    // evidence that a policy is safe.
+    try rollout.assign(canary, "crs", "3");
+    try rollout.reportRunning(canary, "crs", "3");
+    try conn.execParams("UPDATE nodes SET last_seen_at = now() - interval '1 hour' WHERE node_id = $1", &.{canary});
+    {
+        const health = try rollout.healthOfVersion("crs", "3", 60);
+        try testing.expectEqual(@as(usize, 1), health.assigned);
+        try testing.expectEqual(@as(usize, 1), health.unresponsive);
+        try testing.expectEqual(@as(usize, 0), health.unconfirmed);
+        try testing.expect(!health.isHealthy());
+    }
+    try testing.expect((try rollout.advanceIfHealthy(testing.allocator, "crs", "3", 60)) == null);
+
+    // The fleet is still on v2 — the failed gate changed nothing.
+    {
+        const on2 = (try rollout.countOnVersion(testing.allocator, "crs", "2")).?;
+        defer testing.allocator.free(on2);
+        try testing.expectEqualStrings("2", on2);
+    }
+
+    // A window long enough to cover the last heartbeat passes the gate: the health
+    // question is always "within what window", not an absolute.
+    {
+        const rolled = (try rollout.advanceIfHealthy(testing.allocator, "crs", "3", 7200)).?;
+        defer testing.allocator.free(rolled);
+        try testing.expectEqualStrings("3", rolled);
     }
 }
 

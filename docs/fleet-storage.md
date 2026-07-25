@@ -75,6 +75,17 @@ keep HMAC-SHA256, where the secret is shared with exactly one receiver by design
 or fleet-wide, and reports how many nodes are on a version so convergence is
 observable.
 
+Nodes report the version they are actually running, so the control plane can name
+the nodes that have *drifted* from their assignment — never reconciled, failed to
+apply a bundle, or changed out of band. A node that has never reported counts as
+drifted; silence is not compliance.
+
+`advanceIfHealthy` is the gate between a canary and the fleet: it widens a rollout
+only when every node already on the version is heartbeating within the window and
+has confirmed the version it runs. An empty cohort fails the gate, because rolling
+out on the strength of a canary that was never deployed is the mistake a gate
+exists to prevent. A failed gate changes nothing.
+
 ## Event ingestion
 
 A node buffers events in an `EventSpool` and a worker drains the queue to
