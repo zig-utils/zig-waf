@@ -48,11 +48,51 @@ pub const Operator = struct {
     }
 };
 
+/// A host-provided body processor: given the buffered body, it publishes arguments
+/// the WAF's built-in processors do not know how to extract — protobuf, msgpack, a
+/// bespoke form encoding.
+///
+/// The processor is selected by name through `ctl:requestBodyProcessor`, exactly
+/// like the built-in ones, and reports each extracted argument through `publish`.
+/// It runs on the request path with the body already in memory, so it must not do
+/// I/O of its own.
+pub const BodyProcessor = struct {
+    /// The processor name, matched case-insensitively against `ctl:requestBodyProcessor`.
+    name: []const u8,
+    context: *anyopaque,
+    processFn: *const fn (context: *anyopaque, body: []const u8, sink: ArgumentSink) ProcessResult,
+
+    pub fn process(self: BodyProcessor, body: []const u8, sink: ArgumentSink) ProcessResult {
+        return self.processFn(self.context, body, sink);
+    }
+};
+
+/// Where a body processor puts what it extracts. Names and values are copied by the
+/// WAF, so the processor may reuse its own buffers.
+pub const ArgumentSink = struct {
+    context: *anyopaque,
+    addFn: *const fn (context: *anyopaque, name: []const u8, value: []const u8) error{SinkRejected}!void,
+
+    pub fn add(self: ArgumentSink, name: []const u8, value: []const u8) error{SinkRejected}!void {
+        return self.addFn(self.context, name, value);
+    }
+};
+
+/// How a body processor finished. A processor that gives up must say so: a body it
+/// silently declined to read is a body no rule inspected.
+pub const ProcessResult = enum {
+    processed,
+    /// The body was malformed for this processor. The WAF raises
+    /// REQBODY_PROCESSOR_ERROR, as it does for its own processors.
+    malformed,
+};
+
 /// The set of extensions a host provides. Borrowed by the WAF for its lifetime, so
 /// the host owns the storage and must outlive it — the same ownership rule as the
 /// persistent-collection backend.
 pub const Registry = struct {
     operators: []const Operator = &.{},
+    body_processors: []const BodyProcessor = &.{},
 
     /// The plugin answering to `name` (with or without a leading `@`), or null.
     pub fn findOperator(self: *const Registry, name: []const u8) ?*const Operator {
@@ -76,6 +116,21 @@ pub const Registry = struct {
         return out[0..count];
     }
 
+    /// The registered body-processor names, for passing to plan compilation.
+    pub fn bodyProcessorNames(self: *const Registry, out: [][]const u8) [][]const u8 {
+        const count = @min(out.len, self.body_processors.len);
+        for (self.body_processors[0..count], out[0..count]) |processor, *slot| slot.* = processor.name;
+        return out[0..count];
+    }
+
+    /// The body processor answering to `name`, or null.
+    pub fn findBodyProcessor(self: *const Registry, name: []const u8) ?*const BodyProcessor {
+        for (self.body_processors) |*processor| {
+            if (std.ascii.eqlIgnoreCase(processor.name, name)) return processor;
+        }
+        return null;
+    }
+
     /// A registry is only usable if its names are distinct and non-empty: two
     /// plugins answering to one name would make which of them runs depend on
     /// registration order.
@@ -84,6 +139,12 @@ pub const Registry = struct {
             if (operator.name.len == 0) return error.EmptyPluginName;
             for (self.operators[0..index]) |previous| {
                 if (std.ascii.eqlIgnoreCase(previous.name, operator.name)) return error.DuplicatePluginName;
+            }
+        }
+        for (self.body_processors, 0..) |processor, index| {
+            if (processor.name.len == 0) return error.EmptyPluginName;
+            for (self.body_processors[0..index]) |previous| {
+                if (std.ascii.eqlIgnoreCase(previous.name, processor.name)) return error.DuplicatePluginName;
             }
         }
     }

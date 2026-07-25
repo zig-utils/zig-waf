@@ -703,6 +703,9 @@ pub const ControlState = struct {
     request_body_access: bool = true,
     request_body_limit: usize,
     request_body_processor: ?action_config.BodyProcessor = null,
+    /// A host-provided processor named by `ctl:requestBodyProcessor` (#23). Held as
+    /// a name because the set of plugin processors is not known at compile time.
+    request_body_processor_plugin: ?[]const u8 = null,
     response_body_access: bool = true,
     response_body_processor: ?action_config.BodyProcessor = null,
 };
@@ -1528,8 +1531,17 @@ pub const Transaction = struct {
                     },
                     .request_body_processor => {
                         if (self.currentPhase() != .request_headers) return error.ControlTooLate;
-                        staged.request_body_processor = action_config.parseBodyProcessor(expanded) catch
+                        staged.request_body_processor = action_config.parseBodyProcessor(expanded) catch plugin_processor: {
+                            // A name the built-ins do not know may still be a host
+                            // processor; anything else is a configuration error.
+                            if (self.waf.plugins) |registry| {
+                                if (registry.findBodyProcessor(expanded)) |provider| {
+                                    staged.request_body_processor_plugin = provider.name;
+                                    break :plugin_processor null;
+                                }
+                            }
                             return error.InvalidActionValue;
+                        };
                     },
                     .response_body_access => {
                         const phase = self.currentPhase() orelse return error.InvalidLifecycle;
@@ -1911,7 +1923,11 @@ pub const Transaction = struct {
                 if (self.scalar_variables.get(.reqbody_processor, .request_body)) |existing| break :blk existing.value;
                 break :blk null;
             };
-            if (processor) |name| {
+            // A host processor selected by ctl runs instead of the built-ins, and
+            // publishes what it extracts through the same argument path.
+            if (self.control_state.request_body_processor_plugin) |plugin_name| {
+                try self.runPluginBodyProcessor(plugin_name, body);
+            } else if (processor) |name| {
                 if (std.mem.eql(u8, name, "URLENCODED")) {
                     try self.parseBodyArguments(body);
                 } else if (std.mem.eql(u8, name, "JSON")) {
@@ -1926,6 +1942,43 @@ pub const Transaction = struct {
         self.phase_interrupted = false;
         self.lifecycle = .request_body;
     }
+
+    /// Run a host-provided body processor (#23), publishing what it extracts as
+    /// request-body arguments. A processor that reports the body malformed raises
+    /// REQBODY_PROCESSOR_ERROR, exactly as a built-in one does — a body a processor
+    /// declined to read is a body no rule inspected, so it must not pass silently.
+    fn runPluginBodyProcessor(self: *Transaction, name: []const u8, body: []const u8) TransactionError!void {
+        const registry = self.waf.plugins orelse return;
+        const provider = registry.findBodyProcessor(name) orelse return;
+        try self.setScalar(.reqbody_processor, provider.name, .parser, .request_body);
+        var sink_state = PluginArgumentSink{ .transaction = self };
+        const result = provider.process(body, .{ .context = &sink_state, .addFn = PluginArgumentSink.add });
+        if (sink_state.failed) return error.CollectionStorageLimitExceeded;
+        switch (result) {
+            .processed => {},
+            .malformed => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
+        }
+    }
+
+    /// Adapts a plugin's argument callback onto the transaction's argument store.
+    const PluginArgumentSink = struct {
+        transaction: *Transaction,
+        failed: bool = false,
+
+        fn add(context: *anyopaque, name: []const u8, value: []const u8) error{SinkRejected}!void {
+            const self: *PluginArgumentSink = @ptrCast(@alignCast(context));
+            self.transaction.addArgument(.body, name, value, .{
+                .origin = .request_body,
+                .offset = 0,
+                .length = value.len,
+            }) catch {
+                // The transaction's own limits still bound a plugin: it cannot
+                // publish more arguments than the configuration allows.
+                self.failed = true;
+                return error.SinkRejected;
+            };
+        }
+    };
 
     /// Populate ARGS_POST from a urlencoded request body, reusing the pinned
     /// query decoding and the configured SecArgumentSeparator.
@@ -7791,7 +7844,7 @@ test "a host plugin provides an operator the engine has no built-in for" {
         &documents,
         .{},
         null,
-        registry.operatorNames(&names),
+        .{ .operators = registry.operatorNames(&names) },
     );
     defer plan.deinit();
     var builder = Builder.init(std.testing.allocator);
@@ -7837,5 +7890,108 @@ test "a host plugin provides an operator the engine has no built-in for" {
         try tx.evaluatePhase(std.testing.allocator, .request_headers);
         try std.testing.expect((try tx.intervention()) == null);
         try std.testing.expectEqual(@as(usize, 1), tx.pluginUnavailableCount());
+    }
+}
+
+/// A host body processor for a made-up encoding: `name:value` pairs separated by
+/// semicolons, which no built-in processor knows how to read.
+const TestBodyProcessorPlugin = struct {
+    fn process(context: *anyopaque, body: []const u8, sink: plugin.ArgumentSink) plugin.ProcessResult {
+        _ = context;
+        var pairs = std.mem.splitScalar(u8, body, ';');
+        while (pairs.next()) |pair| {
+            if (pair.len == 0) continue;
+            const colon = std.mem.indexOfScalar(u8, pair, ':') orelse return .malformed;
+            sink.add(pair[0..colon], pair[colon + 1 ..]) catch return .malformed;
+        }
+        return .processed;
+    }
+
+    fn processor(self: *TestBodyProcessorPlugin) plugin.BodyProcessor {
+        return .{ .name = "PAIRS", .context = self, .processFn = process };
+    }
+};
+
+test "a host body processor publishes arguments rules can inspect" {
+    var host = TestBodyProcessorPlugin{};
+    const processors = [_]plugin.BodyProcessor{host.processor()};
+    const registry = plugin.Registry{ .body_processors = &processors };
+    try registry.validate();
+
+    const input =
+        \\SecRule REQUEST_HEADERS:Host "@rx ." "id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=PAIRS"
+        \\SecRule ARGS:token "@streq secret" "id:2,phase:2,deny,status:403,t:none,msg:'leaked token'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "pairs.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    var processor_names: [4][]const u8 = undefined;
+    const plan = try compiled_plan.compileWithPlugins(
+        std.testing.allocator,
+        &parsed.registry,
+        &documents,
+        .{},
+        null,
+        .{ .body_processors = registry.bodyProcessorNames(&processor_names) },
+    );
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setPluginRegistry(&registry);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // The host processor read a body no built-in understands, and its arguments are
+    // ordinary ARGS as far as the rules are concerned.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Host", "example.com");
+        try tx.addRequestHeader("Content-Type", "application/x-pairs");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try tx.writeRequestBody("user:alice;token:secret");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("alice", (try tx.collectionFirst(.args, "user")).?.value);
+        try tx.evaluatePhase(std.testing.allocator, .request_body);
+        try std.testing.expectEqual(@as(u16, 403), (try tx.intervention()).?.status);
+        try std.testing.expectEqualStrings("PAIRS", (try tx.scalar(.reqbody_processor)).?.value);
+    }
+
+    // A body the processor cannot read raises the same error a built-in would: a
+    // body nothing could parse must not look like a body with no arguments in it.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Host", "example.com");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try tx.writeRequestBody("this has no pairs at all");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.reqbody_processor_error)).?.value);
+    }
+
+    // A ctl naming a processor nothing provides fails to compile, rather than
+    // leaving a body that no processor would ever read.
+    {
+        const bad =
+            \\SecRule REQUEST_HEADERS:Host "@rx ." "id:1,phase:1,pass,nolog,ctl:requestBodyProcessor=NOSUCH"
+        ;
+        var bad_parsed = try seclang.parser.parseBytes(std.testing.allocator, "bad.conf", bad, .{}, .{});
+        defer bad_parsed.deinit();
+        var bad_documents = [_]seclang.parser.Document{bad_parsed.document};
+        var bad_names: [4][]const u8 = undefined;
+        try std.testing.expectError(error.InvalidRuntimeControl, compiled_plan.compileWithPlugins(
+            std.testing.allocator,
+            &bad_parsed.registry,
+            &bad_documents,
+            .{},
+            null,
+            .{ .body_processors = registry.bodyProcessorNames(&bad_names) },
+        ));
     }
 }
