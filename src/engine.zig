@@ -2548,6 +2548,8 @@ pub const Transaction = struct {
 
         const transforms = plan.transformations[rule.transformations_start..][0..rule.transformations_count];
         const targets = plan.targets[rule.targets_start..][0..rule.targets_count];
+        const negated = rule.operator.negated;
+        const multi = rule.flow.multi_match;
         for (targets) |target| {
             if (target.modifier == .negated) continue; // exclusion form
             const variable_name = plan.string(target.collection) orelse continue;
@@ -2555,20 +2557,30 @@ pub const Transaction = struct {
             const count = target.modifier == .count;
             const values = try self.resolveTarget(arena, variable_name, selector, count);
             for (values) |resolved| {
-                const transformed = if (transforms.len == 0)
-                    resolved.value
-                else transformed: {
-                    const result = self.transformation_executor.applyPipeline(transforms, resolved.value, false) catch
-                        break :transformed resolved.value;
-                    break :transformed result.bytes;
-                };
-                if (operator.evaluate(transformed, .modsecurity) != rule.operator.negated) {
-                    const owned = try arena.dupe(u8, transformed);
-                    return MatchContext{
-                        .name = resolved.name,
-                        .value = owned,
-                        .source = .{ .origin = .rule, .offset = 0, .length = owned.len },
+                if (transforms.len != 0 and multi) {
+                    // multiMatch: evaluate the operator after every transformation
+                    // stage (including the original), matching the first hit.
+                    const result = self.transformation_executor.applyPipeline(transforms, resolved.value, true) catch {
+                        if (operator.evaluate(resolved.value, .modsecurity) != negated)
+                            return try matchContext(arena, resolved.name, resolved.value);
+                        continue;
                     };
+                    for (result.checkpoints) |checkpoint| {
+                        if (operator.evaluate(checkpoint.bytes, .modsecurity) != negated)
+                            return try matchContext(arena, resolved.name, checkpoint.bytes);
+                    }
+                    if (operator.evaluate(result.bytes, .modsecurity) != negated)
+                        return try matchContext(arena, resolved.name, result.bytes);
+                } else {
+                    const transformed = if (transforms.len == 0)
+                        resolved.value
+                    else transformed: {
+                        const result = self.transformation_executor.applyPipeline(transforms, resolved.value, false) catch
+                            break :transformed resolved.value;
+                        break :transformed result.bytes;
+                    };
+                    if (operator.evaluate(transformed, .modsecurity) != negated)
+                        return try matchContext(arena, resolved.name, transformed);
                 }
             }
         }
@@ -3629,6 +3641,13 @@ fn lock(mutex: *std.atomic.Mutex) void {
 fn validAddress(address: []const u8) bool {
     if (address.len == 0 or address.len > 255) return false;
     return !containsLineBreak(address) and std.mem.indexOfScalar(u8, address, 0) == null;
+}
+
+/// Build a MatchContext, copying the matched value into `arena` so it survives
+/// the transformation executor's buffer being reused.
+fn matchContext(arena: std.mem.Allocator, name: []const u8, value: []const u8) std.mem.Allocator.Error!MatchContext {
+    const owned = try arena.dupe(u8, value);
+    return .{ .name = name, .value = owned, .source = .{ .origin = .rule, .offset = 0, .length = owned.len } };
 }
 
 /// Append a formatted fragment to an audit-message buffer using `arena`.
@@ -4694,6 +4713,39 @@ test "evaluatePhase autonomously runs a rule set and blocks a malicious request"
         try tx.evaluatePhase(std.testing.allocator, .request_headers);
         try std.testing.expect((try tx.intervention()) == null);
     }
+}
+
+test "evaluateRule with multiMatch matches at an intermediate transformation stage" {
+    // Without multiMatch this would only see the final (url-decoded) value; with
+    // it, the operator also runs against the pre-decode stage.
+    const input =
+        \\SecRule ARGS "@contains %20" "id:1,phase:1,t:urlDecodeUni,multiMatch,deny"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "multimatch.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    // The raw arg value contains the literal "%20"; url-decoding turns it into a
+    // space, so "@contains %20" only matches the pre-decode stage.
+    try tx.processUri("/x?p=a%2520b", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+
+    const match = (try tx.evaluateRule(a, @fromBackingInt(0)));
+    try std.testing.expect(match != null);
+    try std.testing.expect(std.mem.indexOf(u8, match.?.value, "%20") != null);
 }
 
 test "evaluateRule expands a macro in the operator argument" {
