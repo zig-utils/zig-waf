@@ -250,23 +250,31 @@ pub const EventSpool = struct {
     /// Copy an event into the queue. Fails with SpoolFull once `capacity` events
     /// are queued (backpressure) so memory stays bounded when ingestion stalls.
     pub fn enqueue(self: *EventSpool, event: Event) EnqueueError!void {
+        return self.enqueueRaw(event.node_id, event.occurred_at, event.action, event.uri, event.message);
+    }
+
+    /// The shared allocation path behind `enqueue` and `restore`. Fields are
+    /// `[]const u8` (not necessarily sentinel-terminated) so a decoded snapshot
+    /// can reuse it; each is copied into a sentinel-terminated Owned.
+    fn enqueueRaw(self: *EventSpool, node_id: []const u8, occurred_at: []const u8, action: []const u8, uri: []const u8, message: []const u8) EnqueueError!void {
         if (self.events.items.len >= self.capacity) return error.SpoolFull;
-        var owned: Owned = .{
-            .node_id = try dup(self.allocator, event.node_id),
-            .occurred_at = undefined,
-            .action = undefined,
-            .uri = undefined,
-            .message = undefined,
-        };
-        errdefer self.allocator.free(owned.node_id);
-        owned.occurred_at = try dup(self.allocator, event.occurred_at);
-        errdefer self.allocator.free(owned.occurred_at);
-        owned.action = try dup(self.allocator, event.action);
-        errdefer self.allocator.free(owned.action);
-        owned.uri = try dup(self.allocator, event.uri);
-        errdefer self.allocator.free(owned.uri);
-        owned.message = try dup(self.allocator, event.message);
-        try self.events.append(self.allocator, owned);
+        const owned_node = try dup(self.allocator, node_id);
+        errdefer self.allocator.free(owned_node);
+        const owned_occurred = try dup(self.allocator, occurred_at);
+        errdefer self.allocator.free(owned_occurred);
+        const owned_action = try dup(self.allocator, action);
+        errdefer self.allocator.free(owned_action);
+        const owned_uri = try dup(self.allocator, uri);
+        errdefer self.allocator.free(owned_uri);
+        const owned_message = try dup(self.allocator, message);
+        errdefer self.allocator.free(owned_message);
+        try self.events.append(self.allocator, .{
+            .node_id = owned_node,
+            .occurred_at = owned_occurred,
+            .action = owned_action,
+            .uri = owned_uri,
+            .message = owned_message,
+        });
     }
 
     /// Ingest the whole queue into PostgreSQL in one batched transaction and
@@ -290,10 +298,88 @@ pub const EventSpool = struct {
         return drained;
     }
 
-    fn dup(allocator: std.mem.Allocator, value: [:0]const u8) error{OutOfMemory}![:0]u8 {
+    fn dup(allocator: std.mem.Allocator, value: []const u8) error{OutOfMemory}![:0]u8 {
         const owned = try allocator.allocSentinel(u8, value.len, 0);
         @memcpy(owned, value);
         return owned;
+    }
+
+    // ---- crash durability (#55) ----------------------------------------
+    //
+    // The queue is snapshotted to a single file so a crash or restart loses at
+    // most the events enqueued since the last `persist`. The format is
+    // self-describing and length-prefixed: a u32 event count, then per event
+    // five (u32 length, bytes) fields, all little-endian. `restore` bounds every
+    // read against the file so a truncated or corrupt snapshot is rejected
+    // rather than trusted.
+
+    /// A generous ceiling on a snapshot we will read back, guarding against a
+    /// corrupt or hostile length header claiming a huge file.
+    pub const max_snapshot_bytes = 256 * 1024 * 1024;
+
+    pub const RestoreError = error{ SpoolFull, OutOfMemory, CorruptSnapshot, ReadFailed };
+
+    /// Write the queued events to `sub_path` in `dir` as a length-prefixed
+    /// snapshot. Call after enqueues (and after a successful `drain`, which
+    /// leaves an empty snapshot) so the file always mirrors the live queue.
+    pub fn persist(self: *const EventSpool, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) error{ OutOfMemory, WriteFailed }!void {
+        var buffer: std.ArrayList(u8) = .empty;
+        defer buffer.deinit(self.allocator);
+        try appendU32(&buffer, self.allocator, @intCast(self.events.items.len));
+        for (self.events.items) |event| {
+            inline for (.{ event.node_id, event.occurred_at, event.action, event.uri, event.message }) |field| {
+                try appendU32(&buffer, self.allocator, @intCast(field.len));
+                try buffer.appendSlice(self.allocator, field);
+            }
+        }
+        dir.writeFile(io, .{ .sub_path = sub_path, .data = buffer.items }) catch return error.WriteFailed;
+    }
+
+    /// Reload a snapshot written by `persist` into this (expected empty) queue.
+    /// A missing file is a clean start (no error). Every field is bounds-checked
+    /// against the file; a short or malformed snapshot yields CorruptSnapshot.
+    pub fn restore(self: *EventSpool, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) RestoreError!void {
+        const bytes = dir.readFileAlloc(io, sub_path, self.allocator, .limited(max_snapshot_bytes)) catch |err| switch (err) {
+            error.FileNotFound => return,
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ReadFailed,
+        };
+        defer self.allocator.free(bytes);
+        var cursor: usize = 0;
+        const count = try readU32(bytes, &cursor);
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            const node_id = try readField(bytes, &cursor);
+            const occurred_at = try readField(bytes, &cursor);
+            const action = try readField(bytes, &cursor);
+            const uri = try readField(bytes, &cursor);
+            const message = try readField(bytes, &cursor);
+            try self.enqueueRaw(node_id, occurred_at, action, uri, message);
+        }
+        // Trailing bytes after the declared events mean the snapshot is not what
+        // it claims — reject rather than silently ignore the tail.
+        if (cursor != bytes.len) return error.CorruptSnapshot;
+    }
+
+    fn appendU32(buffer: *std.ArrayList(u8), allocator: std.mem.Allocator, value: u32) error{OutOfMemory}!void {
+        var encoded: [4]u8 = undefined;
+        std.mem.writeInt(u32, &encoded, value, .little);
+        try buffer.appendSlice(allocator, &encoded);
+    }
+
+    fn readU32(bytes: []const u8, cursor: *usize) error{CorruptSnapshot}!u32 {
+        if (cursor.* + 4 > bytes.len) return error.CorruptSnapshot;
+        const value = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
+        cursor.* += 4;
+        return value;
+    }
+
+    fn readField(bytes: []const u8, cursor: *usize) error{CorruptSnapshot}![]const u8 {
+        const field_len = try readU32(bytes, cursor);
+        if (cursor.* + field_len > bytes.len) return error.CorruptSnapshot;
+        const field = bytes[cursor.*..][0..field_len];
+        cursor.* += field_len;
+        return field;
     }
 };
 
@@ -487,6 +573,54 @@ test "event spool buffers, drains in a batch, and retains on failure" {
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
+}
+
+test "event spool survives a crash via its on-disk snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // A missing snapshot is a clean start, not an error.
+    var fresh = EventSpool.init(testing.allocator, 8);
+    defer fresh.deinit();
+    try fresh.restore(io, tmp.dir, "spool.bin");
+    try testing.expectEqual(@as(usize, 0), fresh.len());
+
+    // Enqueue events (including an SQLi-shaped URI with embedded quotes) and
+    // snapshot them to disk — as a worker would before a crash.
+    {
+        var spool = EventSpool.init(testing.allocator, 8);
+        defer spool.deinit();
+        try spool.enqueue(.{ .node_id = "77777777-7777-7777-7777-777777777777", .occurred_at = "2024-05-01T00:00:00Z", .action = "deny", .uri = "/a?id=1", .message = "first" });
+        try spool.enqueue(.{ .node_id = "88888888-8888-8888-8888-888888888888", .occurred_at = "2024-05-01T00:00:01Z", .action = "pass", .uri = "/'; DROP TABLE nodes; --", .message = "second" });
+        try spool.persist(io, tmp.dir, "spool.bin");
+    }
+
+    // A brand-new spool (as after a restart) recovers both events verbatim.
+    var recovered = EventSpool.init(testing.allocator, 8);
+    defer recovered.deinit();
+    try recovered.restore(io, tmp.dir, "spool.bin");
+    try testing.expectEqual(@as(usize, 2), recovered.len());
+    try testing.expectEqualStrings("77777777-7777-7777-7777-777777777777", recovered.events.items[0].node_id);
+    try testing.expectEqualStrings("/a?id=1", recovered.events.items[0].uri);
+    try testing.expectEqualStrings("/'; DROP TABLE nodes; --", recovered.events.items[1].uri);
+    try testing.expectEqualStrings("second", recovered.events.items[1].message);
+
+    // Persisting an empty spool (as after a successful drain) leaves an empty
+    // snapshot, so recovery yields nothing.
+    var empty = EventSpool.init(testing.allocator, 8);
+    defer empty.deinit();
+    try empty.persist(io, tmp.dir, "spool.bin");
+    var reloaded = EventSpool.init(testing.allocator, 8);
+    defer reloaded.deinit();
+    try reloaded.restore(io, tmp.dir, "spool.bin");
+    try testing.expectEqual(@as(usize, 0), reloaded.len());
+
+    // A truncated snapshot is rejected rather than trusted.
+    try tmp.dir.writeFile(io, .{ .sub_path = "corrupt.bin", .data = &[_]u8{ 1, 0, 0, 0, 5, 0, 0, 0, 'a', 'b' } });
+    var corrupt = EventSpool.init(testing.allocator, 8);
+    defer corrupt.deinit();
+    try testing.expectError(error.CorruptSnapshot, corrupt.restore(io, tmp.dir, "corrupt.bin"));
 }
 
 test "batched event ingestion commits the whole batch atomically" {
