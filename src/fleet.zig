@@ -793,8 +793,65 @@ pub const RolloutRepository = struct {
 };
 
 // ---- tests --------------------------------------------------------------
+//
+// The integration tests need a live PostgreSQL named by PG_TEST_DSN and skip
+// when it is unset. Each one runs against a freshly migrated, empty schema
+// (`TestDb`), so tests neither see each other's rows nor depend on order.
 
 const testing = std.testing;
+
+/// Every table the fleet schema owns, for test teardown. Partitions of
+/// `security_events` are removed with their parent by the CASCADE.
+const schema_tables = "nodes, rulesets, security_events, alert_rules, node_rulesets, alert_deliveries";
+
+/// A connection to the PG_TEST_DSN database whose fleet schema has been dropped
+/// and rebuilt, so a test starts from empty tables at the latest version.
+const TestDb = struct {
+    dsn: [:0]u8,
+    conn: pg.Conn,
+
+    /// Reset and migrate. Returns error.SkipZigTest when PG_TEST_DSN is unset,
+    /// which is how the suite stays runnable without a database.
+    fn open(allocator: std.mem.Allocator) !TestDb {
+        var db = try openUnmigrated(allocator);
+        _ = apply(&db.conn, allocator) catch |err| {
+            db.close();
+            return err;
+        };
+        return db;
+    }
+
+    /// Reset without migrating — for tests that assert on `apply` itself.
+    fn openUnmigrated(allocator: std.mem.Allocator) !TestDb {
+        const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+        const value = std.mem.span(raw);
+        if (value.len == 0) return error.SkipZigTest;
+        const dsn = try allocator.allocSentinel(u8, value.len, 0);
+        errdefer allocator.free(dsn);
+        @memcpy(dsn, value);
+        var conn = try pg.Conn.open(dsn);
+        reset(&conn);
+        return .{ .dsn = dsn, .conn = conn };
+    }
+
+    /// Drop the fleet schema and close. Leaves the database as it was found.
+    fn close(self: *TestDb) void {
+        reset(&self.conn);
+        self.conn.close();
+        testing.allocator.free(self.dsn);
+        self.* = undefined;
+    }
+
+    /// Drop every fleet table and forget every fleet migration, so the next
+    /// `apply` exercises the real DDL. Tolerates a database that has neither
+    /// (a clean slate) — which is why nothing here is fatal.
+    fn reset(conn: *pg.Conn) void {
+        conn.exec("DROP TABLE IF EXISTS " ++ schema_tables ++ " CASCADE") catch {};
+        // Derived from `migrations`, so a new migration needs no test edits.
+        const highest = comptime migrations[migrations.len - 1].version;
+        conn.exec(std.fmt.comptimePrint("DELETE FROM schema_migrations WHERE version BETWEEN 1 AND {d}", .{highest})) catch {};
+    }
+};
 
 test "signPayload matches the HMAC-SHA256 reference vector" {
     // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?".
@@ -809,23 +866,13 @@ test "signPayload matches the HMAC-SHA256 reference vector" {
 }
 
 test "the fleet schema applies to a clean database and is idempotent" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    // Start from a clean slate so the migration exercises real DDL.
+    var db = try TestDb.openUnmigrated(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-
-    // Start from a clean slate so the migration exercises real DDL. The
-    // schema_migrations table may not exist yet, so tolerate that delete.
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-
-    try testing.expectEqual(migrations.len, try apply(&conn, testing.allocator));
-    try testing.expectEqual(@as(usize, 0), try apply(&conn, testing.allocator)); // idempotent
+    try testing.expectEqual(migrations.len, try apply(conn, testing.allocator));
+    try testing.expectEqual(@as(usize, 0), try apply(conn, testing.allocator)); // idempotent
 
     // The core tables exist and are usable.
     for ([_][:0]const u8{ "nodes", "rulesets", "security_events", "alert_rules" }) |table_name| {
@@ -849,26 +896,14 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "event retention prunes only events past the window" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const events = EventRepository{ .conn = &conn };
+    const events = EventRepository{ .conn = conn };
     const node_id = "33333333-3333-3333-3333-333333333333";
     try events.record(node_id, "deny", "/recent", "kept"); // occurred now()
     try events.recordAt(node_id, "2020-01-01T00:00:00Z", "deny", "/old", "aged out");
@@ -880,9 +915,6 @@ test "event retention prunes only events past the window" {
     const remaining = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("1", remaining);
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "csv fields are quoted and escaped per RFC 4180" {
@@ -893,20 +925,11 @@ test "csv fields are quoted and escaped per RFC 4180" {
 }
 
 test "event export produces escaped CSV" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const events = EventRepository{ .conn = &conn };
+    const events = EventRepository{ .conn = conn };
     const node_id = "44444444-4444-4444-4444-444444444444";
     try events.recordAt(node_id, "2024-01-01T00:00:00Z", "deny", "/a?id=1", "first");
     // A URI with a comma and a quote must be CSV-quoted and its quote doubled.
@@ -921,25 +944,13 @@ test "event export produces escaped CSV" {
     try testing.expect(std.mem.indexOf(u8, csv, ",pass,\"/x,\"\"y\"\"\",second\r\n") != null);
     // Exactly three CRLF-terminated records (header + 2 rows).
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, csv, "\r\n"));
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "event spool buffers, drains in a batch, and retains on failure" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
-
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-    const events = EventRepository{ .conn = &conn };
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+    const events = EventRepository{ .conn = conn };
     const node_id = "55555555-5555-5555-5555-555555555555";
 
     var spool = EventSpool.init(testing.allocator, 3);
@@ -968,9 +979,6 @@ test "event spool buffers, drains in a batch, and retains on failure" {
     try retry_spool.enqueue(.{ .node_id = node_id, .occurred_at = "not-a-timestamp", .action = "deny", .uri = "/bad", .message = "bad" });
     try testing.expectError(error.QueryFailed, retry_spool.drain(events));
     try testing.expectEqual(@as(usize, 2), retry_spool.len()); // retained for retry
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "event spool survives a crash via its on-disk snapshot" {
@@ -1022,20 +1030,11 @@ test "event spool survives a crash via its on-disk snapshot" {
 }
 
 test "batched event ingestion commits the whole batch atomically" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const events = EventRepository{ .conn = &conn };
+    const events = EventRepository{ .conn = conn };
     const node_id = "44444444-4444-4444-4444-444444444444";
     const batch = [_]Event{
         .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "1" },
@@ -1056,26 +1055,14 @@ test "batched event ingestion commits the whole batch atomically" {
     const after = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(after);
     try testing.expectEqualStrings("3", after); // unchanged — the good row rolled back too
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "ruleset repository publishes immutable versions and rolls back" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const rulesets = RulesetRepository{ .conn = &conn };
+    const rulesets = RulesetRepository{ .conn = conn };
     try rulesets.publish("crs", "1", "SecRuleEngine On # v1");
     try rulesets.publish("crs", "2", "SecRuleEngine On # v2");
 
@@ -1100,27 +1087,15 @@ test "ruleset repository publishes immutable versions and rolls back" {
     try testing.expect(!try rulesets.verify("signed", "99", "bundle-key")); // absent version
     // An unsigned bundle never verifies (its signature column is NULL).
     try testing.expect(!try rulesets.verify("crs", "1", "bundle-key"));
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "rollout assigns ruleset versions per node and fleet-wide" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const nodes = NodeRepository{ .conn = &conn };
-    const rollout = RolloutRepository{ .conn = &conn };
+    const nodes = NodeRepository{ .conn = conn };
+    const rollout = RolloutRepository{ .conn = conn };
     const a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
     const b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
     try nodes.enroll(a, "edge-a", "1.0");
@@ -1178,26 +1153,14 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
         defer testing.allocator.free(vb2);
         try testing.expectEqualStrings("3", vb2); // unlabeled node b untouched
     }
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "node labels segment the fleet for targeted selection" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const nodes = NodeRepository{ .conn = &conn };
+    const nodes = NodeRepository{ .conn = conn };
     const west1 = "cccccccc-cccc-cccc-cccc-cccccccccccc";
     const west2 = "dddddddd-dddd-dddd-dddd-dddddddddddd";
     const east1 = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
@@ -1241,26 +1204,14 @@ test "node labels segment the fleet for targeted selection" {
         defer rows.deinit();
         try testing.expectEqual(@as(usize, 1), rows.len());
     }
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "alert rules resolve enabled webhooks for an action" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const alerts = AlertRepository{ .conn = &conn };
+    const alerts = AlertRepository{ .conn = conn };
     try alerts.create("pager", "deny", "https://hooks.example/pager");
     try alerts.create("slack", "deny", "https://hooks.example/slack");
     try alerts.create("audit", "pass", "https://hooks.example/audit");
@@ -1315,26 +1266,14 @@ test "alert rules resolve enabled webhooks for an action" {
     // Clearing the secret returns the rule to unsigned delivery.
     try alerts.setSecret("slack", null);
     try testing.expect((try alerts.secretFor(testing.allocator, "slack")) == null);
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "alert deliveries record outcomes, including unreachable (null status)" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const deliveries = AlertDeliveryRepository{ .conn = &conn };
+    const deliveries = AlertDeliveryRepository{ .conn = conn };
 
     // A rule with no delivery history reports null.
     try testing.expect((try deliveries.lastHttpStatus(testing.allocator, "pager")) == null);
@@ -1363,24 +1302,12 @@ test "alert deliveries record outcomes, including unreachable (null status)" {
     // slack's most recent attempt had no HTTP response → null, distinct from a
     // rule that was never delivered.
     try testing.expect((try deliveries.lastHttpStatus(testing.allocator, "slack")) == null);
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "security events are partitioned by month with O(1) retention" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
-
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
     // After migration v5 security_events is a partitioned table.
     {
@@ -1392,8 +1319,8 @@ test "security events are partitioned by month with O(1) retention" {
         try testing.expectEqualStrings("1", partitioned);
     }
 
-    const events = EventRepository{ .conn = &conn };
-    const partitions = EventPartitions{ .conn = &conn };
+    const events = EventRepository{ .conn = conn };
+    const partitions = EventPartitions{ .conn = conn };
     const node_id = "99999999-9999-9999-9999-999999999999";
 
     // Provision explicit monthly partitions, then ingest into each so rows route
@@ -1429,27 +1356,15 @@ test "security events are partitioned by month with O(1) retention" {
     try partitions.dropMonth(2024, 3);
     // An out-of-range month is rejected.
     try testing.expectError(error.QueryFailed, partitions.ensureMonth(2024, 13));
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
 
 test "node and event repositories enroll, heartbeat, and ingest safely" {
-    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-    const dsn_slice = std.mem.span(raw);
-    if (dsn_slice.len == 0) return error.SkipZigTest;
-    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
-    defer testing.allocator.free(dsn);
-    @memcpy(dsn, dsn_slice);
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
-    var conn = try pg.Conn.open(dsn);
-    defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
-    _ = try apply(&conn, testing.allocator);
-
-    const nodes = NodeRepository{ .conn = &conn };
-    const events = EventRepository{ .conn = &conn };
+    const nodes = NodeRepository{ .conn = conn };
+    const events = EventRepository{ .conn = conn };
     const node_id = "22222222-2222-2222-2222-222222222222";
 
     // Enrollment is idempotent; heartbeat and status work.
@@ -1493,7 +1408,4 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     const still_active = (try nodes.statusOf(testing.allocator, node_id)).?;
     defer testing.allocator.free(still_active);
     try testing.expectEqualStrings("active", still_active);
-
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
 }
