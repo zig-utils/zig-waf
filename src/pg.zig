@@ -49,6 +49,35 @@ pub const Conn = struct {
         if (c.PQstatus(self.handle) != c.CONNECTION_OK) return error.ConnectionFailed;
     }
 
+    /// Run a statement, reconnecting and retrying it when the connection turns out
+    /// to have been severed (#53) — the failure a long-lived connection actually
+    /// hits, since a database restart or failover invalidates it silently and the
+    /// next statement is how the client finds out.
+    ///
+    /// Only for statements that may safely run twice. The first attempt may have
+    /// reached the server and committed before the connection dropped, so a
+    /// non-idempotent statement can take effect twice; heartbeats, upserts, and
+    /// keyed inserts are fine, a blind `UPDATE … SET n = n + 1` is not.
+    ///
+    /// Retrying is limited to lost connections. Serialization failures are not
+    /// retried here: nothing in the control plane runs at SERIALIZABLE isolation, so
+    /// they cannot arise, and retrying a statement inside a transaction the caller
+    /// owns would be the caller's decision anyway.
+    pub fn execRetrying(self: *Conn, sql: [:0]const u8, attempts: usize) Error!void {
+        var attempt: usize = 0;
+        while (true) {
+            attempt += 1;
+            self.exec(sql) catch |err| {
+                // A connection libpq still considers good failed for a reason a
+                // reconnect cannot fix, so report it rather than retrying blindly.
+                if (self.isOpen() or attempt >= attempts) return err;
+                try self.reset();
+                continue;
+            };
+            return;
+        }
+    }
+
     /// Whether the connection is still usable. libpq only marks a connection bad
     /// once a command has actually failed on it, so this reports the last known
     /// state rather than probing the server.
@@ -608,6 +637,38 @@ fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const owned = try allocator.allocSentinel(u8, value.len, 0);
     @memcpy(owned, value);
     return owned;
+}
+
+test "a statement retries across a severed connection" {
+    var db = try TestSchema.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    try conn.exec("CREATE TABLE retry_probe (n int)");
+    // The server severs this connection; the next statement is how the client finds
+    // out, which is exactly the failure a long-lived connection hits after a
+    // database restart.
+    conn.exec("SELECT pg_terminate_backend(pg_backend_pid())") catch {};
+    try testing.expect(!conn.isOpen());
+    try conn.execRetrying("INSERT INTO retry_probe (n) VALUES (1)", 2);
+    try testing.expect(conn.isOpen());
+
+    // The reconnected session still resolves to the test's schema, so the row
+    // landed in the table created before the drop.
+    const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM retry_probe")).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("1", count);
+
+    // A statement that fails on a healthy connection is reported, not retried: no
+    // number of attempts fixes a syntax error or a constraint violation.
+    try testing.expectError(error.QueryFailed, conn.execRetrying("INSERT INTO retry_probe (n) VALUES ('not a number')", 3));
+    const unchanged = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM retry_probe")).?;
+    defer testing.allocator.free(unchanged);
+    try testing.expectEqualStrings("1", unchanged);
+
+    // A single attempt does not reconnect — the caller asked for one try.
+    conn.exec("SELECT pg_terminate_backend(pg_backend_pid())") catch {};
+    try testing.expectError(error.QueryFailed, conn.execRetrying("INSERT INTO retry_probe (n) VALUES (2)", 1));
 }
 
 test "workload pools are budgeted separately" {
