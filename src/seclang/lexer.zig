@@ -55,13 +55,18 @@ pub const LexerError = std.mem.Allocator.Error || error{
     LogicalLineTooLarge,
     TooManyLineSegments,
     DanglingContinuation,
+    /// A backtick block was opened and never closed.
+    UnterminatedBlock,
     TooManyTokens,
     TokenTooLarge,
     UnterminatedQuote,
     DanglingEscape,
 };
 
-pub const Quote = enum { unquoted, single, double, mixed };
+/// How a token was delimited. `backtick` is Coraza's multi-line block form, whose
+/// value spans physical lines and keeps its newlines — the only token kind that
+/// does. ModSecurity has no equivalent; a backtick there is an ordinary byte.
+pub const Quote = enum { unquoted, single, double, backtick, mixed };
 
 pub const Token = struct {
     raw: []const u8,
@@ -105,17 +110,23 @@ pub fn tokenize(line: *const LogicalLine, allocator: std.mem.Allocator, limits: 
             continue;
         }
         if (quote) |active_quote| {
-            if ((active_quote == .single and byte == '\'') or (active_quote == .double and byte == '"')) quote = null;
+            const closes = switch (active_quote) {
+                .single => byte == '\'',
+                .double => byte == '"',
+                .backtick => byte == '`',
+                else => false,
+            };
+            if (closes) quote = null;
             continue;
         }
-        if (byte == '\'' or byte == '"') {
+        if (byte == '\'' or byte == '"' or byte == '`') {
             if (token_start == null) {
                 token_start = index;
-                first_quote = if (byte == '\'') .single else .double;
+                first_quote = quoteOf(byte);
             } else if (index != token_start.?) {
                 mixed = true;
             }
-            quote = if (byte == '\'') .single else .double;
+            quote = quoteOf(byte);
             continue;
         }
         if (isHorizontalSpace(byte)) {
@@ -187,6 +198,10 @@ pub const LogicalLineIterator = struct {
         var continuing = false;
         var active_quote: ?u8 = null;
         var quote_escape = false;
+        // A backtick block spans physical lines without continuation markers, and
+        // its newlines are part of the value — which is what makes it a block
+        // rather than a long line.
+        var in_block = false;
 
         while (self.offset < self.input.bytes.len) {
             const line_start = self.offset;
@@ -195,6 +210,32 @@ pub const LogicalLineIterator = struct {
             var content_end = newline orelse self.input.bytes.len;
             if (content_end > line_start and self.input.bytes[content_end - 1] == '\r') content_end -= 1;
             var content_start = line_start;
+            if (in_block) {
+                // Inside a block the line is taken verbatim: leading whitespace and
+                // the newline separating entries are data.
+                if (segments.items.len == self.limits.max_segments_per_line) return error.TooManyLineSegments;
+                const block_length = (content_end - line_start) + 1;
+                if (block_length > self.limits.max_logical_line_bytes -| text.items.len) return error.LogicalLineTooLarge;
+                try text.append(allocator, '\n');
+                try segments.append(allocator, .{
+                    .logical_start = @intCast(text.items.len),
+                    .physical = .{
+                        .source = self.input.id,
+                        .start = @intCast(line_start),
+                        .end = @intCast(content_end),
+                    },
+                });
+                try text.appendSlice(allocator, self.input.bytes[line_start..content_end]);
+                updateQuoteState(self.input.bytes[line_start..content_end], &active_quote, &quote_escape, &in_block);
+                self.offset = next_offset;
+                if (in_block) {
+                    // An unterminated block would otherwise swallow the rest of the
+                    // file and report a confusing error far from its cause.
+                    if (newline == null) return error.UnterminatedBlock;
+                    continue;
+                }
+                break;
+            }
             if (continuing) {
                 while (content_start < content_end and isHorizontalSpace(self.input.bytes[content_start])) content_start += 1;
             }
@@ -224,17 +265,25 @@ pub const LogicalLineIterator = struct {
                     },
                 });
                 try text.appendSlice(allocator, self.input.bytes[content_start..append_end]);
-                updateQuoteState(self.input.bytes[content_start..append_end], &active_quote, &quote_escape);
+                updateQuoteState(self.input.bytes[content_start..append_end], &active_quote, &quote_escape, &in_block);
             }
             if (has_continuation and separator_before_continuation and active_quote == null and text.items.len != 0) {
                 if (text.items.len == self.limits.max_logical_line_bytes) return error.LogicalLineTooLarge;
                 try text.append(allocator, ' ');
             }
             self.offset = next_offset;
+            if (in_block) {
+                if (newline == null) return error.UnterminatedBlock;
+                continue;
+            }
             if (!has_continuation) break;
             if (newline == null) return error.DanglingContinuation;
             continuing = true;
         }
+
+        // Reaching the end of the file with a block still open: the input ends
+        // mid-value, whether or not its last line had a newline.
+        if (in_block) return error.UnterminatedBlock;
 
         const owned_text = try text.toOwnedSlice(allocator);
         errdefer allocator.free(owned_text);
@@ -252,12 +301,27 @@ pub const LogicalLineIterator = struct {
     }
 };
 
+fn quoteOf(byte: u8) Quote {
+    return switch (byte) {
+        '\'' => .single,
+        '"' => .double,
+        '`' => .backtick,
+        else => unreachable,
+    };
+}
+
 fn isHorizontalSpace(byte: u8) bool {
     return byte == ' ' or byte == '\t';
 }
 
-fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool) void {
+fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool, in_block: *bool) void {
     for (bytes) |byte| {
+        // Inside a block only a backtick means anything: a quote or a backslash in a
+        // dataset entry is data, not syntax.
+        if (in_block.*) {
+            if (byte == '`') in_block.* = false;
+            continue;
+        }
         if (escaped.*) {
             escaped.* = false;
             continue;
@@ -270,6 +334,8 @@ fn updateQuoteState(bytes: []const u8, active_quote: *?u8, escaped: *bool) void 
             if (byte == quote) active_quote.* = null;
         } else if (byte == '\'' or byte == '"') {
             active_quote.* = byte;
+        } else if (byte == '`') {
+            in_block.* = true;
         }
     }
 }
@@ -336,4 +402,80 @@ test "tokenizer rejects unterminated state and enforces token limits" {
     var limited_line = (try limited_iterator.next(std.testing.allocator)).?;
     defer limited_line.deinit();
     try std.testing.expectError(error.TooManyTokens, tokenize(&limited_line, std.testing.allocator, .{ .max_tokens_per_line = 1 }));
+}
+
+test "a backtick block spans physical lines and keeps its newlines" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    const id = try registry.add(
+        "dataset.conf",
+        "SecDataset denied `\n  first\nsecond\n`\nSecAction pass",
+        null,
+    );
+    var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
+    var block = (try iterator.next(std.testing.allocator)).?;
+    defer block.deinit();
+    // The block's newlines survive, because they separate its entries; leading
+    // whitespace inside it is data rather than indentation to be stripped.
+    try std.testing.expectEqualStrings("SecDataset denied `\n  first\nsecond\n`", block.text);
+
+    var token_line = try tokenize(&block, std.testing.allocator, .{});
+    defer token_line.deinit();
+    try std.testing.expectEqual(@as(usize, 3), token_line.tokens.len);
+    try std.testing.expectEqualStrings("SecDataset", token_line.tokens[0].raw);
+    try std.testing.expectEqualStrings("denied", token_line.tokens[1].raw);
+    // The whole block is one token, so the directive receives its entries as a
+    // single value rather than as stray arguments.
+    try std.testing.expectEqualStrings("`\n  first\nsecond\n`", token_line.tokens[2].raw);
+    try std.testing.expectEqual(Quote.backtick, token_line.tokens[2].quote);
+
+    // The directive after the block is still its own logical line.
+    var following = (try iterator.next(std.testing.allocator)).?;
+    defer following.deinit();
+    try std.testing.expectEqualStrings("SecAction pass", following.text);
+    try std.testing.expect((try iterator.next(std.testing.allocator)) == null);
+}
+
+test "a block treats quotes, hashes, and continuations as data" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    // Every one of these is syntax outside a block: an unbalanced quote, a comment
+    // marker, and a trailing backslash. Inside one they are dataset entries.
+    const id = try registry.add("odd.conf", "SecDataset odd `\nit's\n# not a comment\ntrailing \\\n`", null);
+    var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
+    var block = (try iterator.next(std.testing.allocator)).?;
+    defer block.deinit();
+    try std.testing.expectEqualStrings("SecDataset odd `\nit's\n# not a comment\ntrailing \\\n`", block.text);
+    var token_line = try tokenize(&block, std.testing.allocator, .{});
+    defer token_line.deinit();
+    try std.testing.expectEqual(@as(usize, 3), token_line.tokens.len);
+    try std.testing.expect(token_line.comment == null);
+}
+
+test "an unterminated block is reported rather than swallowing the file" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    const id = try registry.add("open.conf", "SecDataset open `\nfirst\nsecond\n", null);
+    var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
+    try std.testing.expectError(error.UnterminatedBlock, iterator.next(std.testing.allocator));
+
+    // A block is bounded like every other logical line.
+    const long = try registry.add("long.conf", "SecDataset big `\naaaa\nbbbb\n`", null);
+    var limited = try LogicalLineIterator.init(registry.get(long).?, .{ .max_logical_line_bytes = 20 });
+    try std.testing.expectError(error.LogicalLineTooLarge, limited.next(std.testing.allocator));
+}
+
+test "a backtick outside a block still tokenizes as a delimiter" {
+    var registry = try source.Registry.init(std.testing.allocator, .{});
+    defer registry.deinit();
+    // A single-line backtick value is legal and stays on one line.
+    const id = try registry.add("inline.conf", "SecDataset inline `one`", null);
+    var iterator = try LogicalLineIterator.init(registry.get(id).?, .{});
+    var line = (try iterator.next(std.testing.allocator)).?;
+    defer line.deinit();
+    try std.testing.expectEqualStrings("SecDataset inline `one`", line.text);
+    var token_line = try tokenize(&line, std.testing.allocator, .{});
+    defer token_line.deinit();
+    try std.testing.expectEqual(@as(usize, 3), token_line.tokens.len);
+    try std.testing.expectEqual(Quote.backtick, token_line.tokens[2].quote);
 }
