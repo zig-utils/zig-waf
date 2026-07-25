@@ -45,7 +45,7 @@ fn usage() void {
         \\usage:
         \\  zig-waf validate <file.conf>...   parse, compile, and validate SecLang configs
         \\  zig-waf explain <file.conf>       list the compiled rules (phase, id, action, location)
-        \\  zig-waf test <file.conf> [METHOD] [URI]   run a request through the engine and report the decision
+        \\  zig-waf test <file.conf> [METHOD] [URI] [BODY] [CONTENT-TYPE]   run a request through the engine and report the decision
         \\  zig-waf version                   print the engine version
         \\  zig-waf help                      show this help
         \\
@@ -108,6 +108,10 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     };
     const method = args.next() orelse "GET";
     const uri = args.next() orelse "/";
+    // Optional request body and its content type, so request-body-phase rules
+    // (URL-encoded / JSON / multipart / XML processors) can be exercised.
+    const body = args.next();
+    const content_type = args.next() orelse "application/x-www-form-urlencoded";
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
         std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
@@ -142,9 +146,16 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     defer tx.deinit();
     try tx.processConnection("127.0.0.1", 40000, "127.0.0.1", 80);
     try tx.processUri(uri, method, "HTTP/1.1");
+    if (body) |bytes_body| {
+        try tx.addRequestHeader("Content-Type", content_type);
+        var length_buffer: [20]u8 = undefined;
+        const length = std.fmt.bufPrint(&length_buffer, "{d}", .{bytes_body.len}) catch unreachable;
+        try tx.addRequestHeader("Content-Length", length);
+    }
     try tx.processRequestHeaders();
     try tx.evaluatePhase(gpa, .request_headers);
     if ((try tx.intervention()) == null) {
+        if (body) |bytes_body| try tx.writeRequestBody(bytes_body);
         try tx.processRequestBody();
         try tx.evaluatePhase(gpa, .request_body);
     }
