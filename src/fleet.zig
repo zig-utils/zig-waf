@@ -95,6 +95,50 @@ pub const migrations = [_]pg.Migration{
         \\CREATE INDEX alert_deliveries_name_idx ON alert_deliveries (alert_name, attempted_at DESC);
         ,
     },
+    .{
+        .version = 5,
+        .name = "partition_security_events",
+        // Convert the security-event stream to a RANGE partition on occurred_at
+        // (#56) so retention is an O(1) partition DROP instead of a bulk DELETE.
+        // A partitioned table's primary key must include the partition column,
+        // so the key becomes (id, occurred_at). Renaming the old table leaves
+        // its index/PK names occupying the schema's global index namespace, so
+        // those names are freed (renamed) before the new table reclaims them;
+        // the old table — and its renamed indexes — are dropped after its rows
+        // are copied into the partitioned table.
+        .sql =
+        \\ALTER TABLE security_events RENAME TO security_events_unpartitioned;
+        \\ALTER INDEX security_events_pkey RENAME TO security_events_unpartitioned_pkey;
+        \\ALTER INDEX security_events_occurred_idx RENAME TO security_events_unpartitioned_occurred_idx;
+        \\ALTER INDEX security_events_node_idx RENAME TO security_events_unpartitioned_node_idx;
+        \\
+        \\CREATE TABLE security_events (
+        \\  id           bigint GENERATED ALWAYS AS IDENTITY,
+        \\  node_id      uuid NOT NULL,
+        \\  occurred_at  timestamptz NOT NULL,
+        \\  rule_id      bigint,
+        \\  phase        smallint,
+        \\  action       text,
+        \\  severity     smallint,
+        \\  client_ip    inet,
+        \\  method       text,
+        \\  uri          text,
+        \\  message      text,
+        \\  PRIMARY KEY (id, occurred_at)
+        \\) PARTITION BY RANGE (occurred_at);
+        \\
+        \\CREATE TABLE security_events_default PARTITION OF security_events DEFAULT;
+        \\
+        \\INSERT INTO security_events (node_id, occurred_at, rule_id, phase, action, severity, client_ip, method, uri, message)
+        \\  SELECT node_id, occurred_at, rule_id, phase, action, severity, client_ip, method, uri, message
+        \\  FROM security_events_unpartitioned;
+        \\
+        \\DROP TABLE security_events_unpartitioned;
+        \\
+        \\CREATE INDEX security_events_occurred_idx ON security_events (occurred_at);
+        \\CREATE INDEX security_events_node_idx ON security_events (node_id, occurred_at);
+        ,
+    },
 };
 
 /// Bring `conn`'s database up to the latest fleet schema. Returns the number of
@@ -438,6 +482,42 @@ pub const EventSpool = struct {
     }
 };
 
+/// Monthly range partitions for the security-event stream (#56). Creating the
+/// upcoming month's partition ahead of time keeps inserts routing to a bounded
+/// child table; dropping an old month is O(1) retention (the whole partition
+/// and its rows are removed without a bulk DELETE). Year/month are validated
+/// integers, so the interpolated partition names and bounds are safe.
+pub const EventPartitions = struct {
+    conn: *pg.Conn,
+
+    /// Create the partition for `year`-`month` if it does not exist. Its range
+    /// is [month-01, next-month-01). A no-op if the partition already exists.
+    pub fn ensureMonth(self: EventPartitions, year: u16, month: u8) pg.Error!void {
+        if (month < 1 or month > 12) return error.QueryFailed;
+        const next_year: u16 = if (month == 12) year + 1 else year;
+        const next_month: u8 = if (month == 12) 1 else month + 1;
+        var buffer: [320]u8 = undefined;
+        const sql = std.fmt.bufPrint(
+            &buffer,
+            "CREATE TABLE IF NOT EXISTS security_events_{d:0>4}_{d:0>2} PARTITION OF security_events " ++
+                "FOR VALUES FROM ('{d:0>4}-{d:0>2}-01') TO ('{d:0>4}-{d:0>2}-01')",
+            .{ year, month, year, month, next_year, next_month },
+        ) catch return error.QueryFailed;
+        buffer[sql.len] = 0;
+        try self.conn.exec(buffer[0..sql.len :0]);
+    }
+
+    /// Drop the partition for `year`-`month` and all its rows — O(1) retention.
+    /// A no-op if the partition does not exist.
+    pub fn dropMonth(self: EventPartitions, year: u16, month: u8) pg.Error!void {
+        if (month < 1 or month > 12) return error.QueryFailed;
+        var buffer: [128]u8 = undefined;
+        const sql = std.fmt.bufPrint(&buffer, "DROP TABLE IF EXISTS security_events_{d:0>4}_{d:0>2}", .{ year, month }) catch return error.QueryFailed;
+        buffer[sql.len] = 0;
+        try self.conn.exec(buffer[0..sql.len :0]);
+    }
+};
+
 /// Alert rules and webhook targets (#59): when an event with a matching action
 /// is ingested, the enabled rules' webhooks are the delivery targets.
 pub const AlertRepository = struct {
@@ -622,7 +702,7 @@ test "the fleet schema applies to a clean database and is idempotent" {
     // Start from a clean slate so the migration exercises real DDL. The
     // schema_migrations table may not exist yet, so tolerate that delete.
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
 
     try testing.expectEqual(migrations.len, try apply(&conn, testing.allocator));
     try testing.expectEqual(@as(usize, 0), try apply(&conn, testing.allocator)); // idempotent
@@ -651,7 +731,7 @@ test "the fleet schema applies to a clean database and is idempotent" {
     try testing.expectEqualStrings("1", count);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "event retention prunes only events past the window" {
@@ -665,7 +745,7 @@ test "event retention prunes only events past the window" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const events = EventRepository{ .conn = &conn };
@@ -682,7 +762,7 @@ test "event retention prunes only events past the window" {
     try testing.expectEqualStrings("1", remaining);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "event spool buffers, drains in a batch, and retains on failure" {
@@ -696,7 +776,7 @@ test "event spool buffers, drains in a batch, and retains on failure" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
     const events = EventRepository{ .conn = &conn };
     const node_id = "55555555-5555-5555-5555-555555555555";
@@ -729,7 +809,7 @@ test "event spool buffers, drains in a batch, and retains on failure" {
     try testing.expectEqual(@as(usize, 2), retry_spool.len()); // retained for retry
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "event spool survives a crash via its on-disk snapshot" {
@@ -791,7 +871,7 @@ test "batched event ingestion commits the whole batch atomically" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const events = EventRepository{ .conn = &conn };
@@ -817,7 +897,7 @@ test "batched event ingestion commits the whole batch atomically" {
     try testing.expectEqualStrings("3", after); // unchanged — the good row rolled back too
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "ruleset repository publishes immutable versions and rolls back" {
@@ -831,7 +911,7 @@ test "ruleset repository publishes immutable versions and rolls back" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const rulesets = RulesetRepository{ .conn = &conn };
@@ -853,7 +933,7 @@ test "ruleset repository publishes immutable versions and rolls back" {
     try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "rollout assigns ruleset versions per node and fleet-wide" {
@@ -867,7 +947,7 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const nodes = NodeRepository{ .conn = &conn };
@@ -931,7 +1011,7 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
     }
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "node labels segment the fleet for targeted selection" {
@@ -945,7 +1025,7 @@ test "node labels segment the fleet for targeted selection" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const nodes = NodeRepository{ .conn = &conn };
@@ -994,7 +1074,7 @@ test "node labels segment the fleet for targeted selection" {
     }
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "alert rules resolve enabled webhooks for an action" {
@@ -1008,7 +1088,7 @@ test "alert rules resolve enabled webhooks for an action" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const alerts = AlertRepository{ .conn = &conn };
@@ -1050,7 +1130,7 @@ test "alert rules resolve enabled webhooks for an action" {
     }
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "alert deliveries record outcomes, including unreachable (null status)" {
@@ -1064,7 +1144,7 @@ test "alert deliveries record outcomes, including unreachable (null status)" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const deliveries = AlertDeliveryRepository{ .conn = &conn };
@@ -1098,7 +1178,73 @@ test "alert deliveries record outcomes, including unreachable (null status)" {
     try testing.expect((try deliveries.lastHttpStatus(testing.allocator, "slack")) == null);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
+}
+
+test "security events are partitioned by month with O(1) retention" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    // After migration v5 security_events is a partitioned table.
+    {
+        const partitioned = (try conn.queryScalar(
+            testing.allocator,
+            "SELECT count(*) FROM pg_partitioned_table WHERE partrelid = 'security_events'::regclass",
+        )).?;
+        defer testing.allocator.free(partitioned);
+        try testing.expectEqualStrings("1", partitioned);
+    }
+
+    const events = EventRepository{ .conn = &conn };
+    const partitions = EventPartitions{ .conn = &conn };
+    const node_id = "99999999-9999-9999-9999-999999999999";
+
+    // Provision explicit monthly partitions, then ingest into each so rows route
+    // to their month's child table (not the default partition).
+    try partitions.ensureMonth(2024, 3);
+    try partitions.ensureMonth(2024, 4);
+    try partitions.ensureMonth(2024, 12); // year-boundary bounds are valid
+    try events.recordAt(node_id, "2024-03-15T12:00:00Z", "deny", "/march", "m3");
+    try events.recordAt(node_id, "2024-03-20T12:00:00Z", "deny", "/march2", "m3b");
+    try events.recordAt(node_id, "2024-04-10T12:00:00Z", "deny", "/april", "m4");
+
+    // All three are visible through the parent table.
+    {
+        const total = (try events.countForNode(testing.allocator, node_id)).?;
+        defer testing.allocator.free(total);
+        try testing.expectEqualStrings("3", total);
+    }
+    // The March rows physically live in the March partition.
+    {
+        const in_march = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events_2024_03")).?;
+        defer testing.allocator.free(in_march);
+        try testing.expectEqualStrings("2", in_march);
+    }
+
+    // Dropping the March partition removes exactly its rows — O(1) retention.
+    try partitions.dropMonth(2024, 3);
+    {
+        const total_after = (try events.countForNode(testing.allocator, node_id)).?;
+        defer testing.allocator.free(total_after);
+        try testing.expectEqualStrings("1", total_after); // only April remains
+    }
+    // Dropping a non-existent partition is a no-op.
+    try partitions.dropMonth(2024, 3);
+    // An out-of-range month is rejected.
+    try testing.expectError(error.QueryFailed, partitions.ensureMonth(2024, 13));
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
 
 test "node and event repositories enroll, heartbeat, and ingest safely" {
@@ -1112,7 +1258,7 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)") catch {};
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const nodes = NodeRepository{ .conn = &conn };
@@ -1162,5 +1308,5 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     try testing.expectEqualStrings("active", still_active);
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4)");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5)");
 }
