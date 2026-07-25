@@ -105,9 +105,36 @@ pub const NodeRepository = struct {
     }
 };
 
+/// One security event to ingest. All fields are libpq text values.
+pub const Event = struct {
+    node_id: [:0]const u8,
+    occurred_at: [:0]const u8,
+    action: [:0]const u8,
+    uri: [:0]const u8,
+    message: [:0]const u8,
+};
+
 /// Ingestion and per-node counts for the security-event stream (#55/#56).
 pub const EventRepository = struct {
     conn: *pg.Conn,
+
+    /// Ingest a batch of events in a single transaction (#55): one COMMIT (and
+    /// fsync) covers the whole batch, which is how a drained event queue reaches
+    /// PostgreSQL efficiently. The batch is all-or-nothing — any failure rolls
+    /// the whole batch back.
+    pub fn recordBatch(self: EventRepository, batch: []const Event) pg.Error!void {
+        try self.conn.exec("BEGIN");
+        for (batch) |event| {
+            self.conn.execParams(
+                "INSERT INTO security_events (node_id, occurred_at, action, uri, message) VALUES ($1, $2, $3, $4, $5)",
+                &.{ event.node_id, event.occurred_at, event.action, event.uri, event.message },
+            ) catch |err| {
+                self.conn.exec("ROLLBACK") catch {};
+                return err;
+            };
+        }
+        try self.conn.exec("COMMIT");
+    }
 
     pub fn record(self: EventRepository, node_id: [:0]const u8, action: [:0]const u8, uri: [:0]const u8, message: [:0]const u8) pg.Error!void {
         try self.conn.execParams(
@@ -273,6 +300,46 @@ test "event retention prunes only events past the window" {
     const remaining = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("1", remaining);
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+}
+
+test "batched event ingestion commits the whole batch atomically" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const events = EventRepository{ .conn = &conn };
+    const node_id = "44444444-4444-4444-4444-444444444444";
+    const batch = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "1" },
+        .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:01Z", .action = "deny", .uri = "/b", .message = "2" },
+        .{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:02Z", .action = "pass", .uri = "/c", .message = "3" },
+    };
+    try events.recordBatch(&batch);
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("3", count);
+
+    // A batch with a bad row rolls the whole batch back (nothing is ingested).
+    const bad = [_]Event{
+        .{ .node_id = node_id, .occurred_at = "2024-02-01T00:00:00Z", .action = "deny", .uri = "/ok", .message = "4" },
+        .{ .node_id = node_id, .occurred_at = "not-a-timestamp", .action = "deny", .uri = "/bad", .message = "5" },
+    };
+    try testing.expectError(error.QueryFailed, events.recordBatch(&bad));
+    const after = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("3", after); // unchanged — the good row rolled back too
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
