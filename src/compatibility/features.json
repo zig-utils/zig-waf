@@ -201,7 +201,7 @@
       "id": "engine.request-parsing",
       "area": "engine",
       "name": "Query-string argument and cookie parsing",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/24",
       "modsecurity": true,
       "coraza": true,
@@ -212,7 +212,7 @@
         "benchmarks/request.zig",
         "docs/request-parsing.md"
       ],
-      "notes": "processUri parses the query string into ARGS_GET/ARGS with the pinned Coraza doParseQuery split and x-www-form-urlencoded queryUnescape, honoring the configured SecArgumentSeparator; addRequestHeader parses the Cookie header into REQUEST_COOKIES. Focused, engine-integration, and fuzz coverage are executable. Body-argument processors, cookie v0/v1 formats, path arguments, smuggling-safe host parsing, and decoding-error variables remain later slices of WAF-23."
+      "notes": "processUri parses the query string into ARGS_GET/ARGS with the pinned Coraza doParseQuery split and x-www-form-urlencoded queryUnescape, honoring SecArgumentSeparator; addRequestHeader parses the Cookie header into REQUEST_COOKIES (Netscape format, the only format either baseline parses \u2014 SecCookieFormat 1 is rejected rather than accepted and silently parsed as format 0). Body arguments populate ARGS_POST through the URLENCODED/JSON/MULTIPART/XML processors. A malformed percent-escape in a query or body argument name or value raises URLENCODED_ERROR while still decoding non-strictly, matching both baselines. Duplicate and conflicting framing headers stay visible in REQUEST_HEADERS so a rule can detect request smuggling; rejecting the request is the proxy's decision, not the WAF's. PATH_INFO, REQUEST_FILENAME, REQUEST_BASENAME, and SERVER_NAME (port and IPv6-bracket aware) are published from the request target and Host header."
     },
     {
       "id": "engine.request-body-buffering",
