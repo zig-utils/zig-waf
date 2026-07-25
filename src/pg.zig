@@ -36,6 +36,26 @@ pub const Conn = struct {
         self.* = undefined;
     }
 
+    /// Reconnect using the same parameters, after the server severed the
+    /// connection (#55) — a restart, a failover, or an idle-connection reaper.
+    /// The handle stays valid, so callers holding this `Conn` keep working.
+    ///
+    /// Session state does not survive: an in-flight transaction is gone, and
+    /// anything `SET` on the session reverts. Configuration that must outlive a
+    /// reset belongs in the connection string (e.g. `options=-csearch_path=…`),
+    /// which is reused verbatim.
+    pub fn reset(self: *Conn) Error!void {
+        c.PQreset(self.handle);
+        if (c.PQstatus(self.handle) != c.CONNECTION_OK) return error.ConnectionFailed;
+    }
+
+    /// Whether the connection is still usable. libpq only marks a connection bad
+    /// once a command has actually failed on it, so this reports the last known
+    /// state rather than probing the server.
+    pub fn isOpen(self: *const Conn) bool {
+        return c.PQstatus(self.handle) == c.CONNECTION_OK;
+    }
+
     /// The last error text from libpq (borrowed; valid until the next call).
     pub fn lastError(self: *const Conn) []const u8 {
         return std.mem.span(c.PQerrorMessage(self.handle));

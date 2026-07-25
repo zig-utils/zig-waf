@@ -494,6 +494,27 @@ pub const EventSpool = struct {
         return drained;
     }
 
+    /// Drain, recovering from a severed connection (#55). A node's ingestion
+    /// connection outlives many database events it cannot control — a restart, a
+    /// failover, an idle-connection reaper — and each one fails the next drain.
+    /// Rather than requiring an operator, reconnect (same connection string, so a
+    /// failover target resolves afresh) and retry the batch once.
+    ///
+    /// Retrying is safe because ingestion is idempotent: events already committed
+    /// by a drain whose acknowledgement was lost carry the same keys, so they are
+    /// skipped rather than duplicated. Events stay queued if the retry also fails,
+    /// so a database that is down stays a delay, not a loss.
+    pub fn drainReconnecting(self: *EventSpool, repository: EventRepository) (pg.Error || error{OutOfMemory})!usize {
+        return self.drain(repository) catch |err| switch (err) {
+            // Not a transport failure — a reconnect cannot help.
+            error.OutOfMemory => err,
+            error.ConnectionFailed, error.QueryFailed => {
+                try repository.conn.reset();
+                return self.drain(repository);
+            },
+        };
+    }
+
     fn dup(allocator: std.mem.Allocator, value: []const u8) error{OutOfMemory}![:0]u8 {
         const owned = try allocator.allocSentinel(u8, value.len, 0);
         @memcpy(owned, value);
@@ -1100,6 +1121,44 @@ test "keyed event ingestion is idempotent across a re-sent batch" {
     const total = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(total);
     try testing.expectEqualStrings("6", total);
+}
+
+test "a spool drain survives the server severing the connection" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const events = EventRepository{ .conn = conn };
+    const node_id = "66666666-6666-6666-6666-666666666666";
+    var spool = EventSpool.init(testing.allocator, 8);
+    defer spool.deinit();
+    try spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-04-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "1", .key = "txn-a" });
+    try spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-04-01T00:00:01Z", .action = "deny", .uri = "/b", .message = "2", .key = "txn-b" });
+
+    // The server terminates this connection's backend, exactly as a restart or a
+    // failover would. Killing our own backend severs the connection carrying the
+    // statement, so libpq reports that statement as failed too — tolerate it and
+    // assert on the state it leaves behind.
+    conn.exec("SELECT pg_terminate_backend(pg_backend_pid())") catch {};
+    try testing.expect(!conn.isOpen());
+    // A plain drain now fails and keeps every event queued.
+    try testing.expectError(error.QueryFailed, spool.drain(events));
+    try testing.expectEqual(@as(usize, 2), spool.len());
+
+    // The reconnecting drain re-establishes the connection and ingests the batch.
+    try testing.expectEqual(@as(usize, 2), try spool.drainReconnecting(events));
+    try testing.expectEqual(@as(usize, 0), spool.len());
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("2", count);
+
+    // The reconnected session still resolves to the same schema, so the events
+    // are readable through the same repository — connection-string state, not
+    // session state, is what survives a reset.
+    try testing.expect(conn.isOpen());
+    const csv = try events.exportCsv(testing.allocator, node_id);
+    defer testing.allocator.free(csv);
+    try testing.expect(std.mem.indexOf(u8, csv, ",deny,/a,1\r\n") != null);
 }
 
 test "ruleset repository publishes immutable versions and rolls back" {
