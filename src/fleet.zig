@@ -189,6 +189,99 @@ pub const EventRepository = struct {
     }
 };
 
+/// A bounded in-memory queue of events awaiting ingestion (#55). Nodes enqueue
+/// events (their fields are copied in, so callers keep no lifetime obligations)
+/// and a worker periodically `drain`s the whole queue to PostgreSQL in one
+/// batched transaction. On a drain failure the events are kept for the next
+/// attempt, so a transient database outage never drops events. (Disk-backed
+/// spilling for crash durability is a follow-up; this is the batching core.)
+pub const EventSpool = struct {
+    allocator: std.mem.Allocator,
+    capacity: usize,
+    events: std.ArrayList(Owned) = .empty,
+
+    const Owned = struct {
+        node_id: [:0]u8,
+        occurred_at: [:0]u8,
+        action: [:0]u8,
+        uri: [:0]u8,
+        message: [:0]u8,
+
+        fn deinit(self: *Owned, allocator: std.mem.Allocator) void {
+            allocator.free(self.node_id);
+            allocator.free(self.occurred_at);
+            allocator.free(self.action);
+            allocator.free(self.uri);
+            allocator.free(self.message);
+        }
+    };
+
+    pub const EnqueueError = error{ SpoolFull, OutOfMemory };
+
+    pub fn init(allocator: std.mem.Allocator, capacity: usize) EventSpool {
+        return .{ .allocator = allocator, .capacity = capacity };
+    }
+
+    pub fn deinit(self: *EventSpool) void {
+        for (self.events.items) |*event| event.deinit(self.allocator);
+        self.events.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    pub fn len(self: *const EventSpool) usize {
+        return self.events.items.len;
+    }
+
+    /// Copy an event into the queue. Fails with SpoolFull once `capacity` events
+    /// are queued (backpressure) so memory stays bounded when ingestion stalls.
+    pub fn enqueue(self: *EventSpool, event: Event) EnqueueError!void {
+        if (self.events.items.len >= self.capacity) return error.SpoolFull;
+        var owned: Owned = .{
+            .node_id = try dup(self.allocator, event.node_id),
+            .occurred_at = undefined,
+            .action = undefined,
+            .uri = undefined,
+            .message = undefined,
+        };
+        errdefer self.allocator.free(owned.node_id);
+        owned.occurred_at = try dup(self.allocator, event.occurred_at);
+        errdefer self.allocator.free(owned.occurred_at);
+        owned.action = try dup(self.allocator, event.action);
+        errdefer self.allocator.free(owned.action);
+        owned.uri = try dup(self.allocator, event.uri);
+        errdefer self.allocator.free(owned.uri);
+        owned.message = try dup(self.allocator, event.message);
+        try self.events.append(self.allocator, owned);
+    }
+
+    /// Ingest the whole queue into PostgreSQL in one batched transaction and
+    /// clear it. On failure the queue is left intact for a later retry. Returns
+    /// the number of events ingested.
+    pub fn drain(self: *EventSpool, repository: EventRepository) (pg.Error || error{OutOfMemory})!usize {
+        if (self.events.items.len == 0) return 0;
+        const batch = try self.allocator.alloc(Event, self.events.items.len);
+        defer self.allocator.free(batch);
+        for (self.events.items, batch) |owned, *slot| slot.* = .{
+            .node_id = owned.node_id,
+            .occurred_at = owned.occurred_at,
+            .action = owned.action,
+            .uri = owned.uri,
+            .message = owned.message,
+        };
+        try repository.recordBatch(batch); // kept on failure — nothing freed yet
+        const drained = self.events.items.len;
+        for (self.events.items) |*event| event.deinit(self.allocator);
+        self.events.clearRetainingCapacity();
+        return drained;
+    }
+
+    fn dup(allocator: std.mem.Allocator, value: [:0]const u8) error{OutOfMemory}![:0]u8 {
+        const owned = try allocator.allocSentinel(u8, value.len, 0);
+        @memcpy(owned, value);
+        return owned;
+    }
+};
+
 /// Store and retrieve versioned rule-set bundles that are rolled out to nodes
 /// (#54). Each (name, version) is immutable once published; nodes fetch the
 /// latest, and a rollback re-selects an earlier version.
@@ -300,6 +393,53 @@ test "event retention prunes only events past the window" {
     const remaining = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("1", remaining);
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+}
+
+test "event spool buffers, drains in a batch, and retains on failure" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    _ = try apply(&conn, testing.allocator);
+    const events = EventRepository{ .conn = &conn };
+    const node_id = "55555555-5555-5555-5555-555555555555";
+
+    var spool = EventSpool.init(testing.allocator, 3);
+    defer spool.deinit();
+
+    try spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "1" });
+    try spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-01-01T00:00:01Z", .action = "pass", .uri = "/b", .message = "2" });
+    try testing.expectEqual(@as(usize, 2), spool.len());
+
+    // Drain ingests the batch and empties the spool.
+    try testing.expectEqual(@as(usize, 2), try spool.drain(events));
+    try testing.expectEqual(@as(usize, 0), spool.len());
+    const count = (try events.countForNode(testing.allocator, node_id)).?;
+    defer testing.allocator.free(count);
+    try testing.expectEqualStrings("2", count);
+
+    // Capacity is enforced (backpressure).
+    for (0..3) |_| try spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-01-02T00:00:00Z", .action = "deny", .uri = "/c", .message = "x" });
+    try testing.expectError(error.SpoolFull, spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-01-02T00:00:00Z", .action = "deny", .uri = "/d", .message = "y" }));
+
+    // A drain that fails (one row has a bad timestamp) keeps the whole spool for
+    // a retry — no events are lost on a transient database error.
+    var retry_spool = EventSpool.init(testing.allocator, 8);
+    defer retry_spool.deinit();
+    try retry_spool.enqueue(.{ .node_id = node_id, .occurred_at = "2024-03-01T00:00:00Z", .action = "deny", .uri = "/ok", .message = "good" });
+    try retry_spool.enqueue(.{ .node_id = node_id, .occurred_at = "not-a-timestamp", .action = "deny", .uri = "/bad", .message = "bad" });
+    try testing.expectError(error.QueryFailed, retry_spool.drain(events));
+    try testing.expectEqual(@as(usize, 2), retry_spool.len()); // retained for retry
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
