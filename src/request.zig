@@ -44,14 +44,32 @@ pub fn parseQuery(query: []const u8, separator: u8) QueryIterator {
     return .{ .rest = query, .separator = separator };
 }
 
+/// A decoded token and whether the input contained a malformed percent-escape.
+/// The two are separate because decoding never fails — a bad escape is preserved
+/// literally, as both baselines do — while `URLENCODED_ERROR` still has to report
+/// that it happened, which is how a rule detects an encoding trick aimed at
+/// whatever is behind the WAF.
+pub const Decoded = struct {
+    value: []u8,
+    invalid: bool,
+};
+
 /// Decode one `x-www-form-urlencoded` token into `dest`, which must be at least
 /// `input.len` bytes; the decoded slice is never longer than the input. `+`
 /// becomes a space, `%XX` decodes a byte, and a malformed or truncated `%` is
 /// preserved literally, matching the pinned Coraza `queryUnescape`.
 pub fn queryUnescape(dest: []u8, input: []const u8) []u8 {
+    return queryUnescapeCounting(dest, input).value;
+}
+
+/// `queryUnescape`, additionally reporting whether any escape was malformed —
+/// what ModSecurity's `urldecode_nonstrict_inplace` counts to set
+/// `URLENCODED_ERROR`.
+pub fn queryUnescapeCounting(dest: []u8, input: []const u8) Decoded {
     std.debug.assert(dest.len >= input.len);
     var out: usize = 0;
     var i: usize = 0;
+    var invalid = false;
     while (i < input.len) : (i += 1) {
         const ci = input[i];
         if (ci == '+') {
@@ -61,10 +79,12 @@ pub fn queryUnescape(dest: []u8, input: []const u8) []u8 {
         }
         if (ci == '%') {
             // Coraza requires both hex digits in range; otherwise the `%` is
-            // preserved literally.
+            // preserved literally. Either way the escape was malformed, which is
+            // what URLENCODED_ERROR reports.
             if (i + 2 >= input.len) {
                 dest[out] = '%';
                 out += 1;
+                invalid = true;
                 continue;
             }
             const hi = hexDigit(input[i + 1]);
@@ -72,6 +92,7 @@ pub fn queryUnescape(dest: []u8, input: []const u8) []u8 {
             if (hi == null or lo == null) {
                 dest[out] = '%';
                 out += 1;
+                invalid = true;
                 continue;
             }
             dest[out] = (hi.? << 4) | lo.?;
@@ -82,7 +103,7 @@ pub fn queryUnescape(dest: []u8, input: []const u8) []u8 {
         dest[out] = ci;
         out += 1;
     }
-    return dest[0..out];
+    return .{ .value = dest[0..out], .invalid = invalid };
 }
 
 fn hexDigit(byte: u8) ?u8 {

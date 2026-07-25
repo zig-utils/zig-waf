@@ -1745,14 +1745,27 @@ pub const Transaction = struct {
     /// Populate ARGS_GET from the raw query string with the pinned Coraza
     /// x-www-form-urlencoded decoding. Decoded key and value share one scratch
     /// buffer bounded by the query length.
+    /// Raise URLENCODED_ERROR. It is a latch: once an argument decoded badly the
+    /// request contained a malformed escape, and a later well-formed argument does
+    /// not undo that.
+    fn flagUrlEncodedError(self: *Transaction) TransactionError!void {
+        try self.setScalar(.urlencoded_error, "1", .parser, .request_headers);
+    }
+
     fn parseQueryArguments(self: *Transaction, uri: []const u8, query: []const u8) TransactionError!void {
         if (query.len == 0) return;
         const scratch = try self.waf.allocator.alloc(u8, query.len);
         defer self.waf.allocator.free(scratch);
         var it = request.parseQuery(query, self.argumentSeparator());
         while (it.next()) |pair| {
-            const key = request.queryUnescape(scratch, pair.key);
-            const value = request.queryUnescape(scratch[key.len..], pair.value);
+            const decoded_key = request.queryUnescapeCounting(scratch, pair.key);
+            const key = decoded_key.value;
+            const decoded_value = request.queryUnescapeCounting(scratch[key.len..], pair.value);
+            const value = decoded_value.value;
+            // A malformed escape anywhere in the query raises URLENCODED_ERROR, as
+            // upstream does, so a rule can act on an encoding trick aimed at
+            // whatever is behind the WAF.
+            if (decoded_key.invalid or decoded_value.invalid) try self.flagUrlEncodedError();
             const source: collections.Source = .{
                 .origin = .request_target,
                 .offset = @intFromPtr(pair.key.ptr) - @intFromPtr(uri.ptr),
@@ -1888,8 +1901,11 @@ pub const Transaction = struct {
         defer self.waf.allocator.free(scratch);
         var it = request.parseQuery(body, self.argumentSeparator());
         while (it.next()) |pair| {
-            const key = request.queryUnescape(scratch, pair.key);
-            const value = request.queryUnescape(scratch[key.len..], pair.value);
+            const decoded_key = request.queryUnescapeCounting(scratch, pair.key);
+            const key = decoded_key.value;
+            const decoded_value = request.queryUnescapeCounting(scratch[key.len..], pair.value);
+            const value = decoded_value.value;
+            if (decoded_key.invalid or decoded_value.invalid) try self.flagUrlEncodedError();
             const source: collections.Source = .{
                 .origin = .request_body,
                 .offset = @intFromPtr(pair.key.ptr) - @intFromPtr(body.ptr),
@@ -7164,5 +7180,86 @@ test "@verifySSN and @verifyCPF gate on their own structural rules" {
         } else {
             try std.testing.expect(decision == null);
         }
+    }
+}
+
+test "URLENCODED_ERROR reports a malformed escape in the query or body" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A well-formed query leaves the flag at 0, which the transaction publishes
+    // from the start so a rule reading it never sees an absent variable.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?a=%41%42&b=plain+text", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try std.testing.expectEqualStrings("0", (try tx.scalar(.urlencoded_error)).?.value);
+        // The well-formed escapes still decoded.
+        try std.testing.expectEqualStrings("AB", (try tx.collectionFirst(.args, "a")).?.value);
+        try std.testing.expectEqualStrings("plain text", (try tx.collectionFirst(.args, "b")).?.value);
+    }
+
+    // A truncated escape raises it, and the value is preserved literally rather
+    // than dropped — both baselines decode non-strictly and report separately.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?a=%4", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.urlencoded_error)).?.value);
+        try std.testing.expectEqualStrings("%4", (try tx.collectionFirst(.args, "a")).?.value);
+    }
+
+    // A non-hex escape raises it too, including one in the argument *name*.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?a%zz=1", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.urlencoded_error)).?.value);
+    }
+
+    // The urlencoded body path raises it as well, and once raised it stays raised:
+    // a later well-formed argument does not undo a malformed one.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/submit", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "application/x-www-form-urlencoded");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody("a=%GG&b=fine");
+        try tx.processRequestBody();
+        try std.testing.expectEqualStrings("1", (try tx.scalar(.urlencoded_error)).?.value);
+        try std.testing.expectEqualStrings("fine", (try tx.collectionFirst(.args, "b")).?.value);
+    }
+
+    // And a rule can act on it, which is the point of publishing it.
+    {
+        const input =
+            \\SecRule URLENCODED_ERROR "@eq 1" "id:1,phase:1,deny,status:400,t:none,msg:'malformed encoding'"
+        ;
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "enc.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer plan.deinit();
+        var rule_builder = Builder.init(std.testing.allocator);
+        rule_builder.setRetainedPlan(plan);
+        const rule_waf = try rule_builder.build();
+        defer rule_waf.deinit() catch unreachable;
+
+        var tx = rule_waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?a=%zz", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqual(@as(u16, 400), (try tx.intervention()).?.status);
     }
 }
