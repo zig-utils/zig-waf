@@ -1263,6 +1263,15 @@ pub const Transaction = struct {
                         try self.registerSanitiseTarget(list, target);
                         result.effects_applied += 1;
                     },
+                    .sanitize_matched => {
+                        // Mask the variable this rule matched, reusing the
+                        // by-name masking: the matched target is "COLLECTION:key".
+                        if (self.sanitiseListForMatched(matched.context.name)) |dispatch| {
+                            const owned = try self.waf.allocator.dupe(u8, dispatch.key);
+                            try self.registerSanitiseTarget(dispatch.list, owned);
+                        }
+                        result.effects_applied += 1;
+                    },
                     .expirevar => {
                         if (!include_persistent) {
                             result.pending_persistent_effects += 1;
@@ -2216,6 +2225,29 @@ pub const Transaction = struct {
         const owned = try self.waf.allocator.dupe(u8, name);
         // registerSanitiseTarget takes ownership and frees on failure.
         try self.registerSanitiseTarget(list, owned);
+    }
+
+    /// Resolve a matched target name ("COLLECTION:key") to the sanitise list and
+    /// key for sanitizeMatched. Returns null for collections that are not masked
+    /// by name (only ARGS and request/response headers are supported).
+    fn sanitiseListForMatched(self: *Transaction, matched_name: []const u8) ?struct { list: *std.ArrayList([]const u8), key: []const u8 } {
+        const colon = std.mem.indexOfScalar(u8, matched_name, ':') orelse return null;
+        const collection_name = matched_name[0..colon];
+        const key = matched_name[colon + 1 ..];
+        if (key.len == 0) return null;
+        if (std.ascii.eqlIgnoreCase(collection_name, "REQUEST_HEADERS")) {
+            return .{ .list = &self.sanitise_request_headers, .key = key };
+        }
+        if (std.ascii.eqlIgnoreCase(collection_name, "RESPONSE_HEADERS")) {
+            return .{ .list = &self.sanitise_response_headers, .key = key };
+        }
+        if (std.ascii.eqlIgnoreCase(collection_name, "ARGS") or
+            std.ascii.eqlIgnoreCase(collection_name, "ARGS_POST") or
+            std.ascii.eqlIgnoreCase(collection_name, "ARGS_GET"))
+        {
+            return .{ .list = &self.sanitise_args, .key = key };
+        }
+        return null;
     }
 
     /// Append an already-owned header name to a sanitise list, taking ownership
@@ -4441,6 +4473,43 @@ test "the sanitizeArg action masks an argument value in the audited body" {
     defer std.testing.allocator.free(serial);
     // The password value is masked; the other args and the key are intact.
     try std.testing.expect(std.mem.indexOf(u8, serial, "user=alice&password=*******&remember=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
+}
+
+test "the sanitizeMatched action masks the matched variable" {
+    const input =
+        \\SecRule ARGS:password "@rx ." "id:1,phase:2,ctl:auditLogParts=ABCHZ,sanitizeMatched,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sanitize-matched.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.10", 44321, "198.51.100.5", 443);
+    try tx.processUri("/login", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "application/x-www-form-urlencoded");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("user=alice&password=hunter2");
+    try tx.processRequestBody();
+    var cursor = try PhaseCursor.init(&tx, .request_body);
+    _ = (try cursor.next()).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "ARGS:password",
+        .value = "hunter2",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 7 },
+    });
+    try tx.processLogging();
+
+    const serial = try tx.serializeAuditLog(std.testing.allocator, .serial);
+    defer std.testing.allocator.free(serial);
+    // sanitizeMatched resolved ARGS:password and masked its body value.
+    try std.testing.expect(std.mem.indexOf(u8, serial, "password=*******") != null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
 }
 

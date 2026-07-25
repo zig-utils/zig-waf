@@ -431,6 +431,7 @@ pub const EffectKind = enum {
     sanitize_request_header,
     sanitize_response_header,
     sanitize_arg,
+    sanitize_matched,
 };
 
 /// Typed request-path descriptor. Field meanings are selected by `kind`:
@@ -2130,6 +2131,9 @@ const Compiler = struct {
                 try self.appendSanitiseEffect(rule, action, action_index, .sanitize_response_header);
             } else if (std.ascii.eqlIgnoreCase(name, "sanitizeArg")) {
                 try self.appendSanitiseEffect(rule, action, action_index, .sanitize_arg);
+            } else if (std.ascii.eqlIgnoreCase(name, "sanitizeMatched")) {
+                // Masks whichever variable this rule matched; no argument.
+                try self.appendEffect(.{ .action_index = action_index, .kind = .sanitize_matched });
             }
         }
     }
