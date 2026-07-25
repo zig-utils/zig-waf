@@ -2467,7 +2467,24 @@ pub const Transaction = struct {
         }
 
         if (collections.Name.parse(variable_name)) |collection_name| {
-            const chosen: collections.Selector = if (selector) |key| .{ .key = key } else .all;
+            // A `/pattern/` selector is a regex over keys; a plain string is an
+            // exact key; absent selects the whole collection.
+            var compiled_selector: ?selectors.RegexSelector = null;
+            defer if (compiled_selector) |*value| value.deinit();
+            var selector_worker: ?selectors.RegexSelector.Worker = null;
+            defer if (selector_worker) |*value| value.deinit();
+
+            const chosen: collections.Selector = choose: {
+                const sel = selector orelse break :choose .all;
+                if (sel.len >= 2 and sel[0] == '/' and sel[sel.len - 1] == '/') {
+                    compiled_selector = selectors.RegexSelector.compile(self.waf.allocator, sel[1 .. sel.len - 1]) catch
+                        break :choose .all;
+                    selector_worker = compiled_selector.?.worker();
+                    break :choose .{ .key_matcher = selector_worker.?.matcher() };
+                }
+                break :choose .{ .key = sel };
+            };
+
             var matched: usize = 0;
             if (try self.collection(collection_name, chosen)) |initial| {
                 var iterator = initial;
@@ -4861,6 +4878,13 @@ test "resolveTarget yields scalar values, collection entries, and counts" {
     // An unknown variable yields nothing.
     const unknown = try tx.resolveTarget(a, "NOT_A_VARIABLE", null, false);
     try std.testing.expectEqual(@as(usize, 0), unknown.len);
+
+    // A regex key selector (ARGS:/^q$/) matches by pattern over the keys.
+    const regex_sel = try tx.resolveTarget(a, "ARGS", "/^q$/", false);
+    try std.testing.expectEqual(@as(usize, 2), regex_sel.len); // both "q" entries
+    // A non-matching pattern yields nothing.
+    const no_match = try tx.resolveTarget(a, "ARGS", "/^zzz$/", false);
+    try std.testing.expectEqual(@as(usize, 0), no_match.len);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
