@@ -35,6 +35,12 @@ pub fn evaluate(name: []const u8, parameter: []const u8, input: []const u8, prof
         return .{ .decided = operators.evaluate(kind, profile, parameter, input) };
     }
 
+    // Always-match / never-match operators (parameterless, like ModSecurity's
+    // unconditional_match and no_match). `@unconditionalMatch` runs a rule's
+    // actions on every request; `@noMatch` is inert unless negated (`!@noMatch`).
+    if (eqName(op, "unconditionalMatch")) return .{ .decided = true };
+    if (eqName(op, "noMatch")) return .{ .decided = false };
+
     if (eqName(op, "detectSQLi")) {
         var sqli: operators.SqlInjection = .{};
         return .{ .decided = sqli.evaluate(input).matched };
@@ -98,6 +104,14 @@ test "scalar comparison operators dispatch by name" {
     try testing.expect(decided(evaluate("beginsWith", "ab", "abcde", .modsecurity)));
     try testing.expect(decided(evaluate("@gt", "10", "20", .modsecurity)));
     try testing.expect(!decided(evaluate("gt", "20", "10", .modsecurity)));
+}
+
+test "unconditionalMatch always matches and noMatch never does" {
+    try testing.expect(decided(evaluate("@unconditionalMatch", "", "", .modsecurity)));
+    try testing.expect(decided(evaluate("unconditionalMatch", "ignored", "anything", .coraza)));
+    try testing.expect(!decided(evaluate("@noMatch", "", "anything", .modsecurity)));
+    // `!@noMatch` (negated) is the always-true idiom.
+    try testing.expect(decided(negate(evaluate("noMatch", "", "x", .modsecurity), true)));
 }
 
 test "SQLi and XSS detection dispatch" {
