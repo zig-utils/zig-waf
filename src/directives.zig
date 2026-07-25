@@ -1145,6 +1145,10 @@ test "directive union evidence is machine readable and matches the registry" {
 
 test "every registry row has an executable positive schema fixture" {
     for (registry) |entry| {
+        // A row the plan compiler deliberately refuses has no compilable fixture by
+        // design; the row stays so the registry still records that the baseline has
+        // the directive, and the refusal is asserted separately.
+        if (std.ascii.eqlIgnoreCase(entry.name, "SecRuleScript")) continue;
         const arguments = positiveArguments(entry);
         const input = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}{s}\n", .{
             entry.name,

@@ -193,6 +193,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     /// An operator name nothing can evaluate. Compiling it would leave a rule that
     /// never matches — see `isImplementedOperator`.
     UnknownOperator,
+    /// A directive that is recognized but deliberately not implemented — see
+    /// `isUnimplementedDirective`.
+    UnimplementedDirective,
 };
 
 /// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
@@ -234,6 +237,7 @@ pub const DiagnosticCode = enum {
     empty_macro_expression,
     unknown_operator,
     unimplemented_action,
+    unimplemented_directive,
     unknown_dataset,
 
     pub fn id(self: DiagnosticCode) []const u8 {
@@ -248,6 +252,7 @@ pub const DiagnosticCode = enum {
             .empty_macro_expression => "WAF-PLAN-0108",
             .unknown_operator => "WAF-PLAN-0124",
             .unimplemented_action => "WAF-PLAN-0125",
+            .unimplemented_directive => "WAF-PLAN-0127",
             .unknown_dataset => "WAF-PLAN-0126",
             .invalid_default_action => "WAF-PLAN-0109",
             .duplicate_default_phase => "WAF-PLAN-0110",
@@ -290,6 +295,7 @@ pub const DiagnosticCode = enum {
             // part an operator needs to know.
             .unknown_operator => "operator is not implemented, so the rule could never match",
             .unimplemented_action => "action is not implemented, so it would have no effect",
+            .unimplemented_directive => "directive is not implemented, so it would have no effect",
             .unknown_dataset => "dataset is not declared by any SecDataset, so the set would be empty",
         };
     }
@@ -1119,6 +1125,8 @@ const Compiler = struct {
 
     fn addDirective(self: *Compiler, directive: seclang.parser.Directive) CompileError!void {
         if (self.directives.items.len == self.limits.max_directives) return error.TooManyDirectives;
+        if (isUnimplementedDirective(directive.name))
+            return self.fail(error.UnimplementedDirective, directive.name_span, null);
         if (self.pending_chain) |pending| {
             if (directive.kind != .sec_rule)
                 return self.fail(error.DanglingChain, directive.physical, self.rules.items[@backingInt(pending)].source);
@@ -2972,11 +2980,32 @@ fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
 ///     the baseline rather than catch up to it.
 ///   * `pause` — delays the response by a number of milliseconds, which would mean
 ///     sleeping on the request path.
+///   * `exec` — runs an external script per matching rule. ModSecurity supports it;
+///     zig-waf does not, because executing a process is blocking I/O on the request
+///     path, which this engine's whole design excludes. A host that wants to inspect
+///     a request with its own code registers an operator plugin (`docs/plugins.md`)
+///     or uses the C ABI, both of which run without a fork per request.
+/// Directives recognized but deliberately not implemented, rejected rather than
+/// accepted and ignored.
+///
+/// `SecRuleScript` runs a Lua script per request. ModSecurity supports it; zig-waf
+/// does not, because an embedded interpreter on the request path is exactly what
+/// this engine is built to avoid — the rule-execution cost has to stay bounded and
+/// inspectable. A host that wants to inspect a request with its own code registers
+/// an operator plugin (`docs/plugins.md`) or uses the C ABI, neither of which needs
+/// an interpreter per request.
+///
+/// Accepting it silently would be the worst option: a configuration would name a
+/// script that never runs, and nothing would say so.
+fn isUnimplementedDirective(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "SecRuleScript");
+}
+
 fn isUnimplementedAction(name: []const u8) bool {
     return equalsAny(name, &.{
         "sanitizeMatchedBytes", "sanitiseMatchedBytes",
         "append",               "prepend",
-        "pause",
+        "pause",                "exec",
     });
 }
 
@@ -3079,6 +3108,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.InvalidTransformation => .invalid_transformation,
         error.UnknownOperator => .unknown_operator,
         error.UnimplementedAction => .unimplemented_action,
+        error.UnimplementedDirective => .unimplemented_directive,
         error.UnknownDataset => .unknown_dataset,
         error.UnterminatedMacro => .unterminated_macro,
         error.EmptyMacroExpression => .empty_macro_expression,
@@ -4554,4 +4584,39 @@ test "an action neither baseline implements is rejected, not ignored" {
     const plan = try compile(std.testing.allocator, &parsed_supported.registry, &supported_documents, .{});
     defer plan.deinit();
     try std.testing.expectEqual(@as(usize, 2), plan.rules.len);
+}
+
+test "a directive that would silently do nothing is refused" {
+    // SecRuleScript runs a Lua script per request. ModSecurity supports it; zig-waf
+    // does not, because an embedded interpreter on the request path is what this
+    // engine is built to avoid. Accepting it would leave a configuration naming a
+    // script that never runs, with nothing saying so.
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "script.conf", "SecRuleScript /etc/scripts/check.lua", .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(
+        error.UnimplementedDirective,
+        compile(std.testing.allocator, &parsed.registry, &documents, .{}),
+    );
+
+    // The same for `exec`, which runs an external process per matching rule.
+    var exec_parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "exec.conf",
+        "SecRule ARGS \"@rx x\" \"id:1,phase:1,pass,exec:/usr/local/bin/scan.lua\"",
+        .{},
+        .{},
+    );
+    defer exec_parsed.deinit();
+    var exec_documents = [_]seclang.parser.Document{exec_parsed.document};
+    try std.testing.expectError(
+        error.UnimplementedAction,
+        compile(std.testing.allocator, &exec_parsed.registry, &exec_documents, .{}),
+    );
+
+    // Both surface as diagnostics rather than raw errors, so a user sees a location
+    // and a reason.
+    var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer outcome.deinit();
+    try std.testing.expectEqual(DiagnosticCode.unimplemented_directive, outcome.diagnostic.code);
 }
