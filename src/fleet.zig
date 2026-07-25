@@ -166,6 +166,15 @@ pub const migrations = [_]pg.Migration{
         \\CREATE UNIQUE INDEX security_events_key_idx ON security_events (event_key, occurred_at);
         ,
     },
+    .{
+        .version = 8,
+        .name = "node_running_version",
+        // What a node reports it is actually running, against the version it was
+        // assigned (#54). The two differ whenever a node has not reconciled yet,
+        // failed to apply a bundle, or was changed out of band — which is drift,
+        // and is invisible if only the desired state is recorded.
+        .sql = "ALTER TABLE node_rulesets ADD COLUMN running_version integer",
+    },
 };
 
 /// The hex HMAC-SHA256 signature of `payload` under `secret` (#59). Receivers
@@ -1067,6 +1076,43 @@ pub const RolloutRepository = struct {
         );
     }
 
+    /// A node reports the version it is actually running (#54), normally on its
+    /// heartbeat. A node with no assignment for this ruleset has nothing to drift
+    /// from, so the report is ignored rather than inventing an assignment.
+    pub fn reportRunning(self: RolloutRepository, node_id: [:0]const u8, ruleset_name: [:0]const u8, version: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            "UPDATE node_rulesets SET running_version = $3::int WHERE node_id = $1 AND ruleset_name = $2",
+            &.{ node_id, ruleset_name, version },
+        );
+    }
+
+    /// The nodes whose running version is not the version they were assigned —
+    /// drift (#54). A node that has never reported counts as drifted: the control
+    /// plane has no evidence it is running the policy it was given, and treating
+    /// silence as compliance is how a fleet quietly diverges. The cursor yields
+    /// columns (0) node_id, (1) assigned version, (2) running version or empty when
+    /// never reported; the caller `deinit`s it.
+    pub fn drifted(self: RolloutRepository, ruleset_name: [:0]const u8) pg.Error!pg.Rows {
+        return self.conn.query(
+            \\SELECT node_id::text, version::text, coalesce(running_version::text, '')
+            \\FROM node_rulesets
+            \\WHERE ruleset_name = $1 AND running_version IS DISTINCT FROM version
+            \\ORDER BY node_id
+        , &.{ruleset_name});
+    }
+
+    /// How many nodes have drifted from their assigned version (caller frees the
+    /// text count).
+    pub fn driftCount(self: RolloutRepository, allocator: std.mem.Allocator, ruleset_name: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            \\SELECT count(*) FROM node_rulesets
+            \\WHERE ruleset_name = $1 AND running_version IS DISTINCT FROM version
+        ,
+            &.{ruleset_name},
+        );
+    }
+
     /// How many nodes are assigned to a specific version — rollout progress /
     /// convergence (caller frees the text count).
     pub fn countOnVersion(self: RolloutRepository, allocator: std.mem.Allocator, ruleset_name: [:0]const u8, version: [:0]const u8) pg.Error!?[]u8 {
@@ -1777,6 +1823,73 @@ test "rollout assigns ruleset versions per node and fleet-wide" {
         defer testing.allocator.free(vb2);
         try testing.expectEqualStrings("3", vb2); // unlabeled node b untouched
     }
+}
+
+test "drift is reported until a node confirms the version it runs" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const nodes = NodeRepository{ .conn = conn };
+    const rollout = RolloutRepository{ .conn = conn };
+    const a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    try nodes.enroll(a, "edge-a", "1.0");
+    try nodes.enroll(b, "edge-b", "1.0");
+    try rollout.assign(a, "crs", "2");
+    try rollout.assign(b, "crs", "2");
+
+    // Both nodes have been assigned v2 but neither has confirmed running it. That
+    // is drift: the control plane has no evidence either is running the policy it
+    // was given, and treating silence as compliance is how a fleet diverges.
+    {
+        const count = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(count);
+        try testing.expectEqualStrings("2", count);
+    }
+
+    // One node reconciles and reports v2, which clears its drift.
+    try rollout.reportRunning(a, "crs", "2");
+    {
+        const count = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(count);
+        try testing.expectEqualStrings("1", count);
+    }
+
+    // The other reports an older version — it failed to apply the bundle, or was
+    // changed out of band. It stays drifted, and is listed with both versions so an
+    // operator can see what it is actually running.
+    try rollout.reportRunning(b, "crs", "1");
+    {
+        var rows = try rollout.drifted("crs");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 1), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings(b, rows.get(0));
+        try testing.expectEqualStrings("2", rows.get(1)); // assigned
+        try testing.expectEqualStrings("1", rows.get(2)); // actually running
+    }
+
+    // A new rollout re-opens drift for every node until each confirms again.
+    if (try rollout.assignAll(testing.allocator, "crs", "3")) |rolled| testing.allocator.free(rolled);
+    {
+        const count = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(count);
+        try testing.expectEqualStrings("2", count);
+    }
+
+    // A node reporting a version it was never assigned is still drift.
+    try rollout.reportRunning(a, "crs", "99");
+    {
+        const count = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(count);
+        try testing.expectEqualStrings("2", count);
+    }
+
+    // A report for a ruleset a node has no assignment for is ignored rather than
+    // inventing one.
+    try rollout.reportRunning(a, "other", "1");
+    try testing.expect((try rollout.assignedVersion(testing.allocator, a, "other")) == null);
 }
 
 test "node labels segment the fleet for targeted selection" {
