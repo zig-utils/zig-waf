@@ -337,7 +337,11 @@ pub fn writeLegacyJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, re
 
     // request
     try out.appendSlice(gpa, ",\"request\":{\"request_line\":");
-    try appendFmt(out, gpa, "\"{s} {s} HTTP/{s}\"", .{ record.method, record.uri, record.http_version });
+    // The request line embeds attacker-controlled method/uri/version, so it must
+    // be built and then JSON-escaped rather than interpolated raw into a literal.
+    const request_line = try std.fmt.allocPrint(gpa, "{s} {s} HTTP/{s}", .{ record.method, record.uri, record.http_version });
+    defer gpa.free(request_line);
+    try appendJsonString(out, gpa, request_line);
     try out.appendSlice(gpa, ",\"headers\":");
     try appendHeaderObjectJoined(out, gpa, if (parts.has('B')) record.request_headers else &.{});
     try out.append(gpa, '}');
@@ -345,7 +349,9 @@ pub fn writeLegacyJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, re
     // response
     try appendFmt(out, gpa, ",\"response\":{{\"status\":{d}", .{record.response_status});
     try out.appendSlice(gpa, ",\"protocol\":");
-    try appendFmt(out, gpa, "\"HTTP/{s}\"", .{record.http_version});
+    const protocol = try std.fmt.allocPrint(gpa, "HTTP/{s}", .{record.http_version});
+    defer gpa.free(protocol);
+    try appendJsonString(out, gpa, protocol);
     try out.appendSlice(gpa, ",\"headers\":");
     try appendHeaderObjectJoined(out, gpa, if (parts.has('F')) record.response_headers else &.{});
     try out.append(gpa, '}');
@@ -829,4 +835,72 @@ test "selected reserved parts emit empty markers" {
     try testing.expect(std.mem.indexOf(u8, out, "--x-D--\n\n") != null);
     try testing.expect(std.mem.indexOf(u8, out, "--x-K--\n\n") != null);
     try testing.expect(std.mem.endsWith(u8, out, "--x-Z--\n\n"));
+}
+
+test "serializers survive tricky bytes and JSON formats stay parseable" {
+    // Feed escaping-hostile ASCII (quotes, backslashes, control chars, slashes)
+    // through every string field. The JSON-family formats must always emit
+    // parseable JSON — a strong oracle for escaping correctness — and no format
+    // may crash or leak. Bytes stay within ASCII so any invalid-JSON output is a
+    // real escaping defect, not an invalid-UTF-8 input artifact.
+    var prng = std.Random.DefaultPrng.init(0xA11D_0FF5_E7C0);
+    const random = prng.random();
+    var buffers: [12][40]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 2000) : (iteration += 1) {
+        var strings: [12][]const u8 = undefined;
+        for (&buffers, &strings) |*buffer, *string| {
+            const len = random.uintLessThan(usize, buffer.len + 1);
+            for (buffer[0..len]) |*byte| {
+                byte.* = switch (random.uintLessThan(u8, 12)) {
+                    0 => '"',
+                    1 => '\\',
+                    2 => '\n',
+                    3 => '\r',
+                    4 => '\t',
+                    5 => 0x00,
+                    6 => 0x1f,
+                    7 => '/',
+                    else => @as(u8, @intCast(0x20 + random.uintLessThan(u8, 0x5f))), // printable ASCII
+                };
+            }
+            string.* = buffer[0..len];
+        }
+        var request_headers = [_]Header{ .{ .name = strings[8], .value = strings[9] } };
+        var response_headers = [_]Header{ .{ .name = strings[10], .value = strings[11] } };
+        var messages = [_][]const u8{ strings[6], strings[7] };
+        const record: AuditRecord = .{
+            .boundary = strings[0],
+            .timestamp = 1700000000,
+            .unique_id = strings[1],
+            .client_ip = "192.0.2.1",
+            .client_port = 1234,
+            .server_ip = "198.51.100.1",
+            .server_port = 443,
+            .method = strings[2],
+            .uri = strings[3],
+            .http_version = strings[4],
+            .request_headers = &request_headers,
+            .request_body = strings[5],
+            .response_status = 200,
+            .response_headers = &response_headers,
+            .response_body = strings[5],
+            .messages = &messages,
+            .rule_engine = strings[0],
+            .version = strings[1],
+            .server_id = strings[2],
+        };
+        const parts = Parts.fromLetters("ABCEFHKZ");
+        inline for (.{ Format.serial, Format.json, Format.legacy_json, Format.ocsf }) |format| {
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(testing.allocator);
+            try write(&out, testing.allocator, record, parts, format);
+            if (format != .serial) {
+                var parsed = std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{}) catch {
+                    return error.SerializerEmittedInvalidJson;
+                };
+                parsed.deinit();
+            }
+        }
+    }
 }
