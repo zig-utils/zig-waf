@@ -72,6 +72,7 @@ jobs:
         working-directory: zig-waf
         run: >-
           zig build test-plan-corpus
+          -Dplan-corpus-unsupported=examples/multithread/inspectfile_rules.conf
           -Dplan-corpus=../owasp-crs/crs-setup.conf.example
           -Dplan-corpus=../owasp-crs/plugins
           -Dplan-corpus=../owasp-crs/rules

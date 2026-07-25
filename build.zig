@@ -243,6 +243,14 @@ pub fn build(b: *std.Build) void {
 
     const run_plan_corpus = b.addRunArtifact(parser_corpus);
     run_plan_corpus.addArg("--compile-plan");
+    // Files expected to fail because they use an operator zig-waf deliberately does
+    // not implement. Declaring them keeps that boundary tested rather than hidden:
+    // the corpus fails if such a file compiles after all.
+    if (b.option([]const []const u8, "plan-corpus-unsupported", "Corpus file expected to use an unimplemented operator (repeatable)")) |unsupported|
+        for (unsupported) |path| {
+            run_plan_corpus.addArg("--expect-unsupported");
+            run_plan_corpus.addArg(path);
+        };
     if (b.option([]const []const u8, "plan-corpus", "SecLang structural plan corpus file or directory (repeatable)")) |corpus_roots|
         run_plan_corpus.addArgs(corpus_roots);
     const plan_corpus_step = b.step("test-plan-corpus", "Compile structural plans beneath corpus roots");
