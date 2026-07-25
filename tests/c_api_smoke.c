@@ -93,5 +93,34 @@ int main(void) {
 
     zig_waf_transaction_destroy(transaction);
     assert(zig_waf_destroy(waf) == ZIG_WAF_OK);
+
+    /* Full flow: a WAF with rules blocks a matching request over the ABI. */
+    const char rules[] =
+        "SecRule ARGS \"@rx attack\" \"id:1,phase:1,deny,status:403\"\n";
+    zig_waf_t *rwaf = NULL;
+    assert(zig_waf_create_with_rules(&config, (const uint8_t *)rules, strlen(rules), &rwaf) == ZIG_WAF_OK);
+    zig_waf_transaction_t *rtx = NULL;
+    assert(zig_waf_transaction_create(rwaf, &rtx) == ZIG_WAF_OK);
+    assert(zig_waf_transaction_process_connection(rtx, (const uint8_t *)client, strlen(client), 1,
+                                                  (const uint8_t *)server, strlen(server), 80) == ZIG_WAF_OK);
+    const char attack_uri[] = "/p?q=attack-here";
+    assert(zig_waf_transaction_process_uri(rtx, (const uint8_t *)attack_uri, strlen(attack_uri),
+                                           (const uint8_t *)method, strlen(method),
+                                           (const uint8_t *)protocol, strlen(protocol)) == ZIG_WAF_OK);
+    assert(zig_waf_transaction_process_request_headers(rtx) == ZIG_WAF_OK);
+    assert(zig_waf_transaction_evaluate_phase(rtx, ZIG_WAF_PHASE_REQUEST_HEADERS) == ZIG_WAF_OK);
+    zig_waf_intervention_t decision = {0};
+    decision.struct_size = sizeof(decision);
+    decision.abi_version = ZIG_WAF_ABI_VERSION;
+    assert(zig_waf_transaction_intervention(rtx, &decision) == ZIG_WAF_OK);
+    assert(decision.status == 403);
+    zig_waf_transaction_destroy(rtx);
+    assert(zig_waf_destroy(rwaf) == ZIG_WAF_OK);
+
+    /* An invalid config is rejected. */
+    const char bad[] = "SecRule ARGS \"@rx x\" \"id:1,phase:99\"\n";
+    zig_waf_t *bwaf = NULL;
+    assert(zig_waf_create_with_rules(&config, (const uint8_t *)bad, strlen(bad), &bwaf) == ZIG_WAF_ERROR_INVALID_CONFIG);
+
     return 0;
 }

@@ -69,27 +69,67 @@ export fn zig_waf_query_features(out_features: ?*Features) callconv(.c) Status {
     return .ok;
 }
 
+/// Apply a caller-supplied Config to a builder; returns a non-ok Status on a
+/// malformed struct, ABI mismatch, or invalid mode.
+fn configureBuilder(builder: *waf.Waf.Builder, config: ?*const Config) Status {
+    const input = config orelse return .ok;
+    if (input.struct_size < @sizeOf(Config)) return .invalid_argument;
+    if (input.abi_version != abi_version) return .unsupported_abi;
+    builder.setMode(switch (input.mode) {
+        0 => .enabled,
+        1 => .detection_only,
+        else => return .invalid_config,
+    });
+    builder.setLimits(.{
+        .max_request_target_bytes = input.max_request_target_bytes,
+        .max_header_count = input.max_header_count,
+        .max_header_bytes = input.max_header_bytes,
+        .max_request_body_bytes = input.max_request_body_bytes,
+        .max_response_body_bytes = input.max_response_body_bytes,
+    });
+    return .ok;
+}
+
 export fn zig_waf_create(config: ?*const Config, out_waf: ?**WafHandle) callconv(.c) Status {
     const output = out_waf orelse return .invalid_argument;
     output.* = undefined;
 
     var builder = waf.Waf.Builder.init(std.heap.page_allocator);
-    if (config) |input| {
-        if (input.struct_size < @sizeOf(Config)) return .invalid_argument;
-        if (input.abi_version != abi_version) return .unsupported_abi;
-        builder.setMode(switch (input.mode) {
-            0 => .enabled,
-            1 => .detection_only,
-            else => return .invalid_config,
-        });
-        builder.setLimits(.{
-            .max_request_target_bytes = input.max_request_target_bytes,
-            .max_header_count = input.max_header_count,
-            .max_header_bytes = input.max_header_bytes,
-            .max_request_body_bytes = input.max_request_body_bytes,
-            .max_response_body_bytes = input.max_response_body_bytes,
-        });
-    }
+    const configured = configureBuilder(&builder, config);
+    if (configured != .ok) return configured;
+    const instance = builder.build() catch |err| return mapError(err);
+    output.* = @ptrCast(instance);
+    return .ok;
+}
+
+/// Create a WAF whose rule set is compiled from a SecLang configuration. On a
+/// parse or compile error the call fails with invalid_config; the caller can
+/// use the CLI (`zig-waf validate`) to see the diagnostics.
+export fn zig_waf_create_with_rules(
+    config: ?*const Config,
+    rules_pointer: ?[*]const u8,
+    rules_len: usize,
+    out_waf: ?**WafHandle,
+) callconv(.c) Status {
+    const output = out_waf orelse return .invalid_argument;
+    output.* = undefined;
+    const rules = bytes(rules_pointer, rules_len) orelse return .invalid_argument;
+    const gpa = std.heap.page_allocator;
+
+    var parsed = waf.seclang.parser.parseBytesOutcome(gpa, "c-abi-rules", rules, .{}, .{}) catch return .out_of_memory;
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .document => |value| value,
+        .diagnostic => return .invalid_config,
+    };
+    var documents = [_]waf.seclang.parser.Document{document};
+    const plan = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch return .invalid_config;
+    defer plan.deinit();
+
+    var builder = waf.Waf.Builder.init(gpa);
+    const configured = configureBuilder(&builder, config);
+    if (configured != .ok) return configured;
+    builder.setRetainedPlan(plan);
     const instance = builder.build() catch |err| return mapError(err);
     output.* = @ptrCast(instance);
     return .ok;

@@ -91,6 +91,14 @@ typedef struct zig_waf_intervention {
 uint32_t zig_waf_abi_version(void);
 zig_waf_status_t zig_waf_query_features(zig_waf_features_t *out_features);
 zig_waf_status_t zig_waf_create(const zig_waf_config_t *config, zig_waf_t **out_waf);
+
+/* Create a WAF whose rule set is compiled from a SecLang configuration.
+ * Returns ZIG_WAF_ERROR_INVALID_CONFIG on a parse/compile error. */
+zig_waf_status_t zig_waf_create_with_rules(
+    const zig_waf_config_t *config,
+    const uint8_t *rules,
+    size_t rules_len,
+    zig_waf_t **out_waf);
 zig_waf_status_t zig_waf_destroy(zig_waf_t *waf);
 
 zig_waf_status_t zig_waf_transaction_create(zig_waf_t *waf, zig_waf_transaction_t **out_transaction);
