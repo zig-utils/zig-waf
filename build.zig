@@ -134,6 +134,32 @@ pub fn build(b: *std.Build) void {
     const pg_test_step = b.step("pg-test", "Run PostgreSQL integration tests (needs PG_TEST_DSN)");
     pg_test_step.dependOn(&run_pg_tests.step);
 
+    // The ingestion benchmark links the same libpq and needs a live database, so
+    // it is a separate step alongside pg-test rather than part of `bench-*` runs.
+    const fleet_module = b.createModule(.{
+        .root_source_file = b.path("src/fleet.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fleet_module.addImport("pq", pq_module);
+    fleet_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
+    fleet_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
+    const ingestion_benchmark_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/ingestion.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ingestion_benchmark_module.addImport("fleet", fleet_module);
+    const ingestion_benchmark = b.addExecutable(.{
+        .name = "ingestion-benchmark",
+        .root_module = ingestion_benchmark_module,
+    });
+    const run_ingestion_benchmark = b.addRunArtifact(ingestion_benchmark);
+    const ingestion_benchmark_step = b.step("bench-ingestion", "Benchmark event ingestion paths (needs PG_TEST_DSN)");
+    ingestion_benchmark_step.dependOn(&run_ingestion_benchmark.step);
+
     // SQLite embedded backend (#57): an in-process, serverless store mirroring
     // the PostgreSQL client for single-node deployments and dependency-free
     // tests. Kept out of the default `test` step (it links libsqlite3); run it

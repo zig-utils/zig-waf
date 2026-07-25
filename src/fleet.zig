@@ -4,7 +4,9 @@
 //! append; existing ones are never edited (each is recorded by version).
 
 const std = @import("std");
-const pg = @import("pg.zig");
+/// The libpq client this schema and its repositories are built on, re-exported
+/// so a caller of `fleet` needs only one import.
+pub const pg = @import("pg.zig");
 
 /// Every fleet migration, in version order. Append-only.
 pub const migrations = [_]pg.Migration{
