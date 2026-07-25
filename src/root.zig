@@ -11,6 +11,7 @@ pub const engine = @import("engine.zig");
 pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
 pub const operators = @import("operators.zig");
+pub const rule_eval = @import("rule_eval.zig");
 pub const phrase = @import("phrase.zig");
 pub const ip_match = @import("ip_match.zig");
 pub const operator_fuzz = @import("operator_fuzz.zig");
@@ -69,6 +70,7 @@ test {
     _ = flow_evidence;
     _ = macros;
     _ = operators;
+    _ = rule_eval;
     _ = operator_fuzz;
     _ = phrase;
     _ = ip_match;
