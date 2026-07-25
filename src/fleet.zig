@@ -466,6 +466,7 @@ pub const EventSpool = struct {
         action: [:0]u8,
         uri: [:0]u8,
         message: [:0]u8,
+        key: ?[:0]u8,
 
         fn deinit(self: *Owned, allocator: std.mem.Allocator) void {
             allocator.free(self.node_id);
@@ -473,6 +474,7 @@ pub const EventSpool = struct {
             allocator.free(self.action);
             allocator.free(self.uri);
             allocator.free(self.message);
+            if (self.key) |key| allocator.free(key);
         }
     };
 
@@ -495,13 +497,13 @@ pub const EventSpool = struct {
     /// Copy an event into the queue. Fails with SpoolFull once `capacity` events
     /// are queued (backpressure) so memory stays bounded when ingestion stalls.
     pub fn enqueue(self: *EventSpool, event: Event) EnqueueError!void {
-        return self.enqueueRaw(event.node_id, event.occurred_at, event.action, event.uri, event.message);
+        return self.enqueueRaw(event.node_id, event.occurred_at, event.action, event.uri, event.message, event.key);
     }
 
     /// The shared allocation path behind `enqueue` and `restore`. Fields are
     /// `[]const u8` (not necessarily sentinel-terminated) so a decoded snapshot
     /// can reuse it; each is copied into a sentinel-terminated Owned.
-    fn enqueueRaw(self: *EventSpool, node_id: []const u8, occurred_at: []const u8, action: []const u8, uri: []const u8, message: []const u8) EnqueueError!void {
+    fn enqueueRaw(self: *EventSpool, node_id: []const u8, occurred_at: []const u8, action: []const u8, uri: []const u8, message: []const u8, key: ?[]const u8) EnqueueError!void {
         if (self.events.items.len >= self.capacity) return error.SpoolFull;
         const owned_node = try dup(self.allocator, node_id);
         errdefer self.allocator.free(owned_node);
@@ -513,12 +515,15 @@ pub const EventSpool = struct {
         errdefer self.allocator.free(owned_uri);
         const owned_message = try dup(self.allocator, message);
         errdefer self.allocator.free(owned_message);
+        const owned_key = if (key) |value| try dup(self.allocator, value) else null;
+        errdefer if (owned_key) |value| self.allocator.free(value);
         try self.events.append(self.allocator, .{
             .node_id = owned_node,
             .occurred_at = owned_occurred,
             .action = owned_action,
             .uri = owned_uri,
             .message = owned_message,
+            .key = owned_key,
         });
     }
 
@@ -535,6 +540,7 @@ pub const EventSpool = struct {
             .action = owned.action,
             .uri = owned.uri,
             .message = owned.message,
+            .key = owned.key,
         };
         _ = try repository.recordBatch(batch); // kept on failure — nothing freed yet
         const drained = self.events.items.len;
@@ -574,10 +580,19 @@ pub const EventSpool = struct {
     //
     // The queue is snapshotted to a single file so a crash or restart loses at
     // most the events enqueued since the last `persist`. The format is
-    // self-describing and length-prefixed: a u32 event count, then per event
-    // five (u32 length, bytes) fields, all little-endian. `restore` bounds every
-    // read against the file so a truncated or corrupt snapshot is rejected
-    // rather than trusted.
+    // self-describing and length-prefixed: a magic, a format version, a u32 event
+    // count, then per event five (u32 length, bytes) fields and a presence-flagged
+    // idempotency key, all little-endian. `restore` bounds every read against the
+    // file so a truncated or corrupt snapshot is rejected rather than trusted.
+    //
+    // A restart is exactly when a node is upgraded, so the version that finds a
+    // pending snapshot is often not the one that wrote it: snapshots written
+    // before keys existed have no magic and no key field, and are still read
+    // (their events restore unkeyed) rather than discarded as corrupt.
+
+    /// Identifies a snapshot carrying the header the first format lacked.
+    const snapshot_magic = "WAFSPOOL";
+    const snapshot_version: u32 = 2;
 
     /// A generous ceiling on a snapshot we will read back, guarding against a
     /// corrupt or hostile length header claiming a huge file.
@@ -591,11 +606,20 @@ pub const EventSpool = struct {
     pub fn persist(self: *const EventSpool, io: std.Io, dir: std.Io.Dir, sub_path: []const u8) error{ OutOfMemory, WriteFailed }!void {
         var buffer: std.ArrayList(u8) = .empty;
         defer buffer.deinit(self.allocator);
+        try buffer.appendSlice(self.allocator, snapshot_magic);
+        try appendU32(&buffer, self.allocator, snapshot_version);
         try appendU32(&buffer, self.allocator, @intCast(self.events.items.len));
         for (self.events.items) |event| {
             inline for (.{ event.node_id, event.occurred_at, event.action, event.uri, event.message }) |field| {
                 try appendU32(&buffer, self.allocator, @intCast(field.len));
                 try buffer.appendSlice(self.allocator, field);
+            }
+            // A flag, because an absent key and an empty key are different: only
+            // the latter deduplicates.
+            try buffer.append(self.allocator, if (event.key == null) 0 else 1);
+            if (event.key) |key| {
+                try appendU32(&buffer, self.allocator, @intCast(key.len));
+                try buffer.appendSlice(self.allocator, key);
             }
         }
         dir.writeFile(io, .{ .sub_path = sub_path, .data = buffer.items }) catch return error.WriteFailed;
@@ -612,6 +636,13 @@ pub const EventSpool = struct {
         };
         defer self.allocator.free(bytes);
         var cursor: usize = 0;
+        // No magic means a snapshot from before keys were carried; its events
+        // restore without one.
+        const keyed = std.mem.startsWith(u8, bytes, snapshot_magic);
+        if (keyed) {
+            cursor = snapshot_magic.len;
+            if (try readU32(bytes, &cursor) != snapshot_version) return error.CorruptSnapshot;
+        }
         const count = try readU32(bytes, &cursor);
         var i: u32 = 0;
         while (i < count) : (i += 1) {
@@ -620,7 +651,8 @@ pub const EventSpool = struct {
             const action = try readField(bytes, &cursor);
             const uri = try readField(bytes, &cursor);
             const message = try readField(bytes, &cursor);
-            try self.enqueueRaw(node_id, occurred_at, action, uri, message);
+            const key = if (keyed) try readOptionalField(bytes, &cursor) else null;
+            try self.enqueueRaw(node_id, occurred_at, action, uri, message, key);
         }
         // Trailing bytes after the declared events mean the snapshot is not what
         // it claims — reject rather than silently ignore the tail.
@@ -638,6 +670,18 @@ pub const EventSpool = struct {
         const value = std.mem.readInt(u32, bytes[cursor.*..][0..4], .little);
         cursor.* += 4;
         return value;
+    }
+
+    /// Read a field preceded by a presence flag: 0 for absent, 1 for present.
+    fn readOptionalField(bytes: []const u8, cursor: *usize) error{CorruptSnapshot}!?[]const u8 {
+        if (cursor.* >= bytes.len) return error.CorruptSnapshot;
+        const present = bytes[cursor.*];
+        cursor.* += 1;
+        return switch (present) {
+            0 => null,
+            1 => try readField(bytes, cursor),
+            else => error.CorruptSnapshot,
+        };
     }
 
     fn readField(bytes: []const u8, cursor: *usize) error{CorruptSnapshot}![]const u8 {
@@ -1090,10 +1134,59 @@ test "event spool survives a crash via its on-disk snapshot" {
     try testing.expectEqual(@as(usize, 0), reloaded.len());
 
     // A truncated snapshot is rejected rather than trusted.
-    try tmp.dir.writeFile(io, .{ .sub_path = "corrupt.bin", .data = &[_]u8{ 1, 0, 0, 0, 5, 0, 0, 0, 'a', 'b' } });
+    try tmp.dir.writeFile(io, .{ .sub_path = "corrupt.bin", .data = "WAFSPOOL" ++ &[_]u8{ 2, 0, 0, 0, 1, 0, 0, 0, 5, 0, 0, 0, 'a', 'b' } });
     var corrupt = EventSpool.init(testing.allocator, 8);
     defer corrupt.deinit();
     try testing.expectError(error.CorruptSnapshot, corrupt.restore(io, tmp.dir, "corrupt.bin"));
+
+    // A snapshot claiming a format this build does not know is rejected, rather
+    // than decoded as if its layout were the familiar one.
+    try tmp.dir.writeFile(io, .{ .sub_path = "future.bin", .data = "WAFSPOOL" ++ &[_]u8{ 99, 0, 0, 0, 0, 0, 0, 0 } });
+    var future = EventSpool.init(testing.allocator, 8);
+    defer future.deinit();
+    try testing.expectError(error.CorruptSnapshot, future.restore(io, tmp.dir, "future.bin"));
+}
+
+test "spooled events keep their idempotency keys across a snapshot" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        var spool = EventSpool.init(testing.allocator, 8);
+        defer spool.deinit();
+        try spool.enqueue(.{ .node_id = "99999999-9999-9999-9999-999999999999", .occurred_at = "2024-07-01T00:00:00Z", .action = "deny", .uri = "/a", .message = "keyed", .key = "txn-42" });
+        // An absent key and an empty key are different: only the latter has an
+        // identity, so the snapshot must not conflate them.
+        try spool.enqueue(.{ .node_id = "99999999-9999-9999-9999-999999999999", .occurred_at = "2024-07-01T00:00:01Z", .action = "deny", .uri = "/b", .message = "unkeyed" });
+        try spool.enqueue(.{ .node_id = "99999999-9999-9999-9999-999999999999", .occurred_at = "2024-07-01T00:00:02Z", .action = "deny", .uri = "/c", .message = "empty key", .key = "" });
+        try spool.persist(io, tmp.dir, "keyed.bin");
+    }
+
+    var recovered = EventSpool.init(testing.allocator, 8);
+    defer recovered.deinit();
+    try recovered.restore(io, tmp.dir, "keyed.bin");
+    try testing.expectEqual(@as(usize, 3), recovered.len());
+    try testing.expectEqualStrings("txn-42", recovered.events.items[0].key.?);
+    try testing.expect(recovered.events.items[1].key == null);
+    try testing.expectEqualStrings("", recovered.events.items[2].key.?);
+
+    // A snapshot written before keys existed has no header and no key field. A
+    // restart is when a node is upgraded, so that file must still be read — its
+    // events restore unkeyed rather than being discarded as corrupt.
+    const legacy: []const u8 = &([_]u8{ 1, 0, 0, 0 } ++ // one event
+        [_]u8{ 2, 0, 0, 0 } ++ "id".* ++
+        [_]u8{ 1, 0, 0, 0 } ++ "t".* ++
+        [_]u8{ 4, 0, 0, 0 } ++ "deny".* ++
+        [_]u8{ 2, 0, 0, 0 } ++ "/x".* ++
+        [_]u8{ 3, 0, 0, 0 } ++ "old".*);
+    try tmp.dir.writeFile(io, .{ .sub_path = "legacy.bin", .data = legacy });
+    var upgraded = EventSpool.init(testing.allocator, 8);
+    defer upgraded.deinit();
+    try upgraded.restore(io, tmp.dir, "legacy.bin");
+    try testing.expectEqual(@as(usize, 1), upgraded.len());
+    try testing.expectEqualStrings("old", upgraded.events.items[0].message);
+    try testing.expect(upgraded.events.items[0].key == null);
 }
 
 test "batched event ingestion commits the whole batch atomically" {
