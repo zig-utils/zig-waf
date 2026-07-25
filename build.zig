@@ -109,6 +109,31 @@ pub fn build(b: *std.Build) void {
     operator_evidence_module.addImport("waf", waf);
     const operator_evidence_tests = b.addTest(.{ .root_module = operator_evidence_module });
     const run_operator_evidence_tests = b.addRunArtifact(operator_evidence_tests);
+    // PostgreSQL fleet-storage foundation: a libpq-backed client + migration
+    // runner. Kept out of the default `test` step (it links libpq and its
+    // integration tests need a live database); run it with `zig build pg-test`
+    // after setting PG_TEST_DSN.
+    const pq_translate = b.addTranslateC(.{
+        .root_source_file = b.path("pantry/postgresql.org/libpq/v18.0.0/include/libpq-fe.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const pq_module = pq_translate.createModule();
+    const pg_module = b.createModule(.{
+        .root_source_file = b.path("src/pg.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    pg_module.addImport("pq", pq_module);
+    pg_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
+    pg_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
+    const pg_tests = b.addTest(.{ .root_module = pg_module });
+    const run_pg_tests = b.addRunArtifact(pg_tests);
+    const pg_test_step = b.step("pg-test", "Run PostgreSQL integration tests (needs PG_TEST_DSN)");
+    pg_test_step.dependOn(&run_pg_tests.step);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
