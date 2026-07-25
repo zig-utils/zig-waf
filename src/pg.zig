@@ -97,7 +97,10 @@ pub fn migrate(conn: *Conn, allocator: std.mem.Allocator, migrations: []const Mi
     for (migrations) |migration| {
         var version_buffer: [128]u8 = undefined;
         const version_text = try bufSqlZ(&version_buffer, "SELECT 1 FROM schema_migrations WHERE version = {d}", .{migration.version});
-        if ((try conn.queryScalar(allocator, version_text)) != null) continue; // already applied
+        if (try conn.queryScalar(allocator, version_text)) |existing| {
+            allocator.free(existing); // already applied
+            continue;
+        }
 
         try conn.exec("BEGIN");
         conn.exec(migration.sql) catch |err| {
@@ -126,6 +129,11 @@ pub fn migrate(conn: *Conn, allocator: std.mem.Allocator, migrations: []const Mi
 
 const testing = std.testing;
 
+test {
+    // Run the fleet schema's migration tests under `pg-test` too.
+    _ = @import("fleet.zig");
+}
+
 fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const raw = std.c.getenv("PG_TEST_DSN") orelse return null;
     const value = std.mem.span(raw);
@@ -151,9 +159,9 @@ test "migrations apply once, are idempotent, and are transactional" {
     var conn = try Conn.open(dsn);
     defer conn.close();
 
-    // Isolate from any prior run.
+    // Isolate from any prior run (schema_migrations may not exist yet).
     try conn.exec("DROP TABLE IF EXISTS pg_test_widgets");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (99001, 99002, 99003)");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (99001, 99002, 99003)") catch {};
 
     const good = [_]Migration{
         .{ .version = 99001, .name = "create_widgets", .sql = "CREATE TABLE pg_test_widgets (id bigint PRIMARY KEY)" },
