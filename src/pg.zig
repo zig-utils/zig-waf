@@ -79,6 +79,22 @@ pub const Conn = struct {
         }
     }
 
+    /// Like `execParams`, but each parameter may be null → a SQL NULL is bound
+    /// (libpq reads a null value pointer as NULL). For columns that are
+    /// genuinely absent (e.g. no HTTP status when a webhook host is unreachable)
+    /// rather than empty.
+    pub fn execParamsOpt(self: *Conn, sql: [:0]const u8, params: []const ?[:0]const u8) Error!void {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = if (param) |p| p.ptr else null;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0);
+        defer c.PQclear(result);
+        switch (c.PQresultStatus(result)) {
+            c.PGRES_COMMAND_OK, c.PGRES_TUPLES_OK => {},
+            else => return error.QueryFailed,
+        }
+    }
+
     /// Like `queryScalar`, but with text-format bind parameters.
     pub fn queryScalarParams(self: *Conn, allocator: std.mem.Allocator, sql: [:0]const u8, params: []const [:0]const u8) Error!?[]u8 {
         if (params.len > max_params) return error.QueryFailed;
@@ -332,6 +348,18 @@ test "connects and runs a scalar query" {
     defer testing.allocator.free(empty);
     try testing.expectEqualStrings("", empty);
     try testing.expect((try conn.queryScalarParams(testing.allocator, "SELECT NULLIF($1::text, 'x')", &.{"x"})) == null);
+
+    // execParamsOpt binds a null parameter as SQL NULL (round-tripped through a
+    // temp table), distinct from an empty string.
+    try conn.exec("CREATE TEMP TABLE opt_probe (a text, b text)");
+    try conn.execParamsOpt("INSERT INTO opt_probe (a, b) VALUES ($1, $2)", &.{ "present", null });
+    try testing.expect((try conn.queryScalar(testing.allocator, "SELECT b FROM opt_probe")) == null);
+    const a_val = (try conn.queryScalar(testing.allocator, "SELECT a FROM opt_probe")).?;
+    defer testing.allocator.free(a_val);
+    try testing.expectEqualStrings("present", a_val);
+    const null_count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM opt_probe WHERE b IS NULL")).?;
+    defer testing.allocator.free(null_count);
+    try testing.expectEqualStrings("1", null_count);
 }
 
 test "migrations apply once, are idempotent, and are transactional" {
