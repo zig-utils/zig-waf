@@ -2432,6 +2432,59 @@ pub const Transaction = struct {
         return try iterator.next();
     }
 
+    /// One resolved rule-target value: the concrete variable name it came from
+    /// (e.g. an ARGS key) and its current value, both borrowed from the store.
+    pub const ResolvedValue = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+
+    /// Resolve a rule target — a SecLang variable name plus an optional key
+    /// selector — to the values a rule operator runs against, allocating the
+    /// result (and any count string) in `arena`. A scalar variable yields at
+    /// most one value; a collection yields each matching entry. The count form
+    /// (`&VAR`) yields a single decimal cardinality. Unknown variables and regex
+    /// key selectors (not yet handled here) yield nothing. This is the
+    /// target-resolution layer of the rule-execution engine.
+    pub fn resolveTarget(
+        self: *Transaction,
+        arena: std.mem.Allocator,
+        variable_name: []const u8,
+        selector: ?[]const u8,
+        count: bool,
+    ) TransactionError![]ResolvedValue {
+        var values: std.ArrayList(ResolvedValue) = .empty;
+
+        if (variables.Name.parse(variable_name)) |scalar_name| {
+            const view = try self.scalar(scalar_name);
+            if (count) {
+                try values.append(arena, .{ .name = variable_name, .value = if (view != null) "1" else "0" });
+            } else if (view) |present| {
+                try values.append(arena, .{ .name = variable_name, .value = present.value });
+            }
+            return values.toOwnedSlice(arena);
+        }
+
+        if (collections.Name.parse(variable_name)) |collection_name| {
+            const chosen: collections.Selector = if (selector) |key| .{ .key = key } else .all;
+            var matched: usize = 0;
+            if (try self.collection(collection_name, chosen)) |initial| {
+                var iterator = initial;
+                while (try iterator.next()) |view| {
+                    matched += 1;
+                    if (!count) try values.append(arena, .{ .name = view.key, .value = view.value });
+                }
+            }
+            if (count) {
+                const text = try std.fmt.allocPrint(arena, "{d}", .{matched});
+                try values.append(arena, .{ .name = variable_name, .value = text });
+            }
+            return values.toOwnedSlice(arena);
+        }
+
+        return values.toOwnedSlice(arena); // unknown variable
+    }
+
     pub fn collectionTarget(self: *const Transaction, target: collections.Target, exclusions: []const collections.Target) TransactionError!?collections.TargetIterator {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         const availability = self.currentAvailability() orelse return null;
@@ -4511,6 +4564,48 @@ test "the sanitizeMatched action masks the matched variable" {
     // sanitizeMatched resolved ARGS:password and masked its body value.
     try std.testing.expect(std.mem.indexOf(u8, serial, "password=*******") != null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
+}
+
+test "resolveTarget yields scalar values, collection entries, and counts" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/search?q=zig&q=lang&empty=", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Scalar variable → single value.
+    const method = try tx.resolveTarget(a, "REQUEST_METHOD", null, false);
+    try std.testing.expectEqual(@as(usize, 1), method.len);
+    try std.testing.expectEqualStrings("GET", method[0].value);
+
+    // Collection with a key selector → the matching entry.
+    const q = try tx.resolveTarget(a, "ARGS", "q", false);
+    try std.testing.expectEqual(@as(usize, 2), q.len); // q appears twice
+    try std.testing.expectEqualStrings("zig", q[0].value);
+
+    // Collection with no selector → all entries (q, q, empty).
+    const all_args = try tx.resolveTarget(a, "ARGS", null, false);
+    try std.testing.expectEqual(@as(usize, 3), all_args.len);
+
+    // Count form → a single decimal cardinality.
+    const count = try tx.resolveTarget(a, "ARGS", null, true);
+    try std.testing.expectEqual(@as(usize, 1), count.len);
+    try std.testing.expectEqualStrings("3", count[0].value);
+
+    // A scalar count is 0/1; an absent scalar counts as 0.
+    const missing = try tx.resolveTarget(a, "REQUEST_METHOD", null, true);
+    try std.testing.expectEqualStrings("1", missing[0].value);
+
+    // An unknown variable yields nothing.
+    const unknown = try tx.resolveTarget(a, "NOT_A_VARIABLE", null, false);
+    try std.testing.expectEqual(@as(usize, 0), unknown.len);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
