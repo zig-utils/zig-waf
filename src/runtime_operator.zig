@@ -30,15 +30,17 @@ pub const RuntimeOperator = union(enum) {
             return .{ .phrase = try operators.PhraseOperator.compile(allocator, parameter, .{}) };
         }
         // For `@pmFromFile` the compiler has already replaced the filename with
-        // the file's bytes, so `parameter` is a newline-delimited keyword list.
-        if (eqName(op, "pmf") or eqName(op, "pmFromFile")) {
+        // the file's bytes, and for `@pmFromDataset` the dataset's entries, so
+        // `parameter` is a newline-delimited keyword list either way.
+        if (eqName(op, "pmf") or eqName(op, "pmFromFile") or eqName(op, "pmFromDataset")) {
             return .{ .phrase = try operators.PhraseOperator.compileFromFileBytes(allocator, parameter, .{}) };
         }
         if (eqName(op, "ipMatch")) {
             return .{ .ip = try operators.compileIpMatch(allocator, parameter, .{}) };
         }
-        // Likewise `parameter` here is the subnet-per-line contents of the file.
-        if (eqName(op, "ipMatchFromFile") or eqName(op, "ipMatchF")) {
+        // Likewise `parameter` here is the subnet-per-line contents of the file or
+        // the dataset.
+        if (eqName(op, "ipMatchFromFile") or eqName(op, "ipMatchF") or eqName(op, "ipMatchFromDataset")) {
             return .{ .ip = try operators.compileIpMatchFromFileBytes(allocator, parameter, .{}) };
         }
         return .{ .compile_free = .{ .name = name, .parameter = parameter } };

@@ -6766,3 +6766,131 @@ test "concurrent request pinning is safe across reload" {
     try retired.tryReclaim();
     try runtime.deinit();
 }
+
+test "@pmFromDataset compiles its phrase set from a SecDataset block" {
+    // Coraza declares pattern sets inline as a backtick block, so the dataset and
+    // the rule that reads it live in one configuration and need no data provider.
+    const input =
+        \\SecDataset shells `
+        \\bin/sh
+        \\bin/bash
+        \\# not a comment marker to the block, but ignored as a phrase
+        \\`
+        \\SecRule ARGS "@pmFromDataset shells" "id:1,phase:1,deny,status:403,t:none,msg:'RCE'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "dataset.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // An argument containing a dataset phrase is denied.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?cmd=/bin/bash%20-c", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        const decision = (try tx.intervention()).?;
+        try std.testing.expectEqual(@as(u16, 403), decision.status);
+    }
+
+    // An argument matching nothing in the dataset passes.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/x?cmd=hello", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "@ipMatchFromDataset compiles its subnet set from a SecDataset block" {
+    const input =
+        \\SecDataset badips `
+        \\10.0.0.0/8
+        \\192.168.1.5
+        \\`
+        \\SecRule REMOTE_ADDR "@ipMatchFromDataset badips" "id:1,phase:1,deny,status:403,msg:'blocklisted'"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "ipdataset.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("10.4.5.6", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        const decision = (try tx.intervention()).?;
+        try std.testing.expectEqual(@as(u16, 403), decision.status);
+    }
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("203.0.113.9", 1234, "198.51.100.1", 443);
+        try tx.processUri("/", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+    }
+}
+
+test "a rule naming an undeclared dataset fails to compile" {
+    // Compiling it as an empty set would silently disable the rule, which is the
+    // worst outcome for a security control: it would look configured and match
+    // nothing.
+    const input =
+        \\SecRule ARGS "@pmFromDataset absent" "id:1,phase:1,deny"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "missing.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(
+        error.UnknownDataset,
+        compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{}),
+    );
+}
+
+test "a dataset declared after the rules that read it still resolves" {
+    // A bundled ruleset may ship its data in a file included after its rules, so
+    // declarations are collected before any rule is compiled.
+    const input =
+        \\SecRule ARGS "@pmFromDataset later" "id:1,phase:1,deny,status:403,t:none"
+        \\SecDataset later `
+        \\attack
+        \\`
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "after.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?q=attack", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    try std.testing.expect((try tx.intervention()) != null);
+}

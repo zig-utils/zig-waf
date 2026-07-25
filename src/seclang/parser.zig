@@ -39,6 +39,8 @@ pub const Argument = struct {
         return switch (self.quote) {
             .single => if (self.raw[0] == '\'' and self.raw[self.raw.len - 1] == '\'') self.raw[1 .. self.raw.len - 1] else self.raw,
             .double => if (self.raw[0] == '"' and self.raw[self.raw.len - 1] == '"') self.raw[1 .. self.raw.len - 1] else self.raw,
+            // A block's delimiters are not part of its value; its newlines are.
+            .backtick => if (self.raw[0] == '`' and self.raw[self.raw.len - 1] == '`') self.raw[1 .. self.raw.len - 1] else self.raw,
             else => self.raw,
         };
     }

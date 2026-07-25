@@ -183,6 +183,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     EmptyMacroExpression,
     InvalidSourceTree,
     InvalidOperatorDataFile,
+    /// A `@pmFromDataset` / `@ipMatchFromDataset` named a dataset no `SecDataset`
+    /// declares. Compiling it as an empty set would silently disable the rule.
+    UnknownDataset,
 };
 
 /// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
@@ -880,6 +883,9 @@ fn compileDetailed(
     if (registry.sources.items.len > limits.max_source_references) return error.TooManySourceReferences;
     var compiler = Compiler.init(allocator, limits, failure, data_provider);
     defer compiler.deinit();
+    // Datasets first: a rule's operator is resolved as it is compiled, so every
+    // declaration has to be known before any rule is looked at.
+    for (documents) |*document| try compiler.collectDatasets(document);
     for (documents) |*document| {
         try validateDocument(registry, document);
         compiler.current_source_path = if (registry.get(document.source_id)) |record| record.path else null;
@@ -973,6 +979,11 @@ const Compiler = struct {
     failure: ?*?Failure,
     /// Optional loader for `@pmFromFile` / `@ipMatchFromFile` data files.
     data_provider: ?DataProvider = null,
+    /// `SecDataset` declarations by name, collected before rules are compiled so a
+    /// dataset may be declared anywhere in the configuration — including a file
+    /// included after the rules that read it, which is how a bundled ruleset ships
+    /// its data separately from its rules.
+    datasets: std.StringHashMapUnmanaged([]const u8) = .empty,
     /// Path of the rule file whose directives are currently being compiled;
     /// the base directory for resolving that file's operator data files.
     current_source_path: ?[]const u8 = null,
@@ -988,6 +999,7 @@ const Compiler = struct {
     }
 
     fn deinit(self: *Compiler) void {
+        self.datasets.deinit(self.allocator);
         self.interner.deinit();
         self.directives.deinit(self.allocator);
         self.arguments.deinit(self.allocator);
@@ -1017,6 +1029,22 @@ const Compiler = struct {
         self.remote_warnings.deinit(self.allocator);
         self.rule_ids.deinit(self.allocator);
         for (&self.phase_rules) |*items| items.deinit(self.allocator);
+    }
+
+    /// Record every `SecDataset name <entries>` declaration in a document. The
+    /// entries are borrowed from the parsed document, which outlives compilation.
+    /// A later declaration of the same name replaces an earlier one, matching how
+    /// Coraza's registry behaves.
+    fn collectDatasets(self: *Compiler, document: *const seclang.parser.Document) CompileError!void {
+        for (document.directives.items) |directive| {
+            // SecDataset is a generic directive to the parser, so it is recognized
+            // by name here rather than by kind.
+            if (!std.ascii.eqlIgnoreCase(directive.name, "SecDataset")) continue;
+            if (directive.arguments.len != 2) continue; // arity is enforced elsewhere
+            const name = std.mem.trim(u8, directive.arguments[0].content(), " \t");
+            if (name.len == 0) continue;
+            try self.datasets.put(self.allocator, name, directive.arguments[1].content());
+        }
     }
 
     fn addDocument(self: *Compiler, document: *const seclang.parser.Document) CompileError!void {
@@ -1298,6 +1326,15 @@ const Compiler = struct {
 
     const FileOperatorKind = enum { none, phrase, ip };
 
+    /// Whether an operator reads its patterns from a `SecDataset` declaration.
+    /// The phrase and IP kinds compile the same way as their file counterparts;
+    /// only where the bytes come from differs.
+    fn datasetOperatorKind(name: []const u8) FileOperatorKind {
+        if (std.ascii.eqlIgnoreCase(name, "pmFromDataset")) return .phrase;
+        if (std.ascii.eqlIgnoreCase(name, "ipMatchFromDataset")) return .ip;
+        return .none;
+    }
+
     fn fileOperatorKind(name: []const u8) FileOperatorKind {
         if (std.ascii.eqlIgnoreCase(name, "pmFromFile") or std.ascii.eqlIgnoreCase(name, "pmf")) return .phrase;
         if (std.ascii.eqlIgnoreCase(name, "ipMatchFromFile") or std.ascii.eqlIgnoreCase(name, "ipMatchF")) return .ip;
@@ -1316,6 +1353,14 @@ const Compiler = struct {
         parameter: []const u8,
         span: seclang.source.Span,
     ) CompileError!StringId {
+        // A dataset needs no provider: its entries are declared in the
+        // configuration itself, so they are already in hand.
+        if (datasetOperatorKind(name) != .none) {
+            const dataset_name = std.mem.trim(u8, parameter, " \t");
+            const entries = self.datasets.get(dataset_name) orelse
+                return self.fail(error.UnknownDataset, span, null);
+            return self.interner.intern(entries);
+        }
         const provider = self.data_provider orelse return self.interner.intern(parameter);
         if (fileOperatorKind(name) == .none) return self.interner.intern(parameter);
         const source_path = self.current_source_path orelse
