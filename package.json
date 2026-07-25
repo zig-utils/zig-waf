@@ -15,6 +15,7 @@
   "dependencies": {
     "ziglang.org": "0.17.0-dev",
     "openldap.org/liblmdb": "^0.9.35",
-    "postgresql.org/libpq": "^18"
+    "postgresql.org/libpq": "^18",
+    "facebook.com/zstd": "latest"
   }
 }

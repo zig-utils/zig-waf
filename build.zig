@@ -120,6 +120,27 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     const pq_module = pq_translate.createModule();
+    // Zstandard, for compressing a node's durable event queue (#55). Linked
+    // statically, like liblmdb, so no runtime library path is needed.
+    const zstd_translate = b.addTranslateC(.{
+        .root_source_file = b.path("pantry/facebook.com/zstd/v1.5.7/include/zstd.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const zstd_c_module = zstd_translate.createModule();
+    const zstd_module = b.createModule(.{
+        .root_source_file = b.path("src/zstd.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    zstd_module.addImport("zstd_c", zstd_c_module);
+    zstd_module.addIncludePath(b.path("pantry/facebook.com/zstd/v1.5.7/include"));
+    zstd_module.addObjectFile(b.path("pantry/facebook.com/zstd/v1.5.7/lib/libzstd.a"));
+    const zstd_tests = b.addTest(.{ .root_module = zstd_module });
+    const run_zstd_tests = b.addRunArtifact(zstd_tests);
+
     const pg_module = b.createModule(.{
         .root_source_file = b.path("src/pg.zig"),
         .target = target,
@@ -127,12 +148,14 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     pg_module.addImport("pq", pq_module);
+    pg_module.addImport("zstd", zstd_module);
     pg_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
     pg_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
     const pg_tests = b.addTest(.{ .root_module = pg_module });
     const run_pg_tests = b.addRunArtifact(pg_tests);
     const pg_test_step = b.step("pg-test", "Run PostgreSQL integration tests (needs PG_TEST_DSN)");
     pg_test_step.dependOn(&run_pg_tests.step);
+    pg_test_step.dependOn(&run_zstd_tests.step);
 
     // The ingestion benchmark links the same libpq and needs a live database, so
     // it is a separate step alongside pg-test rather than part of `bench-*` runs.
@@ -143,6 +166,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     fleet_module.addImport("pq", pq_module);
+    fleet_module.addImport("zstd", zstd_module);
     fleet_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
     fleet_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
     const ingestion_benchmark_module = b.createModule(.{
