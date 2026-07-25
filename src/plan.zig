@@ -430,6 +430,7 @@ pub const EffectKind = enum {
     setrsc,
     sanitize_request_header,
     sanitize_response_header,
+    sanitize_arg,
 };
 
 /// Typed request-path descriptor. Field meanings are selected by `kind`:
@@ -2127,6 +2128,8 @@ const Compiler = struct {
                 try self.appendSanitiseEffect(rule, action, action_index, .sanitize_request_header);
             } else if (std.ascii.eqlIgnoreCase(name, "sanitizeResponseHeader")) {
                 try self.appendSanitiseEffect(rule, action, action_index, .sanitize_response_header);
+            } else if (std.ascii.eqlIgnoreCase(name, "sanitizeArg")) {
+                try self.appendSanitiseEffect(rule, action, action_index, .sanitize_arg);
             }
         }
     }

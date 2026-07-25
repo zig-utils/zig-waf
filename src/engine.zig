@@ -912,6 +912,9 @@ pub const Transaction = struct {
     /// sanitiseRequestHeader / sanitiseResponseHeader). Names are owned copies.
     sanitise_request_headers: std.ArrayList([]const u8) = .empty,
     sanitise_response_headers: std.ArrayList([]const u8) = .empty,
+    /// Argument names whose values are masked in the audited request body
+    /// (ModSecurity sanitiseArg). Owned copies.
+    sanitise_args: std.ArrayList([]const u8) = .empty,
     flow_state: FlowState = .{},
     control_state: ControlState,
     rule_exclusions: std.ArrayList(RuleExclusion) = .empty,
@@ -1245,18 +1248,19 @@ pub const Transaction = struct {
                         try scalar_batch.putOwned(bindingScalar(namespace), key, .rule, .request_headers);
                         result.effects_applied += 1;
                     },
-                    .sanitize_request_header, .sanitize_response_header => {
-                        const header = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
-                        errdefer self.waf.allocator.free(header);
-                        if (header.len == 0) return error.InvalidActionValue;
+                    .sanitize_request_header, .sanitize_response_header, .sanitize_arg => {
+                        const target = try self.expandEffectTextStaged(effect.name orelse return error.InvalidRuleReference, &batch, &scalar_batch, plan);
+                        errdefer self.waf.allocator.free(target);
+                        if (target.len == 0) return error.InvalidActionValue;
                         // Sanitisation registration is fail-safe: it only ever
                         // masks more, never leaks, so registering directly (not
                         // staged) is safe even if a later effect rolls back.
-                        const list = if (effect.kind == .sanitize_request_header)
-                            &self.sanitise_request_headers
-                        else
-                            &self.sanitise_response_headers;
-                        try self.registerSanitiseTarget(list, header);
+                        const list = switch (effect.kind) {
+                            .sanitize_request_header => &self.sanitise_request_headers,
+                            .sanitize_response_header => &self.sanitise_response_headers,
+                            else => &self.sanitise_args,
+                        };
+                        try self.registerSanitiseTarget(list, target);
                         result.effects_applied += 1;
                     },
                     .expirevar => {
@@ -2179,7 +2183,7 @@ pub const Transaction = struct {
             .uri = self.auditScalar(.request_uri) orelse "",
             .http_version = self.auditHttpVersion(),
             .request_headers = try self.collectHeaders(arena, .request_headers, self.sanitise_request_headers.items),
-            .request_body = self.auditScalar(.request_body),
+            .request_body = try self.maskedRequestBody(arena),
             .response_status = self.auditNumber(u16, .response_status),
             .response_headers = try self.collectHeaders(arena, .response_headers, self.sanitise_response_headers.items),
             .response_body = self.auditScalar(.response_body),
@@ -2199,6 +2203,12 @@ pub const Transaction = struct {
     /// implementing ModSecurity's sanitiseResponseHeader.
     pub fn sanitiseResponseHeader(self: *Transaction, name: []const u8) TransactionError!void {
         try self.appendSanitiseTarget(&self.sanitise_response_headers, name);
+    }
+
+    /// Register an argument whose value is masked in the audited request body,
+    /// implementing ModSecurity's sanitiseArg.
+    pub fn sanitiseArg(self: *Transaction, name: []const u8) TransactionError!void {
+        try self.appendSanitiseTarget(&self.sanitise_args, name);
     }
 
     fn appendSanitiseTarget(self: *Transaction, list: *std.ArrayList([]const u8), name: []const u8) TransactionError!void {
@@ -2255,6 +2265,37 @@ pub const Transaction = struct {
             try list.append(arena, .{ .name = view.key, .value = value });
         }
         return list.toOwnedSlice(arena);
+    }
+
+    /// The request body with each sanitiseArg value masked. Each masked argument
+    /// carries a request-body Source spanning its raw `key=value` segment; the
+    /// value (everything after the first `=` in the segment) is overwritten with
+    /// '*' in a copy, matching ModSecurity's sanitiseArg. Returns the borrowed
+    /// body unchanged when nothing is sanitised.
+    fn maskedRequestBody(self: *Transaction, arena: std.mem.Allocator) TransactionError!?[]const u8 {
+        const body = self.auditScalar(.request_body) orelse return null;
+        if (self.sanitise_args.items.len == 0 or body.len == 0) return body;
+        const copy = try arena.dupe(u8, body);
+        var iterator = (self.collection(.args_post, .all) catch return copy) orelse return copy;
+        while (iterator.next() catch return copy) |view| {
+            // ARGS names are case-sensitive.
+            var matched = false;
+            for (self.sanitise_args.items) |target| {
+                if (std.mem.eql(u8, target, view.key)) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched or view.source.origin != .request_body) continue;
+            const start = view.source.offset;
+            const end = start + view.source.length;
+            if (end > copy.len or start > end) continue;
+            const segment = copy[start..end];
+            if (std.mem.indexOfScalar(u8, segment, '=')) |eq| {
+                @memset(copy[start + eq + 1 .. end], '*');
+            }
+        }
+        return copy;
     }
 
     /// Format one audit message per matched rule flagged for audit logging,
@@ -3167,6 +3208,7 @@ pub const Transaction = struct {
         self.rule_exclusion_bytes = 0;
         deinitSanitiseTargets(self.waf.allocator, &self.sanitise_request_headers);
         deinitSanitiseTargets(self.waf.allocator, &self.sanitise_response_headers);
+        deinitSanitiseTargets(self.waf.allocator, &self.sanitise_args);
         self.transformation_executor.deinit();
         if (self.request_body_buffer) |*buffer| buffer.deinit();
         if (self.response_body_buffer) |*buffer| buffer.deinit();
@@ -4363,6 +4405,43 @@ test "the sanitizeRequestHeader and sanitizeResponseHeader actions mask via secl
     try std.testing.expect(std.mem.indexOf(u8, serial, "topsecret") == null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "set-cookie: *") != null);
     try std.testing.expect(std.mem.indexOf(u8, serial, "sid=xyz") == null);
+}
+
+test "the sanitizeArg action masks an argument value in the audited body" {
+    const input =
+        \\SecRule REQUEST_METHOD "@streq NONE" "id:1,phase:2,ctl:auditLogParts=ABCHZ,sanitizeArg:password,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "sanitize-arg.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.10", 44321, "198.51.100.5", 443);
+    try tx.processUri("/login", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("content-type", "application/x-www-form-urlencoded");
+    try tx.processRequestHeaders();
+    try tx.writeRequestBody("user=alice&password=hunter2&remember=1");
+    try tx.processRequestBody();
+    var cursor = try PhaseCursor.init(&tx, .request_body);
+    _ = (try cursor.next()).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), .{
+        .name = "REQUEST_METHOD",
+        .value = "POST",
+        .source = .{ .origin = .request_body, .offset = 0, .length = 4 },
+    });
+    try tx.processLogging();
+
+    const serial = try tx.serializeAuditLog(std.testing.allocator, .serial);
+    defer std.testing.allocator.free(serial);
+    // The password value is masked; the other args and the key are intact.
+    try std.testing.expect(std.mem.indexOf(u8, serial, "user=alice&password=*******&remember=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, serial, "hunter2") == null);
 }
 
 test "processUri populates ARGS_GET from the decoded query string" {
