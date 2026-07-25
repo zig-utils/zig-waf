@@ -25,6 +25,8 @@ pub fn main(init: std.process.Init) !void {
         try validate(gpa, io, &args);
     } else if (std.mem.eql(u8, command, "explain")) {
         try explain(gpa, io, &args);
+    } else if (std.mem.eql(u8, command, "test")) {
+        try testRequest(gpa, io, &args);
     } else if (std.mem.eql(u8, command, "version")) {
         std.debug.print("zig-waf {s}\n", .{waf.version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -43,6 +45,7 @@ fn usage() void {
         \\usage:
         \\  zig-waf validate <file.conf>...   parse, compile, and validate SecLang configs
         \\  zig-waf explain <file.conf>       list the compiled rules (phase, id, action, location)
+        \\  zig-waf test <file.conf> [METHOD] [URI]   run a request through the engine and report the decision
         \\  zig-waf version                   print the engine version
         \\  zig-waf help                      show this help
         \\
@@ -92,6 +95,68 @@ fn explain(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator)
             index,                          rule.phase,    id,
             @tagName(rule.disruptive.kind), location.line, location.column,
         });
+    }
+}
+
+/// Compile a config, run a synthetic request through the engine's request
+/// phases, and print whether it is blocked or allowed — a quick way to check a
+/// rule against a request from the command line or CI.
+fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse {
+        std.debug.print("zig-waf test: expected a config file\n", .{});
+        std.process.exit(2);
+    };
+    const method = args.next() orelse "GET";
+    const uri = args.next() orelse "/";
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(bytes);
+
+    var parsed = try waf.seclang.parser.parseBytesOutcome(gpa, path, bytes, .{}, .{});
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .diagnostic => |value| {
+            const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
+            defer gpa.free(rendered);
+            std.debug.print("{s}", .{rendered});
+            std.process.exit(1);
+        },
+        .document => |document| document,
+    };
+    var documents = [_]waf.seclang.parser.Document{document};
+    const plan = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+        std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
+        std.process.exit(1);
+    };
+    defer plan.deinit();
+
+    var builder = waf.Waf.Builder.init(gpa);
+    builder.setRetainedPlan(plan);
+    const instance = try builder.build();
+    defer instance.deinit() catch {};
+
+    var tx = instance.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("127.0.0.1", 40000, "127.0.0.1", 80);
+    try tx.processUri(uri, method, "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(gpa, .request_headers);
+    if ((try tx.intervention()) == null) {
+        try tx.processRequestBody();
+        try tx.evaluatePhase(gpa, .request_body);
+    }
+
+    if (try tx.intervention()) |decision| {
+        std.debug.print("BLOCKED  action={s} status={d}{s}\n", .{
+            @tagName(decision.action),
+            decision.status,
+            if (decision.enforced) "" else "  (detection-only)",
+        });
+    } else {
+        std.debug.print("ALLOWED\n", .{});
     }
 }
 
