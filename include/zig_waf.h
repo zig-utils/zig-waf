@@ -144,6 +144,18 @@ zig_waf_status_t zig_waf_transaction_intervention(
     const zig_waf_transaction_t *transaction,
     zig_waf_intervention_t *out_intervention);
 
+/* Serialize the audit record. format: 0 serial, 1 JSON, 2 legacy JSON, 3 OCSF.
+ * On success out_buffer and out_len describe a buffer the caller must release
+ * with zig_waf_free(). */
+zig_waf_status_t zig_waf_transaction_serialize_audit_log(
+    zig_waf_transaction_t *transaction,
+    uint32_t format,
+    uint8_t **out_buffer,
+    size_t *out_len);
+
+/* Release a buffer returned by the ABI (e.g. the audit-log serializer). */
+void zig_waf_free(uint8_t *pointer, size_t len);
+
 #ifdef __cplusplus
 }
 #endif

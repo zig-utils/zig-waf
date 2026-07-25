@@ -257,6 +257,40 @@ export fn zig_waf_transaction_intervention(
     return .ok;
 }
 
+/// Serialize the transaction's audit record into a freshly allocated buffer.
+/// `format`: 0 serial, 1 JSON, 2 legacy JSON, 3 OCSF. On success the caller owns
+/// `*out_buffer` and must release it with `zig_waf_free(*out_buffer, *out_len)`.
+export fn zig_waf_transaction_serialize_audit_log(
+    handle: ?*TransactionHandle,
+    format: u32,
+    out_buffer: ?*?[*]u8,
+    out_len: ?*usize,
+) callconv(.c) Status {
+    const transaction = getTransaction(handle) orelse return .invalid_argument;
+    const buffer_out = out_buffer orelse return .invalid_argument;
+    const len_out = out_len orelse return .invalid_argument;
+    buffer_out.* = null;
+    len_out.* = 0;
+    const fmt: waf.audit.Format = switch (format) {
+        0 => .serial,
+        1 => .json,
+        2 => .legacy_json,
+        3 => .ocsf,
+        else => return .invalid_argument,
+    };
+    const rendered = transaction.serializeAuditLog(std.heap.page_allocator, fmt) catch |err| return mapError(err);
+    buffer_out.* = rendered.ptr;
+    len_out.* = rendered.len;
+    return .ok;
+}
+
+/// Release a buffer returned by the ABI (currently the audit-log serializer).
+export fn zig_waf_free(pointer: ?[*]u8, len: usize) callconv(.c) void {
+    const start = pointer orelse return;
+    if (len == 0) return;
+    std.heap.page_allocator.free(start[0..len]);
+}
+
 fn wafFromHandle(handle: *WafHandle) *waf.Waf {
     return @ptrCast(@alignCast(handle));
 }

@@ -77,6 +77,17 @@ int main(void) {
                strlen(protocol)) == ZIG_WAF_OK);
     assert(zig_waf_transaction_process_logging(transaction) == ZIG_WAF_OK);
 
+    /* Serialize the audit record over the ABI and release it. */
+    uint8_t *audit = NULL;
+    size_t audit_len = 0;
+    assert(zig_waf_transaction_serialize_audit_log(transaction, 0, &audit, &audit_len) == ZIG_WAF_OK);
+    assert(audit != NULL && audit_len > 0);
+    /* The serial format opens with the section-A boundary marker. */
+    assert(strncmp((const char *)audit, "--", 2) == 0);
+    zig_waf_free(audit, audit_len);
+    /* An unknown format id is rejected. */
+    assert(zig_waf_transaction_serialize_audit_log(transaction, 99, &audit, &audit_len) == ZIG_WAF_ERROR_INVALID_ARGUMENT);
+
     zig_waf_transaction_destroy(transaction);
     assert(zig_waf_destroy(waf) == ZIG_WAF_OK);
     return 0;
