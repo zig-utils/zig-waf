@@ -830,20 +830,13 @@ pub const RolloutRepository = struct {
 
 const testing = std.testing;
 
-/// Every table the fleet schema owns, for test teardown. Partitions of
-/// `security_events` are removed with their parent by the CASCADE.
-const schema_tables = "nodes, rulesets, security_events, alert_rules, node_rulesets, alert_deliveries";
-
-/// A connection to the PG_TEST_DSN database whose fleet schema has been dropped
-/// and rebuilt, so a test starts from empty tables at the latest version.
+/// A connection to a private schema in the PG_TEST_DSN database with the fleet
+/// schema freshly applied, so each test starts from empty tables at the latest
+/// version and never contends with a test running in parallel.
 const TestDb = struct {
-    dsn: [:0]u8,
-    conn: pg.Conn,
-
-    /// Reset and migrate. Returns error.SkipZigTest when PG_TEST_DSN is unset,
-    /// which is how the suite stays runnable without a database.
-    fn open(allocator: std.mem.Allocator) !TestDb {
-        var db = try openUnmigrated(allocator);
+    /// Isolate and migrate. Returns error.SkipZigTest when PG_TEST_DSN is unset.
+    fn open(allocator: std.mem.Allocator) !pg.TestSchema {
+        var db = try pg.TestSchema.open(allocator);
         _ = apply(&db.conn, allocator) catch |err| {
             db.close();
             return err;
@@ -851,35 +844,9 @@ const TestDb = struct {
         return db;
     }
 
-    /// Reset without migrating — for tests that assert on `apply` itself.
-    fn openUnmigrated(allocator: std.mem.Allocator) !TestDb {
-        const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
-        const value = std.mem.span(raw);
-        if (value.len == 0) return error.SkipZigTest;
-        const dsn = try allocator.allocSentinel(u8, value.len, 0);
-        errdefer allocator.free(dsn);
-        @memcpy(dsn, value);
-        var conn = try pg.Conn.open(dsn);
-        reset(&conn);
-        return .{ .dsn = dsn, .conn = conn };
-    }
-
-    /// Drop the fleet schema and close. Leaves the database as it was found.
-    fn close(self: *TestDb) void {
-        reset(&self.conn);
-        self.conn.close();
-        testing.allocator.free(self.dsn);
-        self.* = undefined;
-    }
-
-    /// Drop every fleet table and forget every fleet migration, so the next
-    /// `apply` exercises the real DDL. Tolerates a database that has neither
-    /// (a clean slate) — which is why nothing here is fatal.
-    fn reset(conn: *pg.Conn) void {
-        conn.exec("DROP TABLE IF EXISTS " ++ schema_tables ++ " CASCADE") catch {};
-        // Derived from `migrations`, so a new migration needs no test edits.
-        const highest = comptime migrations[migrations.len - 1].version;
-        conn.exec(std.fmt.comptimePrint("DELETE FROM schema_migrations WHERE version BETWEEN 1 AND {d}", .{highest})) catch {};
+    /// Isolate without migrating — for tests that assert on `apply` itself.
+    fn openUnmigrated(allocator: std.mem.Allocator) !pg.TestSchema {
+        return pg.TestSchema.open(allocator);
     }
 };
 

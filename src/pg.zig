@@ -318,6 +318,68 @@ test {
     _ = @import("fleet.zig");
 }
 
+/// Test-only: a connection whose search_path is a private, uniquely named
+/// schema, dropped on `close`.
+///
+/// The build runner executes tests in parallel, so every integration test in
+/// this suite shares the one database named by PG_TEST_DSN. Tests that create
+/// tables — and `migrate`, which records versions in `schema_migrations` — would
+/// otherwise contend: one test's teardown drops the tables another is still
+/// using, intermittently and unreproducibly. A per-test schema gives each one
+/// its own `schema_migrations` and its own tables, so DDL is genuinely isolated.
+pub const TestSchema = struct {
+    dsn: [:0]u8,
+    name: [:0]u8,
+    conn: Conn,
+
+    /// Distinguishes concurrent tests within the process; the pid distinguishes
+    /// concurrent test binaries.
+    var next_id: std.atomic.Value(u32) = .init(0);
+
+    /// Open PG_TEST_DSN and switch to a fresh private schema. Returns
+    /// error.SkipZigTest when PG_TEST_DSN is unset, which is how this suite stays
+    /// runnable without a database.
+    pub fn open(allocator: std.mem.Allocator) !TestSchema {
+        const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+        const value = std.mem.span(raw);
+        if (value.len == 0) return error.SkipZigTest;
+        const dsn = try allocator.allocSentinel(u8, value.len, 0);
+        errdefer allocator.free(dsn);
+        @memcpy(dsn, value);
+
+        var name_buffer: [64]u8 = undefined;
+        const generated = std.fmt.bufPrint(&name_buffer, "waf_test_{d}_{d}", .{
+            std.c.getpid(),
+            next_id.fetchAdd(1, .monotonic),
+        }) catch unreachable;
+        const name = try allocator.allocSentinel(u8, generated.len, 0);
+        errdefer allocator.free(name);
+        @memcpy(name, generated);
+
+        var conn = try Conn.open(dsn);
+        errdefer conn.close();
+        // A crashed earlier run can leave the schema behind, so drop first.
+        var sql_buffer: [256]u8 = undefined;
+        try conn.exec(try bufSqlZ(&sql_buffer, "DROP SCHEMA IF EXISTS {s} CASCADE", .{name}));
+        try conn.exec(try bufSqlZ(&sql_buffer, "CREATE SCHEMA {s}", .{name}));
+        // Unqualified names now resolve to this schema for the whole session.
+        try conn.exec(try bufSqlZ(&sql_buffer, "SET search_path = {s}", .{name}));
+        return .{ .dsn = dsn, .name = name, .conn = conn };
+    }
+
+    /// Drop the private schema with everything in it, then close.
+    pub fn close(self: *TestSchema) void {
+        var sql_buffer: [256]u8 = undefined;
+        if (bufSqlZ(&sql_buffer, "DROP SCHEMA IF EXISTS {s} CASCADE", .{self.name})) |sql| {
+            self.conn.exec(sql) catch {};
+        } else |_| {}
+        self.conn.close();
+        testing.allocator.free(self.name);
+        testing.allocator.free(self.dsn);
+        self.* = undefined;
+    }
+};
+
 fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const raw = std.c.getenv("PG_TEST_DSN") orelse return null;
     const value = std.mem.span(raw);
@@ -382,22 +444,18 @@ test "connects and runs a scalar query" {
 }
 
 test "migrations apply once, are idempotent, and are transactional" {
-    const dsn = (try testDsn(testing.allocator)) orelse return error.SkipZigTest;
-    defer testing.allocator.free(dsn);
-    var conn = try Conn.open(dsn);
-    defer conn.close();
-
-    // Isolate from any prior run (schema_migrations may not exist yet).
-    try conn.exec("DROP TABLE IF EXISTS pg_test_widgets");
-    conn.exec("DELETE FROM schema_migrations WHERE version IN (99001, 99002, 99003)") catch {};
+    // A private schema, so this test's schema_migrations and tables are its own.
+    var db = try TestSchema.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
 
     const good = [_]Migration{
         .{ .version = 99001, .name = "create_widgets", .sql = "CREATE TABLE pg_test_widgets (id bigint PRIMARY KEY)" },
         .{ .version = 99002, .name = "seed_widget", .sql = "INSERT INTO pg_test_widgets (id) VALUES (7)" },
     };
-    try testing.expectEqual(@as(usize, 2), try migrate(&conn, testing.allocator, &good));
+    try testing.expectEqual(@as(usize, 2), try migrate(conn, testing.allocator, &good));
     // Second run applies nothing (idempotent).
-    try testing.expectEqual(@as(usize, 0), try migrate(&conn, testing.allocator, &good));
+    try testing.expectEqual(@as(usize, 0), try migrate(conn, testing.allocator, &good));
 
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM pg_test_widgets")).?;
     defer testing.allocator.free(count);
@@ -407,9 +465,6 @@ test "migrations apply once, are idempotent, and are transactional" {
     const bad = [_]Migration{
         .{ .version = 99003, .name = "broken", .sql = "INSERT INTO pg_test_widgets (id) VALUES (7)" }, // duplicate PK
     };
-    try testing.expectError(error.QueryFailed, migrate(&conn, testing.allocator, &bad));
+    try testing.expectError(error.QueryFailed, migrate(conn, testing.allocator, &bad));
     try testing.expect((try conn.queryScalar(testing.allocator, "SELECT 1 FROM schema_migrations WHERE version = 99003")) == null);
-
-    try conn.exec("DROP TABLE pg_test_widgets");
-    try conn.exec("DELETE FROM schema_migrations WHERE version IN (99001, 99002)");
 }
