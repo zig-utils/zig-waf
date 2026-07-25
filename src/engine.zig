@@ -7995,3 +7995,67 @@ test "a host body processor publishes arguments rules can inspect" {
         ));
     }
 }
+
+test "XML entity expansion cannot read files or blow up the parser" {
+    // Safety here is structural rather than configured: the tokenizer performs no
+    // entity decoding and has no DTD processor, so there is no external-entity
+    // resolution to disable and no expansion to bound. These assertions pin that
+    // property, because the day an XML backend gains DTD support is the day XXE
+    // becomes possible by default.
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // XXE: an external entity referencing a local file. Resolving it would make the
+    // WAF read /etc/passwd on the attacker's behalf and hand it to the ruleset — or,
+    // with a remote SYSTEM id, make the WAF a request forwarder.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "application/xml");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody(
+            \\<?xml version="1.0"?>
+            \\<!DOCTYPE root [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>
+            \\<root><data>&xxe;</data></root>
+        );
+        try tx.processRequestBody();
+
+        // Whatever the XML collection holds, it must not hold the file's contents.
+        var found_passwd = false;
+        if (try tx.collectionTarget(.{ .collection = .xml, .selector = .all }, &.{})) |iterator| {
+            var it = iterator;
+            while (try it.next()) |view| {
+                if (std.mem.indexOf(u8, view.value, "root:x:") != null) found_passwd = true;
+            }
+        }
+        try std.testing.expect(!found_passwd);
+    }
+
+    // Billion laughs: nested entities that expand to gigabytes if resolved.
+    {
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/api", "POST", "HTTP/1.1");
+        try tx.addRequestHeader("Content-Type", "application/xml");
+        try tx.processRequestHeaders();
+        try tx.writeRequestBody(
+            \\<?xml version="1.0"?>
+            \\<!DOCTYPE lolz [
+            \\ <!ENTITY lol "lol">
+            \\ <!ENTITY lol1 "&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;&lol;">
+            \\ <!ENTITY lol2 "&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;&lol1;">
+            \\ <!ENTITY lol3 "&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;&lol2;">
+            \\ <!ENTITY lol4 "&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;&lol3;">
+            \\]>
+            \\<lolz>&lol4;</lolz>
+        );
+        // The transaction completes rather than expanding: an entity bomb is a body
+        // that parses to little, not a body that consumes the process.
+        try tx.processRequestBody();
+        try std.testing.expect((try tx.scalar(.request_body)) != null);
+    }
+}
