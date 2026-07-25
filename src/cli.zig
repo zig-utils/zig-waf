@@ -137,8 +137,11 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     const method = args.next() orelse "GET";
     const uri = args.next() orelse "/";
     // Optional request body and its content type, so request-body-phase rules
-    // (URL-encoded / JSON / multipart / XML processors) can be exercised.
-    const body = args.next();
+    // (URL-encoded / JSON / multipart / XML processors) can be exercised. An
+    // empty body argument means "no body" — otherwise a GET would be sent with a
+    // zero-length body and content-type headers, which protocol rules flag.
+    const body_arg = args.next();
+    const body: ?[]const u8 = if (body_arg) |value| (if (value.len == 0) null else value) else null;
     const content_type = args.next() orelse "application/x-www-form-urlencoded";
 
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
@@ -182,6 +185,13 @@ fn testRequest(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Itera
     defer tx.deinit();
     try tx.processConnection("127.0.0.1", 40000, "127.0.0.1", 80);
     try tx.processUri(uri, method, "HTTP/1.1");
+    // Send the headers a normal client always carries. CRS protocol-enforcement
+    // rules (920) legitimately flag requests missing Host / User-Agent / Accept,
+    // so without these a benign request looks like a bare scanner probe and is
+    // blocked — masking real detection behaviour behind a test artifact.
+    try tx.addRequestHeader("Host", "localhost");
+    try tx.addRequestHeader("User-Agent", "zig-waf-test/1.0");
+    try tx.addRequestHeader("Accept", "*/*");
     if (body) |bytes_body| {
         try tx.addRequestHeader("Content-Type", content_type);
         var length_buffer: [20]u8 = undefined;
