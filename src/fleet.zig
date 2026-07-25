@@ -323,7 +323,52 @@ pub const EventRepository = struct {
             &.{days_buffer[0..days.len :0]},
         );
     }
+
+    /// Export a node's events as an RFC 4180 CSV document (#56) — the archival /
+    /// download path for audit search. Columns: occurred_at, action, uri,
+    /// message, oldest first. Fields are quoted and internal quotes doubled, so
+    /// a URI or message containing commas, quotes, or newlines round-trips
+    /// intact. The caller owns and frees the returned bytes.
+    pub fn exportCsv(self: EventRepository, allocator: std.mem.Allocator, node_id: [:0]const u8) pg.Error![]u8 {
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(allocator);
+        try appendCsvRow(&out, allocator, &.{ "occurred_at", "action", "uri", "message" });
+        var rows = try self.conn.query(
+            \\SELECT occurred_at::text, coalesce(action, ''), coalesce(uri, ''), coalesce(message, '')
+            \\FROM security_events WHERE node_id = $1 ORDER BY occurred_at, id
+        , &.{node_id});
+        defer rows.deinit();
+        while (rows.next()) {
+            try appendCsvRow(&out, allocator, &.{ rows.get(0), rows.get(1), rows.get(2), rows.get(3) });
+        }
+        return out.toOwnedSlice(allocator);
+    }
 };
+
+/// Append one RFC 4180 CSV record (fields joined by commas, terminated by CRLF).
+fn appendCsvRow(out: *std.ArrayList(u8), allocator: std.mem.Allocator, fields: []const []const u8) error{OutOfMemory}!void {
+    for (fields, 0..) |field, index| {
+        if (index != 0) try out.append(allocator, ',');
+        try appendCsvField(out, allocator, field);
+    }
+    try out.appendSlice(allocator, "\r\n");
+}
+
+/// Append a CSV field, quoting it when it contains a comma, quote, CR, or LF and
+/// doubling any embedded quotes.
+fn appendCsvField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, field: []const u8) error{OutOfMemory}!void {
+    const needs_quote = std.mem.indexOfAny(u8, field, ",\"\r\n") != null;
+    if (!needs_quote) {
+        try out.appendSlice(allocator, field);
+        return;
+    }
+    try out.append(allocator, '"');
+    for (field) |byte| {
+        if (byte == '"') try out.append(allocator, '"');
+        try out.append(allocator, byte);
+    }
+    try out.append(allocator, '"');
+}
 
 /// A bounded in-memory queue of events awaiting ingestion (#55). Nodes enqueue
 /// events (their fields are copied in, so callers keep no lifetime obligations)
@@ -805,6 +850,47 @@ test "event retention prunes only events past the window" {
     const remaining = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("1", remaining);
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
+}
+
+test "csv fields are quoted and escaped per RFC 4180" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+    try appendCsvRow(&out, testing.allocator, &.{ "plain", "has,comma", "has\"quote", "line\nbreak" });
+    try testing.expectEqualStrings("plain,\"has,comma\",\"has\"\"quote\",\"line\nbreak\"\r\n", out.items);
+}
+
+test "event export produces escaped CSV" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const events = EventRepository{ .conn = &conn };
+    const node_id = "44444444-4444-4444-4444-444444444444";
+    try events.recordAt(node_id, "2024-01-01T00:00:00Z", "deny", "/a?id=1", "first");
+    // A URI with a comma and a quote must be CSV-quoted and its quote doubled.
+    try events.recordAt(node_id, "2024-01-02T00:00:00Z", "pass", "/x,\"y\"", "second");
+
+    const csv = try events.exportCsv(testing.allocator, node_id);
+    defer testing.allocator.free(csv);
+
+    // Header, then the two events oldest-first; the tricky URI is quoted.
+    try testing.expect(std.mem.startsWith(u8, csv, "occurred_at,action,uri,message\r\n"));
+    try testing.expect(std.mem.indexOf(u8, csv, ",deny,/a?id=1,first\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, csv, ",pass,\"/x,\"\"y\"\"\",second\r\n") != null);
+    // Exactly three CRLF-terminated records (header + 2 rows).
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, csv, "\r\n"));
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
