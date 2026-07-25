@@ -91,6 +91,82 @@ pub const Conn = struct {
     }
 };
 
+/// A bounded pool of PostgreSQL connections, opened lazily and reused (#53).
+/// Thread-safe: `acquire`/`release` are guarded by a mutex so many std.Io tasks
+/// can share it. `acquire` returns an idle connection, opens a new one while
+/// under `max`, or fails with `PoolExhausted` when all `max` are checked out —
+/// non-blocking, so a caller drops or retries rather than stalling a worker.
+pub const Pool = struct {
+    allocator: std.mem.Allocator,
+    dsn: [:0]const u8,
+    max: usize,
+    /// Tiny-critical-section spinlock over the idle list and counter; new
+    /// connections are opened outside it so a blocking connect never stalls
+    /// other tasks holding the lock.
+    locked: std.atomic.Value(bool) = .init(false),
+    idle: std.ArrayList(Conn) = .empty,
+    checked_out: usize = 0,
+
+    pub const AcquireError = Error || error{PoolExhausted};
+
+    pub fn init(allocator: std.mem.Allocator, dsn: [:0]const u8, max: usize) Pool {
+        return .{ .allocator = allocator, .dsn = dsn, .max = max };
+    }
+
+    fn lock(self: *Pool) void {
+        while (self.locked.cmpxchgWeak(false, true, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+    }
+    fn unlock(self: *Pool) void {
+        self.locked.store(false, .release);
+    }
+
+    /// Close every idle connection. All checked-out connections must have been
+    /// released first.
+    pub fn deinit(self: *Pool) void {
+        self.lock();
+        defer self.unlock();
+        for (self.idle.items) |*conn| conn.close();
+        self.idle.deinit(self.allocator);
+        self.* = undefined;
+    }
+
+    /// Borrow a connection; return it with `release`.
+    pub fn acquire(self: *Pool) AcquireError!Conn {
+        self.lock();
+        if (self.idle.pop()) |conn| {
+            self.checked_out += 1;
+            self.unlock();
+            return conn;
+        }
+        if (self.checked_out >= self.max) {
+            self.unlock();
+            return error.PoolExhausted;
+        }
+        self.checked_out += 1; // reserve the slot before releasing the lock
+        self.unlock();
+
+        // Open outside the lock (a blocking connect must not stall other tasks).
+        return Conn.open(self.dsn) catch |err| {
+            self.lock();
+            self.checked_out -= 1; // hand the reserved slot back on failure
+            self.unlock();
+            return err;
+        };
+    }
+
+    /// Return a connection to the pool for reuse.
+    pub fn release(self: *Pool, conn: Conn) void {
+        self.lock();
+        defer self.unlock();
+        self.checked_out -= 1;
+        self.idle.append(self.allocator, conn) catch {
+            // Out of memory tracking the idle handle: close it rather than leak.
+            var owned = conn;
+            owned.close();
+        };
+    }
+};
+
 /// One schema migration: a stable version, a name, and its idempotent-at-the-
 /// -version SQL (which may contain several statements).
 pub const Migration = struct {
@@ -169,6 +245,30 @@ fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const owned = try allocator.allocSentinel(u8, value.len, 0);
     @memcpy(owned, value);
     return owned;
+}
+
+test "connection pool reuses connections and bounds concurrency" {
+    const dsn = (try testDsn(testing.allocator)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(dsn);
+    var pool = Pool.init(testing.allocator, dsn, 2);
+    defer pool.deinit();
+
+    var a = try pool.acquire();
+    const b = try pool.acquire();
+    // At max (2 checked out): a third acquire fails without blocking.
+    try testing.expectError(error.PoolExhausted, pool.acquire());
+    const one = (try a.queryScalar(testing.allocator, "SELECT 1")).?;
+    defer testing.allocator.free(one);
+    try testing.expectEqualStrings("1", one);
+
+    pool.release(a);
+    // Releasing frees a slot; re-acquiring reuses the now-idle connection.
+    var reused = try pool.acquire();
+    const two = (try reused.queryScalar(testing.allocator, "SELECT 2")).?;
+    defer testing.allocator.free(two);
+    try testing.expectEqualStrings("2", two);
+    pool.release(b);
+    pool.release(reused);
 }
 
 test "connects and runs a scalar query" {
