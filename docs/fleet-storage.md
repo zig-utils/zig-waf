@@ -240,3 +240,29 @@ subject, not email: an email address can be reassigned, and a linkage by email w
 hand the new holder the old account. Discovery and JWKS fetching stay with the
 caller, which owns HTTP and its destination policy, so verification is a pure
 function of its inputs.
+
+## Alerts and telemetry
+
+A rule fires when its threshold is met inside its window, and then stays quiet for
+its dedupe interval. Alerting on every matching event is noise, and noise is how a
+real alert gets missed. Firing is a single statement — the threshold check, the
+dedupe check, and the stamp that starts the next quiet period cannot interleave — so
+two dispatchers seeing the same burst deliver one alert rather than two.
+
+A silence suppresses a rule for a stated reason, by a named actor, until a stated
+time. It is preferred to disabling the rule: it expires by itself, so nobody has to
+remember to switch an alert back on, and the reason survives the incident.
+
+Delivery attempts are recorded with their outcome, including an unreachable host,
+whose HTTP status is NULL rather than zero. `consecutiveFailures` counts only the run
+since the last success, so it measures the channel's current state, and
+`failingChannels` names every rule whose last attempt did not succeed. This is the
+metric that matters most: an alert channel that is failing looks exactly like quiet.
+
+`fleet_metrics.render` exposes the fleet in the Prometheus text format — nodes by
+status, unresponsive nodes, ruleset drift, recent events by action, event-stream
+bytes, delivery outcomes, failing channels, and active silences. These are
+control-plane metrics; request-path metrics come from the engine and never depend on
+a database being reachable. A metric that cannot be collected is omitted rather than
+reported as zero, since zero would be a claim about the fleet rather than an absence
+— and label values are escaped, so a hostname can never forge a second series.

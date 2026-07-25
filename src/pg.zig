@@ -575,6 +575,7 @@ test {
     _ = @import("fleet.zig");
     _ = @import("fleet_auth.zig");
     _ = @import("oidc.zig");
+    _ = @import("fleet_metrics.zig");
 }
 
 /// Test-only: a connection whose search_path is a private, uniquely named

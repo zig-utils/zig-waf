@@ -246,6 +246,35 @@ pub const migrations = [_]pg.Migration{
     },
     .{
         .version = 10,
+        .name = "alert_thresholds_and_silences",
+        // An alert on every matching event is noise, and noise is how a real alert
+        // gets missed (#59). A rule fires only once its threshold is met inside its
+        // window, and refires no more often than its dedupe interval; a silence
+        // suppresses it entirely for a stated reason and a stated period, so a
+        // muted alert is a recorded decision rather than a disabled rule nobody
+        // remembers switching off.
+        .sql =
+        \\ALTER TABLE alert_rules ADD COLUMN threshold integer NOT NULL DEFAULT 1
+        \\  CHECK (threshold > 0);
+        \\ALTER TABLE alert_rules ADD COLUMN window_seconds integer NOT NULL DEFAULT 300
+        \\  CHECK (window_seconds > 0);
+        \\ALTER TABLE alert_rules ADD COLUMN dedupe_seconds integer NOT NULL DEFAULT 3600
+        \\  CHECK (dedupe_seconds >= 0);
+        \\ALTER TABLE alert_rules ADD COLUMN last_fired_at timestamptz;
+        \\
+        \\CREATE TABLE alert_silences (
+        \\  id          bigserial PRIMARY KEY,
+        \\  alert_name  text NOT NULL REFERENCES alert_rules (name) ON DELETE CASCADE,
+        \\  reason      text NOT NULL,
+        \\  actor       text NOT NULL,
+        \\  until       timestamptz NOT NULL,
+        \\  created_at  timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\CREATE INDEX alert_silences_active_idx ON alert_silences (alert_name, until);
+        ,
+    },
+    .{
+        .version = 11,
         .name = "search_indexes",
         // Index types matched to how each column is searched (#52).
         //
@@ -1111,6 +1140,94 @@ pub const AlertRepository = struct {
     pub fn secretFor(self: AlertRepository, allocator: std.mem.Allocator, name: [:0]const u8) pg.Error!?[]u8 {
         return self.conn.queryScalarParams(allocator, "SELECT secret FROM alert_rules WHERE name = $1", &.{name});
     }
+
+    /// When a rule fires (#59). `threshold` matching events must occur inside
+    /// `window_seconds` before it fires at all, and having fired it stays quiet for
+    /// `dedupe_seconds`. The defaults (1 event in 5 minutes, an hour of quiet) are
+    /// what an unconfigured rule does.
+    pub fn setThreshold(
+        self: AlertRepository,
+        name: [:0]const u8,
+        threshold: u32,
+        window_seconds: u32,
+        dedupe_seconds: u32,
+    ) pg.Error!void {
+        var buffers: [3][16]u8 = undefined;
+        var values: [3][:0]const u8 = undefined;
+        inline for (.{ threshold, window_seconds, dedupe_seconds }, 0..) |number, index| {
+            const written = std.fmt.bufPrint(&buffers[index], "{d}", .{number}) catch return error.QueryFailed;
+            buffers[index][written.len] = 0;
+            values[index] = buffers[index][0..written.len :0];
+        }
+        try self.conn.execParams(
+            \\UPDATE alert_rules
+            \\SET threshold = $2::int, window_seconds = $3::int, dedupe_seconds = $4::int
+            \\WHERE name = $1
+        , &.{ name, values[0], values[1], values[2] });
+    }
+
+    /// Silence a rule until `seconds` from now, recording who did it and why (#59).
+    /// A silence is preferred to disabling a rule: it states a reason, it expires by
+    /// itself, and it leaves the rule enabled — so nobody has to remember to switch
+    /// an alert back on.
+    pub fn silence(
+        self: AlertRepository,
+        name: [:0]const u8,
+        actor: [:0]const u8,
+        reason: [:0]const u8,
+        seconds: u32,
+    ) pg.Error!void {
+        var buffer: [16]u8 = undefined;
+        const written = std.fmt.bufPrint(&buffer, "{d}", .{seconds}) catch return error.QueryFailed;
+        buffer[written.len] = 0;
+        const inserted = try self.conn.execParamsOptCount(
+            \\INSERT INTO alert_silences (alert_name, actor, reason, until)
+            \\SELECT name, $2, $3, now() + make_interval(secs => $4::int)
+            \\FROM alert_rules WHERE name = $1
+        , &.{ name, actor, reason, buffer[0..written.len :0] });
+        if (inserted == 0) return error.QueryFailed; // no such rule
+    }
+
+    /// Whether a rule is currently silenced.
+    pub fn isSilenced(self: AlertRepository, name: [:0]const u8) pg.Error!bool {
+        var rows = try self.conn.query(
+            "SELECT 1 FROM alert_silences WHERE alert_name = $1 AND until > now() LIMIT 1",
+            &.{name},
+        );
+        defer rows.deinit();
+        return rows.next();
+    }
+
+    /// Decide whether `name` fires now, and record that it did.
+    ///
+    /// Firing is a single statement, so the threshold check, the dedupe check, and
+    /// the stamp that enforces the next dedupe window cannot interleave with another
+    /// worker doing the same — two dispatchers seeing the same burst deliver one
+    /// alert, not two.
+    ///
+    /// A rule fires when it is enabled, not silenced, has seen at least `threshold`
+    /// matching events within its window, and has not fired within its dedupe
+    /// interval.
+    pub fn fireIfDue(self: AlertRepository, name: [:0]const u8) pg.Error!bool {
+        var rows = try self.conn.query(
+            \\UPDATE alert_rules r SET last_fired_at = now()
+            \\WHERE r.name = $1
+            \\  AND r.enabled
+            \\  AND (r.last_fired_at IS NULL
+            \\       OR r.last_fired_at < now() - make_interval(secs => r.dedupe_seconds))
+            \\  AND NOT EXISTS (
+            \\    SELECT 1 FROM alert_silences s WHERE s.alert_name = r.name AND s.until > now()
+            \\  )
+            \\  AND (
+            \\    SELECT count(*) FROM security_events e
+            \\    WHERE e.action = r.event_action
+            \\      AND e.occurred_at > now() - make_interval(secs => r.window_seconds)
+            \\  ) >= r.threshold
+            \\RETURNING r.webhook_url
+        , &.{name});
+        defer rows.deinit();
+        return rows.next();
+    }
 };
 
 /// The audit trail of webhook dispatch attempts (#59): every delivery records
@@ -1142,6 +1259,48 @@ pub const AlertDeliveryRepository = struct {
             "SELECT http_status::text FROM alert_deliveries WHERE alert_name = $1 ORDER BY attempted_at DESC, id DESC LIMIT 1",
             &.{alert_name},
         );
+    }
+
+    /// How many consecutive attempts a rule has failed (#59) — the retry count a
+    /// dispatcher backs off on, and zero once a delivery succeeds. Counting only the
+    /// run since the last success is what makes it a measure of the channel's
+    /// current state rather than of its whole history.
+    pub fn consecutiveFailures(self: AlertDeliveryRepository, allocator: std.mem.Allocator, alert_name: [:0]const u8) pg.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            \\SELECT count(*) FROM alert_deliveries
+            \\WHERE alert_name = $1
+            \\  AND status <> 'delivered'
+            \\  AND id > coalesce((
+            \\    SELECT max(id) FROM alert_deliveries
+            \\    WHERE alert_name = $1 AND status = 'delivered'
+            \\  ), 0)
+        ,
+            &.{alert_name},
+        );
+    }
+
+    /// Every alert whose channel is currently failing: its last attempt did not
+    /// succeed (#59). An alert that cannot be delivered is worse than no alert,
+    /// because it looks like silence — so this is surfaced rather than left to be
+    /// noticed. The cursor yields (0) alert_name, (1) webhook_url, (2) last status,
+    /// (3) consecutive failures; the caller `deinit`s it.
+    pub fn failingChannels(self: AlertDeliveryRepository) pg.Error!pg.Rows {
+        return self.conn.query(
+            \\WITH last_attempt AS (
+            \\  SELECT DISTINCT ON (alert_name) alert_name, webhook_url, status, id
+            \\  FROM alert_deliveries ORDER BY alert_name, attempted_at DESC, id DESC
+            \\)
+            \\SELECT l.alert_name, l.webhook_url, l.status,
+            \\       (SELECT count(*) FROM alert_deliveries d
+            \\        WHERE d.alert_name = l.alert_name AND d.status <> 'delivered'
+            \\          AND d.id > coalesce((SELECT max(id) FROM alert_deliveries s
+            \\                               WHERE s.alert_name = l.alert_name AND s.status = 'delivered'), 0)
+            \\       )::text
+            \\FROM last_attempt l
+            \\WHERE l.status <> 'delivered'
+            \\ORDER BY l.alert_name
+        , &.{});
     }
 };
 
@@ -1512,6 +1671,132 @@ test "the fleet schema applies to a clean database and is idempotent" {
     const count = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM security_events WHERE action = 'deny'")).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
+}
+
+test "an alert fires on its threshold, deduplicates, and can be silenced" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const alerts = AlertRepository{ .conn = conn };
+    const events = EventRepository{ .conn = conn };
+    const node_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+    try alerts.create("sqli", "deny", "https://hooks.example.com/sqli");
+    // Three denials within five minutes, then an hour of quiet.
+    try alerts.setThreshold("sqli", 3, 300, 3600);
+
+    // Below the threshold the rule does not fire: alerting on every event is noise,
+    // and noise is how a real alert gets missed.
+    try events.record(node_id, "deny", "/a", "1");
+    try events.record(node_id, "deny", "/b", "2");
+    try testing.expect(!try alerts.fireIfDue("sqli"));
+
+    // The third event meets it.
+    try events.record(node_id, "deny", "/c", "3");
+    try testing.expect(try alerts.fireIfDue("sqli"));
+
+    // Having fired, it stays quiet for its dedupe interval even as events continue.
+    try events.record(node_id, "deny", "/d", "4");
+    try testing.expect(!try alerts.fireIfDue("sqli"));
+
+    // Once the interval has passed it can fire again.
+    try conn.exec("UPDATE alert_rules SET last_fired_at = now() - interval '2 hours' WHERE name = 'sqli'");
+    try testing.expect(try alerts.fireIfDue("sqli"));
+
+    // Events outside the window do not count toward the threshold, so a slow
+    // trickle over days is not treated as a burst.
+    try conn.exec("DELETE FROM security_events");
+    try conn.exec("UPDATE alert_rules SET last_fired_at = NULL WHERE name = 'sqli'");
+    try events.recordAt(node_id, "2024-01-01T00:00:00Z", "deny", "/old", "1");
+    try events.recordAt(node_id, "2024-01-02T00:00:00Z", "deny", "/old", "2");
+    try events.recordAt(node_id, "2024-01-03T00:00:00Z", "deny", "/old", "3");
+    try testing.expect(!try alerts.fireIfDue("sqli"));
+
+    // A silence suppresses the rule for a stated reason and period, leaving it
+    // enabled — so nobody has to remember to switch an alert back on.
+    for (0..3) |_| try events.record(node_id, "deny", "/e", "burst");
+    try alerts.silence("sqli", "op@example.com", "known scanner sweep", 3600);
+    try testing.expect(try alerts.isSilenced("sqli"));
+    try testing.expect(!try alerts.fireIfDue("sqli"));
+
+    // An expired silence stops suppressing without anything having to clear it.
+    try conn.exec("UPDATE alert_silences SET until = now() - interval '1 second'");
+    try testing.expect(!try alerts.isSilenced("sqli"));
+    try testing.expect(try alerts.fireIfDue("sqli"));
+
+    // A disabled rule never fires, and an unknown rule cannot be silenced.
+    try alerts.setEnabled("sqli", false);
+    try conn.exec("UPDATE alert_rules SET last_fired_at = NULL WHERE name = 'sqli'");
+    try testing.expect(!try alerts.fireIfDue("sqli"));
+    try testing.expectError(error.QueryFailed, alerts.silence("absent", "op@example.com", "why", 60));
+
+    // A threshold of zero is not a rule that fires on nothing — the schema rejects
+    // it rather than storing a rule whose behavior is undefined.
+    try testing.expectError(error.QueryFailed, alerts.setThreshold("sqli", 0, 300, 3600));
+}
+
+test "a failing alert channel is visible and its retries counted" {
+    var db = try TestDb.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    const alerts = AlertRepository{ .conn = conn };
+    const deliveries = AlertDeliveryRepository{ .conn = conn };
+    try alerts.create("healthy", "deny", "https://hooks.example.com/ok");
+    try alerts.create("broken", "deny", "https://down.example.com/hook");
+
+    // A channel that has never been delivered to is not yet failing.
+    {
+        var rows = try deliveries.failingChannels();
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.len());
+    }
+
+    try deliveries.record("healthy", "https://hooks.example.com/ok", "delivered", "200");
+    // Three failed attempts, one with no HTTP response at all — an unreachable host
+    // is not a 5xx and is not recorded as one.
+    try deliveries.record("broken", "https://down.example.com/hook", "failed", "500");
+    try deliveries.record("broken", "https://down.example.com/hook", "failed", null);
+    try deliveries.record("broken", "https://down.example.com/hook", "failed", "502");
+
+    {
+        const failures = (try deliveries.consecutiveFailures(testing.allocator, "broken")).?;
+        defer testing.allocator.free(failures);
+        try testing.expectEqualStrings("3", failures);
+        const healthy = (try deliveries.consecutiveFailures(testing.allocator, "healthy")).?;
+        defer testing.allocator.free(healthy);
+        try testing.expectEqualStrings("0", healthy);
+    }
+
+    // Only the broken channel is reported, with what it last returned — an alert
+    // that cannot be delivered looks exactly like quiet, so it is surfaced.
+    {
+        var rows = try deliveries.failingChannels();
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 1), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("broken", rows.get(0));
+        try testing.expectEqualStrings("failed", rows.get(2));
+        try testing.expectEqualStrings("3", rows.get(3));
+    }
+
+    // A success resets the count: it measures the channel's current state, not its
+    // whole history.
+    try deliveries.record("broken", "https://down.example.com/hook", "delivered", "200");
+    {
+        const failures = (try deliveries.consecutiveFailures(testing.allocator, "broken")).?;
+        defer testing.allocator.free(failures);
+        try testing.expectEqualStrings("0", failures);
+        var rows = try deliveries.failingChannels();
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.len());
+    }
+
+    // And a later failure counts from there rather than from the beginning.
+    try deliveries.record("broken", "https://down.example.com/hook", "failed", "503");
+    const after = (try deliveries.consecutiveFailures(testing.allocator, "broken")).?;
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings("1", after);
 }
 
 test "event pages are stable while the stream grows" {
