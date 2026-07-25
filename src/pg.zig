@@ -61,6 +61,34 @@ pub const Conn = struct {
         const value = c.PQgetvalue(result, 0, 0);
         return try allocator.dupe(u8, std.mem.span(value));
     }
+
+    const max_params = 16;
+
+    /// Run a parameterized statement (`$1`, `$2`, …) with text-format arguments —
+    /// the injection-safe way to pass untrusted values. Expects no result rows.
+    pub fn execParams(self: *Conn, sql: [:0]const u8, params: []const [:0]const u8) Error!void {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = param.ptr;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0);
+        defer c.PQclear(result);
+        switch (c.PQresultStatus(result)) {
+            c.PGRES_COMMAND_OK, c.PGRES_TUPLES_OK => {},
+            else => return error.QueryFailed,
+        }
+    }
+
+    /// Like `queryScalar`, but with text-format bind parameters.
+    pub fn queryScalarParams(self: *Conn, allocator: std.mem.Allocator, sql: [:0]const u8, params: []const [:0]const u8) Error!?[]u8 {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = param.ptr;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0);
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) return error.QueryFailed;
+        if (c.PQntuples(result) == 0 or c.PQnfields(result) == 0) return null;
+        return try allocator.dupe(u8, std.mem.span(c.PQgetvalue(result, 0, 0)));
+    }
 };
 
 /// One schema migration: a stable version, a name, and its idempotent-at-the-
