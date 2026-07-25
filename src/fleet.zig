@@ -450,16 +450,25 @@ fn appendCsvField(out: *std.ArrayList(u8), allocator: std.mem.Allocator, field: 
     try out.append(allocator, '"');
 }
 
-/// A bounded in-memory queue of events awaiting ingestion (#55). Nodes enqueue
-/// events (their fields are copied in, so callers keep no lifetime obligations)
-/// and a worker periodically `drain`s the whole queue to PostgreSQL in one
-/// batched transaction. On a drain failure the events are kept for the next
-/// attempt, so a transient database outage never drops events. (Disk-backed
-/// spilling for crash durability is a follow-up; this is the batching core.)
+/// A bounded queue of events awaiting ingestion (#55). Nodes enqueue events
+/// (their fields are copied in, so callers keep no lifetime obligations) and a
+/// worker periodically `drain`s the whole queue to PostgreSQL in one batched
+/// transaction. On a drain failure the events are kept for the next attempt, so a
+/// transient database outage never drops events, and `persist`/`restore` carry the
+/// queue across a crash or restart.
+///
+/// The queue is bounded, so a long enough outage eventually fills it; `overflow`
+/// decides whether the node then refuses new events or sheds its oldest.
 pub const EventSpool = struct {
     allocator: std.mem.Allocator,
     capacity: usize,
     events: std.ArrayList(Owned) = .empty,
+    /// What a full queue does with a new event; see `Overflow`.
+    overflow: Overflow = .reject,
+    /// How many events a full queue discarded under `.drop_oldest`. Monotonic for
+    /// the life of the spool, so a node can expose it and an operator can see that
+    /// events were shed rather than delivered.
+    dropped: usize = 0,
 
     const Owned = struct {
         node_id: [:0]u8,
@@ -481,8 +490,26 @@ pub const EventSpool = struct {
 
     pub const EnqueueError = error{ SpoolFull, OutOfMemory };
 
+    /// What a full queue does with a new event (#55).
+    pub const Overflow = enum {
+        /// Refuse the event and report SpoolFull, leaving the queue untouched.
+        /// The caller decides — a node may sample, log, or stop inspecting rather
+        /// than have that choice made for it.
+        reject,
+        /// Discard the oldest queued event to make room. For a fleet console the
+        /// newest events are the ones being watched, so a long outage is better
+        /// survived by keeping the recent tail than the stale head. The loss is
+        /// counted in `dropped`, never silent.
+        drop_oldest,
+    };
+
     pub fn init(allocator: std.mem.Allocator, capacity: usize) EventSpool {
         return .{ .allocator = allocator, .capacity = capacity };
+    }
+
+    /// A spool that sheds its oldest events instead of refusing new ones.
+    pub fn initShedding(allocator: std.mem.Allocator, capacity: usize) EventSpool {
+        return .{ .allocator = allocator, .capacity = capacity, .overflow = .drop_oldest };
     }
 
     pub fn deinit(self: *EventSpool) void {
@@ -495,8 +522,9 @@ pub const EventSpool = struct {
         return self.events.items.len;
     }
 
-    /// Copy an event into the queue. Fails with SpoolFull once `capacity` events
-    /// are queued (backpressure) so memory stays bounded when ingestion stalls.
+    /// Copy an event into the queue. Once `capacity` events are queued the
+    /// `overflow` policy decides whether the new event is refused or the oldest is
+    /// shed, so memory stays bounded when ingestion stalls either way.
     pub fn enqueue(self: *EventSpool, event: Event) EnqueueError!void {
         return self.enqueueRaw(event.node_id, event.occurred_at, event.action, event.uri, event.message, event.key);
     }
@@ -505,7 +533,16 @@ pub const EventSpool = struct {
     /// `[]const u8` (not necessarily sentinel-terminated) so a decoded snapshot
     /// can reuse it; each is copied into a sentinel-terminated Owned.
     fn enqueueRaw(self: *EventSpool, node_id: []const u8, occurred_at: []const u8, action: []const u8, uri: []const u8, message: []const u8, key: ?[]const u8) EnqueueError!void {
-        if (self.events.items.len >= self.capacity) return error.SpoolFull;
+        if (self.events.items.len >= self.capacity) switch (self.overflow) {
+            .reject => return error.SpoolFull,
+            .drop_oldest => {
+                // A zero-capacity spool has nothing to shed, so it can only refuse.
+                if (self.capacity == 0) return error.SpoolFull;
+                var oldest = self.events.orderedRemove(0);
+                oldest.deinit(self.allocator);
+                self.dropped += 1;
+            },
+        };
         const owned_node = try dup(self.allocator, node_id);
         errdefer self.allocator.free(owned_node);
         const owned_occurred = try dup(self.allocator, occurred_at);
@@ -1382,6 +1419,44 @@ test "COPY ingestion round-trips awkward fields and deduplicates by key" {
     try testing.expectEqual(@as(usize, 1), try events.recordBatchCopy(testing.allocator, &.{
         .{ .node_id = node_id, .occurred_at = "2024-05-02T00:00:00Z", .action = "deny", .uri = "/f", .message = "after failure", .key = "copy-4" },
     }));
+}
+
+test "a full spool refuses or sheds according to its overflow policy" {
+    const node_id = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+    // The default: a full queue refuses new events and keeps what it has, so the
+    // caller learns ingestion is stalled and decides what to do about it.
+    var rejecting = EventSpool.init(testing.allocator, 2);
+    defer rejecting.deinit();
+    try rejecting.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/1", .message = "first" });
+    try rejecting.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/2", .message = "second" });
+    try testing.expectError(error.SpoolFull, rejecting.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/3", .message = "third" }));
+    try testing.expectEqual(@as(usize, 2), rejecting.len());
+    try testing.expectEqualStrings("first", rejecting.events.items[0].message);
+    try testing.expectEqual(@as(usize, 0), rejecting.dropped);
+
+    // Shedding: the oldest event makes way for the newest, and the queue stays at
+    // capacity. The count of what was shed is visible rather than silent.
+    var shedding = EventSpool.initShedding(testing.allocator, 2);
+    defer shedding.deinit();
+    try shedding.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/1", .message = "first" });
+    try shedding.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/2", .message = "second" });
+    try shedding.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/3", .message = "third" });
+    try testing.expectEqual(@as(usize, 2), shedding.len());
+    try testing.expectEqualStrings("second", shedding.events.items[0].message);
+    try testing.expectEqualStrings("third", shedding.events.items[1].message);
+    try testing.expectEqual(@as(usize, 1), shedding.dropped);
+
+    try shedding.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/4", .message = "fourth" });
+    try testing.expectEqual(@as(usize, 2), shedding.dropped);
+    try testing.expectEqualStrings("fourth", shedding.events.items[1].message);
+
+    // A zero-capacity spool has nothing to shed, so it refuses under either policy
+    // rather than looping or discarding the event it was just handed.
+    var empty_capacity = EventSpool.initShedding(testing.allocator, 0);
+    defer empty_capacity.deinit();
+    try testing.expectError(error.SpoolFull, empty_capacity.enqueue(.{ .node_id = node_id, .occurred_at = "t", .action = "deny", .uri = "/x", .message = "none" }));
+    try testing.expectEqual(@as(usize, 0), empty_capacity.dropped);
 }
 
 test "a snapshot is compressed, and an uncompressed one still restores" {
