@@ -83,6 +83,8 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .root_module = waf });
     const run_tests = b.addRunArtifact(tests);
+    const c_api_tests = b.addTest(.{ .root_module = c_api_module });
+    const run_c_api_tests = b.addRunArtifact(c_api_tests);
     const transformation_evidence_module = b.createModule(.{
         .root_source_file = b.path("tests/transformation_evidence.zig"),
         .target = target,
@@ -109,6 +111,7 @@ pub fn build(b: *std.Build) void {
     const run_operator_evidence_tests = b.addRunArtifact(operator_evidence_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_c_smoke.step);
     test_step.dependOn(&run_transformation_evidence_tests.step);
     test_step.dependOn(&run_transformation_differential_tests.step);

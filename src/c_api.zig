@@ -396,3 +396,116 @@ fn mapError(err: anyerror) Status {
         else => .internal,
     };
 }
+
+// ---- tests --------------------------------------------------------------
+//
+// Robustness of the C ABI boundary: malformed inputs must return a status
+// code, never crash — a crash here is a denial of service in every connector
+// (rpx dataplane, Nginx, Caddy, …) that links this library.
+
+const testing = std.testing;
+
+fn validConfig() Config {
+    return .{
+        .struct_size = @sizeOf(Config),
+        .abi_version = abi_version,
+        .mode = 0,
+        .reserved0 = 0,
+        .max_request_target_bytes = 8192,
+        .max_header_count = 64,
+        .max_header_bytes = 16384,
+        .max_request_body_bytes = 1 << 20,
+        .max_response_body_bytes = 1 << 20,
+        .reserved = @splat(0),
+    };
+}
+
+test "abi_version and feature query validate their struct contract" {
+    try testing.expectEqual(abi_version, zig_waf_abi_version());
+
+    // Null output and a too-small struct are rejected; a wrong ABI is flagged.
+    try testing.expectEqual(Status.invalid_argument, zig_waf_query_features(null));
+    var features: Features = undefined;
+    features.struct_size = 0;
+    features.abi_version = abi_version;
+    try testing.expectEqual(Status.invalid_argument, zig_waf_query_features(&features));
+    features.struct_size = @sizeOf(Features);
+    features.abi_version = abi_version + 1;
+    try testing.expectEqual(Status.unsupported_abi, zig_waf_query_features(&features));
+    features.abi_version = abi_version;
+    try testing.expectEqual(Status.ok, zig_waf_query_features(&features));
+}
+
+test "create rejects malformed config and a null output" {
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.invalid_argument, zig_waf_create(null, null));
+
+    var config = validConfig();
+    config.struct_size = 0;
+    try testing.expectEqual(Status.invalid_argument, zig_waf_create(&config, &handle));
+    config = validConfig();
+    config.abi_version = abi_version + 1;
+    try testing.expectEqual(Status.unsupported_abi, zig_waf_create(&config, &handle));
+    config = validConfig();
+    config.mode = 99; // neither enabled (0) nor detection-only (1)
+    try testing.expectEqual(Status.invalid_config, zig_waf_create(&config, &handle));
+
+    // A well-formed config builds; the handle must then destroy cleanly.
+    config = validConfig();
+    try testing.expectEqual(Status.ok, zig_waf_create(&config, &handle));
+    try testing.expectEqual(Status.ok, zig_waf_destroy(handle));
+}
+
+test "create_with_rules validates arguments and survives arbitrary rule bytes" {
+    var handle: *WafHandle = undefined;
+    const rules = "SecRule ARGS \"@rx x\" \"id:1,phase:1,pass,nolog\"";
+    // Null output / a null rules pointer with a non-zero length are argument
+    // errors, not crashes. (A null pointer with length 0 is a valid empty set.)
+    try testing.expectEqual(Status.invalid_argument, zig_waf_create_with_rules(null, rules.ptr, rules.len, null));
+    try testing.expectEqual(Status.invalid_argument, zig_waf_create_with_rules(null, null, 16, &handle));
+    // A valid rule set compiles and builds.
+    try testing.expectEqual(Status.ok, zig_waf_create_with_rules(null, rules.ptr, rules.len, &handle));
+    try testing.expectEqual(Status.ok, zig_waf_destroy(handle));
+    // A syntactically broken config is reported, not crashed.
+    const broken = "SecRule ARGS";
+    try testing.expectEqual(Status.invalid_config, zig_waf_create_with_rules(null, broken.ptr, broken.len, &handle));
+
+    // Fuzz: arbitrary bytes must always yield a status without crashing; on the
+    // rare success, the handle is destroyed.
+    var prng = std.Random.DefaultPrng.init(0xAB1_C0DE_F00D);
+    const random = prng.random();
+    var buffer: [96]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 1500) : (iteration += 1) {
+        const len = random.uintLessThan(usize, buffer.len + 1);
+        for (buffer[0..len]) |*byte| {
+            byte.* = switch (random.uintLessThan(u8, 8)) {
+                0 => 'S',
+                1 => ' ',
+                2 => '"',
+                3 => ',',
+                4 => ':',
+                5 => '\n',
+                else => random.int(u8),
+            };
+        }
+        var out: *WafHandle = undefined;
+        const status = zig_waf_create_with_rules(null, buffer[0..len].ptr, len, &out);
+        if (status == .ok) _ = zig_waf_destroy(out);
+    }
+}
+
+test "serialize_audit_log rejects an unknown format" {
+    var handle: *WafHandle = undefined;
+    const rules = "SecAction \"id:1,pass,nolog\"";
+    try testing.expectEqual(Status.ok, zig_waf_create_with_rules(null, rules.ptr, rules.len, &handle));
+    defer _ = zig_waf_destroy(handle);
+    var tx: *TransactionHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_transaction_create(handle, &tx));
+    defer zig_waf_transaction_destroy(tx);
+
+    var buffer: ?[*]u8 = undefined;
+    var len: usize = undefined;
+    // 7 is not a valid format id (0..3 and the configured sentinel are).
+    try testing.expectEqual(Status.invalid_argument, zig_waf_transaction_serialize_audit_log(tx, 7, &buffer, &len));
+}
