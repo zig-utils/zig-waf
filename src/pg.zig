@@ -556,8 +556,9 @@ pub fn migrate(conn: *Conn, allocator: std.mem.Allocator, migrations: []const Mi
 const testing = std.testing;
 
 test {
-    // Run the fleet schema's migration tests under `pg-test` too.
+    // Run the fleet schema's and identity layer's tests under `pg-test` too.
     _ = @import("fleet.zig");
+    _ = @import("fleet_auth.zig");
 }
 
 /// Test-only: a connection whose search_path is a private, uniquely named
