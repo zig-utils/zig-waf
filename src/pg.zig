@@ -397,6 +397,69 @@ pub const Pool = struct {
     }
 };
 
+/// Which control-plane workload a connection is for (#53). They fail differently
+/// and must not share a budget: API requests are many and short, ingestion is a
+/// steady trickle of batches, and rollout is occasional but must not be blocked by
+/// either — a bad afternoon of console traffic should not stop the fleet from
+/// receiving a policy.
+pub const Workload = enum { api, rollout, ingestion };
+
+/// Separate bounded pools, one per workload, so exhausting one cannot starve
+/// another (#53). A single shared pool makes every workload as available as the
+/// greediest one; these limits are a partition of the database's connection budget,
+/// so each workload's worst case is its own.
+pub const WorkloadPools = struct {
+    api: Pool,
+    rollout: Pool,
+    ingestion: Pool,
+
+    /// Connections each workload may hold. The defaults reflect their shapes: many
+    /// short API requests, a couple of ingestion drains, and one rollout at a time.
+    pub const Limits = struct {
+        api: usize = 8,
+        rollout: usize = 1,
+        ingestion: usize = 2,
+    };
+
+    pub fn init(allocator: std.mem.Allocator, dsn: [:0]const u8, limits: Limits) WorkloadPools {
+        return .{
+            .api = Pool.init(allocator, dsn, limits.api),
+            .rollout = Pool.init(allocator, dsn, limits.rollout),
+            .ingestion = Pool.init(allocator, dsn, limits.ingestion),
+        };
+    }
+
+    pub fn deinit(self: *WorkloadPools) void {
+        self.api.deinit();
+        self.rollout.deinit();
+        self.ingestion.deinit();
+        self.* = undefined;
+    }
+
+    pub fn pool(self: *WorkloadPools, workload: Workload) *Pool {
+        return switch (workload) {
+            .api => &self.api,
+            .rollout => &self.rollout,
+            .ingestion => &self.ingestion,
+        };
+    }
+
+    /// Borrow a connection for `workload`; return it with `release`.
+    pub fn acquire(self: *WorkloadPools, workload: Workload) Pool.AcquireError!Conn {
+        return self.pool(workload).acquire();
+    }
+
+    pub fn release(self: *WorkloadPools, workload: Workload, conn: Conn) void {
+        self.pool(workload).release(conn);
+    }
+
+    /// The total connections every workload could hold at once — what the database's
+    /// `max_connections` has to accommodate for this process.
+    pub fn totalLimit(self: *const WorkloadPools) usize {
+        return self.api.max + self.rollout.max + self.ingestion.max;
+    }
+};
+
 /// One schema migration: a stable version, a name, and its idempotent-at-the-
 /// -version SQL (which may contain several statements).
 pub const Migration = struct {
@@ -545,6 +608,41 @@ fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const owned = try allocator.allocSentinel(u8, value.len, 0);
     @memcpy(owned, value);
     return owned;
+}
+
+test "workload pools are budgeted separately" {
+    const dsn = (try testDsn(testing.allocator)) orelse return error.SkipZigTest;
+    defer testing.allocator.free(dsn);
+    var pools = WorkloadPools.init(testing.allocator, dsn, .{ .api = 2, .rollout = 1, .ingestion = 1 });
+    defer pools.deinit();
+    try testing.expectEqual(@as(usize, 4), pools.totalLimit());
+
+    // Exhaust ingestion entirely.
+    const ingesting = try pools.acquire(.ingestion);
+    try testing.expectError(error.PoolExhausted, pools.acquire(.ingestion));
+
+    // Rollout and API are unaffected: a stalled ingestion drain cannot stop the
+    // fleet from receiving a policy or the console from answering.
+    const rolling = try pools.acquire(.rollout);
+    var serving = try pools.acquire(.api);
+    const one = (try serving.queryScalar(testing.allocator, "SELECT 1")).?;
+    defer testing.allocator.free(one);
+    try testing.expectEqualStrings("1", one);
+
+    // Each workload's limit is its own, so API's second connection is still there
+    // while rollout has none left.
+    const serving_two = try pools.acquire(.api);
+    try testing.expectError(error.PoolExhausted, pools.acquire(.api));
+    try testing.expectError(error.PoolExhausted, pools.acquire(.rollout));
+
+    pools.release(.ingestion, ingesting);
+    pools.release(.rollout, rolling);
+    pools.release(.api, serving);
+    pools.release(.api, serving_two);
+
+    // Released connections are reused rather than reopened, per workload.
+    const reused = try pools.acquire(.ingestion);
+    pools.release(.ingestion, reused);
 }
 
 test "prepared statements run repeatedly and bind NULL" {

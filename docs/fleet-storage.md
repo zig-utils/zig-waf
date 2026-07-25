@@ -31,10 +31,28 @@ node ids, labels, and event fields are never interpolated into a statement.
   reset belongs in the connection string — `options=-csearch_path=…` rather than
   `SET search_path`.
 
+`prepare`/`execPrepared`/`queryPrepared` parse a statement once per connection; a
+prepared name outlives a pool checkout, so the handful of hot statement shapes are
+planned once rather than on every call. `setStatementTimeout` bounds how long any
+statement may run, and `sendQuery`/`cancel`/`discardResults` abandon one already in
+flight — cancellation being a request, not a guarantee, since a statement that has
+already finished completes.
+
+Values are bound in text format throughout, and bytea columns go through
+`decode(…, 'hex')`. Binary format would move type encoding onto the client — for
+`timestamptz` that means reimplementing PostgreSQL's own encoding, where any drift
+silently mis-dates events — and buys nothing measurable at these value sizes.
+
 `pg.Pool` is bounded and non-blocking: `acquire` returns an idle connection,
 opens one while under `max`, or fails with `PoolExhausted` so a caller drops or
 retries rather than stalling a worker. Connections are opened outside the lock,
 so a slow connect never blocks other tasks.
+
+`pg.WorkloadPools` gives the API, rollout, and ingestion workloads separate bounded
+pools. They fail differently and must not share a budget: a shared pool makes every
+workload as available as the greediest one, and a bad afternoon of console traffic
+should not stop the fleet from receiving a policy. `totalLimit` is what the
+database's `max_connections` must accommodate for the process.
 
 ## Schema and migrations
 
