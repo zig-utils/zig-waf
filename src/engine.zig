@@ -2159,6 +2159,30 @@ pub const Transaction = struct {
         self.lifecycle = .logging;
     }
 
+    /// The audit-log format selected by `SecAuditLogFormat`, or the ModSecurity
+    /// default (the native serial format) when the directive is absent. Lets a
+    /// connector honor the configured format instead of hard-coding one.
+    pub fn configuredAuditFormat(self: *const Transaction) audit.Format {
+        const configuration = if (self.waf.directive_configuration) |*value| value else return .serial;
+        const directive = configuration.latest(.sec_audit_log_format) orelse return .serial;
+        var values = directive.values();
+        const decoded = values.next() orelse return .serial;
+        return switch (decoded.value) {
+            .audit_log_format => |format| switch (format) {
+                .native => .serial,
+                .json => .json,
+                .legacy_json => .legacy_json,
+                .ocsf => .ocsf,
+            },
+            else => .serial,
+        };
+    }
+
+    /// Serialize the audit record in the `SecAuditLogFormat`-configured format.
+    pub fn serializeConfiguredAuditLog(self: *Transaction, allocator: std.mem.Allocator) TransactionError![]u8 {
+        return self.serializeAuditLog(allocator, self.configuredAuditFormat());
+    }
+
     /// Serialize this transaction's audit record in `format`, honoring the
     /// active SecAuditLogParts selection. The returned bytes are owned by the
     /// caller (freed with `allocator`); all intermediate snapshot state lives in
@@ -4572,6 +4596,30 @@ test "serializeAuditLog snapshots the transaction into the serial and JSON forma
     try std.testing.expectEqual(@as(i64, 403), tx_obj.get("response").?.object.get("status").?.integer);
     const messages = doc.value.object.get("messages").?.array;
     try std.testing.expect(std.mem.indexOf(u8, messages.items[0].object.get("message").?.string, "942100") != null);
+}
+
+test "SecAuditLogFormat selects the configured audit format" {
+    const cases = [_]struct { directive: []const u8, expected: audit.Format }{
+        .{ .directive = "SecAuditLogFormat Native", .expected = .serial },
+        .{ .directive = "SecAuditLogFormat JSON", .expected = .json },
+        .{ .directive = "SecAuditLogFormat LegacyJSON", .expected = .legacy_json },
+        .{ .directive = "SecAuditLogFormat OCSF", .expected = .ocsf },
+        .{ .directive = "SecAction \"id:1,pass,nolog\"", .expected = .serial }, // no directive → native default
+    };
+    for (cases) |case| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "fmt.conf", case.directive, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer plan.deinit();
+        var builder = Builder.init(std.testing.allocator);
+        builder.setRetainedPlan(plan);
+        const waf = try builder.build();
+        defer waf.deinit() catch unreachable;
+        var tx = waf.newTransaction();
+        defer tx.deinit();
+        try std.testing.expectEqual(case.expected, tx.configuredAuditFormat());
+    }
 }
 
 test "sanitiseRequestHeader and sanitiseResponseHeader mask values in the audit log" {

@@ -309,8 +309,12 @@ export fn zig_waf_transaction_intervention(
 }
 
 /// Serialize the transaction's audit record into a freshly allocated buffer.
-/// `format`: 0 serial, 1 JSON, 2 legacy JSON, 3 OCSF. On success the caller owns
-/// `*out_buffer` and must release it with `zig_waf_free(*out_buffer, *out_len)`.
+/// `format`: 0 serial, 1 JSON, 2 legacy JSON, 3 OCSF, or 0xFFFFFFFF to use the
+/// format selected by `SecAuditLogFormat` (defaulting to native/serial). On
+/// success the caller owns `*out_buffer` and must release it with
+/// `zig_waf_free(*out_buffer, *out_len)`.
+const audit_format_configured: u32 = 0xFFFF_FFFF;
+
 export fn zig_waf_transaction_serialize_audit_log(
     handle: ?*TransactionHandle,
     format: u32,
@@ -327,6 +331,7 @@ export fn zig_waf_transaction_serialize_audit_log(
         1 => .json,
         2 => .legacy_json,
         3 => .ocsf,
+        audit_format_configured => transaction.configuredAuditFormat(),
         else => return .invalid_argument,
     };
     const rendered = transaction.serializeAuditLog(std.heap.page_allocator, fmt) catch |err| return mapError(err);

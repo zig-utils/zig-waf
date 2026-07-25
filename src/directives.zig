@@ -278,7 +278,7 @@ pub const ConnectionEngine = enum { on, off };
 pub const LimitAction = enum { reject, process_partial };
 pub const AuditEngine = enum { on, off, relevant_only };
 pub const AuditLogType = enum { serial, concurrent, https };
-pub const AuditLogFormat = enum { native, json };
+pub const AuditLogFormat = enum { native, json, legacy_json, ocsf };
 pub const UploadKeepFiles = enum { on, off, relevant_only };
 pub const RemoteFailAction = enum { abort, warn };
 pub const Fingerprint = [32]u8;
@@ -783,7 +783,7 @@ fn validValues(compiled: *const plan_mod.Plan, entry: *const Entry, arguments: [
         .cookie_format => enumValue(value, &.{ "0", "1" }),
         .audit_engine => enumValue(value, &.{ "On", "Off", "RelevantOnly" }),
         .audit_log_type => enumValue(value, &.{ "Serial", "Concurrent", "HTTPS" }),
-        .audit_log_format => enumValue(value, &.{ "Native", "JSON" }),
+        .audit_log_format => enumValue(value, &.{ "Native", "JSON", "LegacyJSON", "OCSF" }),
         .audit_parts => validAuditParts(value),
         .octal_mode => parseOctalMode(value) != null,
         .upload_keep_files => enumValue(value, &.{ "On", "Off", "RelevantOnly" }),
@@ -979,7 +979,14 @@ fn decodeValue(schema: Schema, index: usize, value: []const u8) Value {
             .concurrent
         else
             .https },
-        .audit_log_format => .{ .audit_log_format = if (std.ascii.eqlIgnoreCase(value, "Native")) .native else .json },
+        .audit_log_format => .{ .audit_log_format = if (std.ascii.eqlIgnoreCase(value, "Native"))
+            .native
+        else if (std.ascii.eqlIgnoreCase(value, "LegacyJSON"))
+            .legacy_json
+        else if (std.ascii.eqlIgnoreCase(value, "OCSF"))
+            .ocsf
+        else
+            .json },
         .audit_parts => .{ .audit_parts = value },
         .octal_mode => .{ .octal_mode = parseOctalMode(value).? },
         .upload_keep_files => .{ .upload_keep_files = if (std.ascii.eqlIgnoreCase(value, "On"))
