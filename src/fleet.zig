@@ -51,6 +51,21 @@ pub const migrations = [_]pg.Migration{
         \\CREATE INDEX security_events_node_idx ON security_events (node_id, occurred_at);
         ,
     },
+    .{
+        .version = 2,
+        .name = "alert_rules",
+        .sql =
+        \\CREATE TABLE alert_rules (
+        \\  id            bigserial PRIMARY KEY,
+        \\  name          text NOT NULL UNIQUE,
+        \\  event_action  text NOT NULL,
+        \\  webhook_url   text NOT NULL,
+        \\  enabled       boolean NOT NULL DEFAULT true,
+        \\  created_at    timestamptz NOT NULL DEFAULT now()
+        \\);
+        \\CREATE INDEX alert_rules_action_idx ON alert_rules (event_action) WHERE enabled;
+        ,
+    },
 };
 
 /// Bring `conn`'s database up to the latest fleet schema. Returns the number of
@@ -282,6 +297,35 @@ pub const EventSpool = struct {
     }
 };
 
+/// Alert rules and webhook targets (#59): when an event with a matching action
+/// is ingested, the enabled rules' webhooks are the delivery targets.
+pub const AlertRepository = struct {
+    conn: *pg.Conn,
+
+    pub fn create(self: AlertRepository, name: [:0]const u8, event_action: [:0]const u8, webhook_url: [:0]const u8) pg.Error!void {
+        try self.conn.execParams(
+            "INSERT INTO alert_rules (name, event_action, webhook_url) VALUES ($1, $2, $3)",
+            &.{ name, event_action, webhook_url },
+        );
+    }
+
+    pub fn setEnabled(self: AlertRepository, name: [:0]const u8, enabled: bool) pg.Error!void {
+        try self.conn.execParams(
+            "UPDATE alert_rules SET enabled = $2 WHERE name = $1",
+            &.{ name, if (enabled) "true" else "false" },
+        );
+    }
+
+    /// The webhook URLs of enabled rules that fire on `action`, for dispatch —
+    /// a row cursor over column (0) webhook_url; the caller `deinit`s it.
+    pub fn webhooksFor(self: AlertRepository, action: [:0]const u8) pg.Error!pg.Rows {
+        return self.conn.query(
+            "SELECT webhook_url FROM alert_rules WHERE enabled AND event_action = $1 ORDER BY name",
+            &.{action},
+        );
+    }
+};
+
 /// Store and retrieve versioned rule-set bundles that are rolled out to nodes
 /// (#54). Each (name, version) is immutable once published; nodes fetch the
 /// latest, and a rollback re-selects an earlier version.
@@ -334,14 +378,14 @@ test "the fleet schema applies to a clean database and is idempotent" {
 
     // Start from a clean slate so the migration exercises real DDL. The
     // schema_migrations table may not exist yet, so tolerate that delete.
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
 
-    try testing.expectEqual(@as(usize, 1), try apply(&conn, testing.allocator));
+    try testing.expectEqual(migrations.len, try apply(&conn, testing.allocator));
     try testing.expectEqual(@as(usize, 0), try apply(&conn, testing.allocator)); // idempotent
 
-    // The three core tables exist and are usable.
-    for ([_][:0]const u8{ "nodes", "rulesets", "security_events" }) |table_name| {
+    // The core tables exist and are usable.
+    for ([_][:0]const u8{ "nodes", "rulesets", "security_events", "alert_rules" }) |table_name| {
         var buffer: [128]u8 = undefined;
         const query = std.fmt.bufPrint(&buffer, "SELECT to_regclass('{s}') IS NOT NULL", .{table_name}) catch unreachable;
         buffer[query.len] = 0;
@@ -363,8 +407,8 @@ test "the fleet schema applies to a clean database and is idempotent" {
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("1", count);
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
 
 test "event retention prunes only events past the window" {
@@ -377,8 +421,8 @@ test "event retention prunes only events past the window" {
 
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const events = EventRepository{ .conn = &conn };
@@ -394,8 +438,8 @@ test "event retention prunes only events past the window" {
     defer testing.allocator.free(remaining);
     try testing.expectEqualStrings("1", remaining);
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
 
 test "event spool buffers, drains in a batch, and retains on failure" {
@@ -408,8 +452,8 @@ test "event spool buffers, drains in a batch, and retains on failure" {
 
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
     _ = try apply(&conn, testing.allocator);
     const events = EventRepository{ .conn = &conn };
     const node_id = "55555555-5555-5555-5555-555555555555";
@@ -441,8 +485,8 @@ test "event spool buffers, drains in a batch, and retains on failure" {
     try testing.expectError(error.QueryFailed, retry_spool.drain(events));
     try testing.expectEqual(@as(usize, 2), retry_spool.len()); // retained for retry
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
 
 test "batched event ingestion commits the whole batch atomically" {
@@ -455,8 +499,8 @@ test "batched event ingestion commits the whole batch atomically" {
 
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const events = EventRepository{ .conn = &conn };
@@ -481,8 +525,8 @@ test "batched event ingestion commits the whole batch atomically" {
     defer testing.allocator.free(after);
     try testing.expectEqualStrings("3", after); // unchanged — the good row rolled back too
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
 
 test "ruleset repository publishes immutable versions and rolls back" {
@@ -495,8 +539,8 @@ test "ruleset repository publishes immutable versions and rolls back" {
 
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const rulesets = RulesetRepository{ .conn = &conn };
@@ -517,8 +561,64 @@ test "ruleset repository publishes immutable versions and rolls back" {
     try testing.expectError(error.QueryFailed, rulesets.publish("crs", "2", "tampered"));
     try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
+}
+
+test "alert rules resolve enabled webhooks for an action" {
+    const raw = std.c.getenv("PG_TEST_DSN") orelse return error.SkipZigTest;
+    const dsn_slice = std.mem.span(raw);
+    if (dsn_slice.len == 0) return error.SkipZigTest;
+    const dsn = try testing.allocator.allocSentinel(u8, dsn_slice.len, 0);
+    defer testing.allocator.free(dsn);
+    @memcpy(dsn, dsn_slice);
+
+    var conn = try pg.Conn.open(dsn);
+    defer conn.close();
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
+    _ = try apply(&conn, testing.allocator);
+
+    const alerts = AlertRepository{ .conn = &conn };
+    try alerts.create("pager", "deny", "https://hooks.example/pager");
+    try alerts.create("slack", "deny", "https://hooks.example/slack");
+    try alerts.create("audit", "pass", "https://hooks.example/audit");
+
+    // Names are unique — re-creating "pager" conflicts.
+    try testing.expectError(error.QueryFailed, alerts.create("pager", "deny", "https://x"));
+
+    // Two enabled webhooks fire on "deny", ordered by name (pager, slack).
+    {
+        var rows = try alerts.webhooksFor("deny");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 2), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("https://hooks.example/pager", rows.get(0));
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("https://hooks.example/slack", rows.get(0));
+        try testing.expect(!rows.next());
+    }
+
+    // Disabling a rule removes it from the delivery set.
+    try alerts.setEnabled("pager", false);
+    {
+        var rows = try alerts.webhooksFor("deny");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 1), rows.len());
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("https://hooks.example/slack", rows.get(0));
+    }
+
+    // An action with no matching enabled rule yields an empty cursor.
+    {
+        var rows = try alerts.webhooksFor("allow");
+        defer rows.deinit();
+        try testing.expectEqual(@as(usize, 0), rows.len());
+        try testing.expect(!rows.next());
+    }
+
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
 
 test "node and event repositories enroll, heartbeat, and ingest safely" {
@@ -531,8 +631,8 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
 
     var conn = try pg.Conn.open(dsn);
     defer conn.close();
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    conn.exec("DELETE FROM schema_migrations WHERE version = 1") catch {};
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)") catch {};
     _ = try apply(&conn, testing.allocator);
 
     const nodes = NodeRepository{ .conn = &conn };
@@ -581,6 +681,6 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     defer testing.allocator.free(still_active);
     try testing.expectEqualStrings("active", still_active);
 
-    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes CASCADE");
-    try conn.exec("DELETE FROM schema_migrations WHERE version = 1");
+    try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules CASCADE");
+    try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2)");
 }
