@@ -559,6 +559,7 @@ test {
     // Run the fleet schema's and identity layer's tests under `pg-test` too.
     _ = @import("fleet.zig");
     _ = @import("fleet_auth.zig");
+    _ = @import("oidc.zig");
 }
 
 /// Test-only: a connection whose search_path is a private, uniquely named
