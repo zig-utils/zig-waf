@@ -11,6 +11,7 @@ const rule_config = @import("rule_config.zig");
 const request = @import("request.zig");
 const request_buffer = @import("request_buffer.zig");
 const multipart = @import("multipart.zig");
+const operators = @import("operators.zig");
 const runtime_operator = @import("runtime_operator.zig");
 const audit = @import("audit.zig");
 const xml = @import("xml");
@@ -2578,16 +2579,19 @@ pub const Transaction = struct {
                     // multiMatch: evaluate the operator after every transformation
                     // stage (including the original), matching the first hit.
                     const result = self.transformation_executor.applyPipeline(transforms, resolved.value, true) catch {
-                        if (operator.evaluate(resolved.value, .modsecurity) != negated)
-                            return try matchContext(arena, resolved.name, resolved.value);
+                        const hit = operator.match(resolved.value, .modsecurity);
+                        if (hit.matched != negated)
+                            return try matchContext(arena, resolved.name, resolved.value, hit.regex);
                         continue;
                     };
                     for (result.checkpoints) |checkpoint| {
-                        if (operator.evaluate(checkpoint.bytes, .modsecurity) != negated)
-                            return try matchContext(arena, resolved.name, checkpoint.bytes);
+                        const hit = operator.match(checkpoint.bytes, .modsecurity);
+                        if (hit.matched != negated)
+                            return try matchContext(arena, resolved.name, checkpoint.bytes, hit.regex);
                     }
-                    if (operator.evaluate(result.bytes, .modsecurity) != negated)
-                        return try matchContext(arena, resolved.name, result.bytes);
+                    const hit = operator.match(result.bytes, .modsecurity);
+                    if (hit.matched != negated)
+                        return try matchContext(arena, resolved.name, result.bytes, hit.regex);
                 } else {
                     const transformed = if (transforms.len == 0)
                         resolved.value
@@ -2596,8 +2600,9 @@ pub const Transaction = struct {
                             break :transformed resolved.value;
                         break :transformed result.bytes;
                     };
-                    if (operator.evaluate(transformed, .modsecurity) != negated)
-                        return try matchContext(arena, resolved.name, transformed);
+                    const hit = operator.match(transformed, .modsecurity);
+                    if (hit.matched != negated)
+                        return try matchContext(arena, resolved.name, transformed, hit.regex);
                 }
             }
         }
@@ -3661,10 +3666,30 @@ fn validAddress(address: []const u8) bool {
 }
 
 /// Build a MatchContext, copying the matched value into `arena` so it survives
-/// the transformation executor's buffer being reused.
-fn matchContext(arena: std.mem.Allocator, name: []const u8, value: []const u8) std.mem.Allocator.Error!MatchContext {
+/// the transformation executor's buffer being reused, and translating any regex
+/// capture strings into byte ranges over that value (so a `capture` rule can
+/// stage TX.0..TX.N). Capture strings borrow `value`; ranges are computed
+/// against it and remain valid over the identical `arena` copy.
+fn matchContext(arena: std.mem.Allocator, name: []const u8, value: []const u8, regex: ?operators.RegexOutcome) std.mem.Allocator.Error!MatchContext {
     const owned = try arena.dupe(u8, value);
-    return .{ .name = name, .value = owned, .source = .{ .origin = .rule, .offset = 0, .length = owned.len } };
+    var captures: []const ?CaptureRange = &.{};
+    if (regex) |outcome| if (outcome.capture_count != 0) {
+        const ranges = try arena.alloc(?CaptureRange, outcome.capture_count);
+        const base = @intFromPtr(value.ptr);
+        for (0..outcome.capture_count) |index| {
+            ranges[index] = null;
+            if (!outcome.captures_present[index]) continue;
+            const capture = outcome.captures[index];
+            const capture_addr = @intFromPtr(capture.ptr);
+            // Only a capture that borrows `value` maps to a byte range in it.
+            if (capture_addr >= base and capture_addr + capture.len <= base + value.len) {
+                const start = capture_addr - base;
+                ranges[index] = .{ .start = start, .end = start + capture.len };
+            }
+        }
+        captures = ranges;
+    };
+    return .{ .name = name, .value = owned, .source = .{ .origin = .rule, .offset = 0, .length = owned.len }, .captures = captures };
 }
 
 /// Append a formatted fragment to an audit-message buffer using `arena`.
@@ -4730,6 +4755,37 @@ test "evaluatePhase autonomously runs a rule set and blocks a malicious request"
         try tx.evaluatePhase(std.testing.allocator, .request_headers);
         try std.testing.expect((try tx.intervention()) == null);
     }
+}
+
+test "a captured regex group is available as TX.N after the rule applies" {
+    const input =
+        \\SecRule ARGS "@rx attack-(\d+)" "id:1,phase:1,capture,setvar:'tx.hit=%{TX.1}',pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "capture.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/x?p=attack-4242", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+
+    var cursor = try PhaseCursor.init(&tx, .request_headers);
+    _ = (try cursor.next()).?;
+    // Evaluate + apply the rule; the capture group (4242) should reach TX.1,
+    // and setvar copies it to TX.hit.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const match = (try tx.evaluateRule(arena.allocator(), @fromBackingInt(0))).?;
+    _ = try tx.applyMatchedRule(@fromBackingInt(0), match);
+    try std.testing.expectEqualStrings("4242", (try tx.collectionFirst(.tx, "1")).?.value);
+    try std.testing.expectEqualStrings("4242", (try tx.collectionFirst(.tx, "hit")).?.value);
 }
 
 test "evaluateRule with multiMatch matches at an intermediate transformation stage" {

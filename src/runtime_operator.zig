@@ -50,18 +50,31 @@ pub const RuntimeOperator = union(enum) {
     /// program; the execution loop may instead hold a per-transaction worker for
     /// hot paths. An unrecognized compile-free operator evaluates to false.
     pub fn evaluate(self: *const RuntimeOperator, input: []const u8, profile: operators.Profile) bool {
+        return self.match(input, profile).matched;
+    }
+
+    /// One operator match: whether it matched, plus the regex capture outcome
+    /// (`@rx` only) so the caller can populate TX.0..TX.N when the rule captures.
+    /// Capture strings borrow `input` and are valid only while it is.
+    pub const Match = struct {
+        matched: bool,
+        regex: ?operators.RegexOutcome = null,
+    };
+
+    pub fn match(self: *const RuntimeOperator, input: []const u8, profile: operators.Profile) Match {
         switch (self.*) {
-            .compile_free => |cf| return switch (rule_eval.evaluate(cf.name, cf.parameter, input, profile)) {
+            .compile_free => |cf| return .{ .matched = switch (rule_eval.evaluate(cf.name, cf.parameter, input, profile)) {
                 .decided => |value| value,
                 else => false,
-            },
+            } },
             .regex => |*re| {
                 var worker = re.worker();
                 defer worker.deinit();
-                return worker.evaluate(input).matched;
+                const outcome = worker.evaluate(input);
+                return .{ .matched = outcome.matched, .regex = outcome };
             },
-            .phrase => |*p| return p.matches(input),
-            .ip => |*ip| return ip.matches(input),
+            .phrase => |*p| return .{ .matched = p.matches(input) },
+            .ip => |*ip| return .{ .matched = ip.matches(input) },
         }
     }
 };
