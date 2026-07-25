@@ -690,6 +690,36 @@ pub const RulesetRepository = struct {
             &.{ name, version },
         );
     }
+
+    /// Publish a signed bundle version (#54): the HMAC-SHA256 of the content
+    /// under `secret` is stored in the `signature` column, so a node can verify
+    /// the bundle was authored by the control plane and not tampered with in
+    /// transit before applying it. Like `publish`, versions are immutable.
+    pub fn publishSigned(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, content: [:0]const u8, secret: []const u8) pg.Error!void {
+        var signature: [65]u8 = undefined;
+        signPayload(secret, content, signature[0..64]);
+        signature[64] = 0;
+        // decode($4, 'hex') stores the hex digest into the bytea signature column.
+        try self.conn.execParams(
+            "INSERT INTO rulesets (name, version, content, signature) VALUES ($1, $2, $3, decode($4, 'hex'))",
+            &.{ name, version, content, signature[0..64 :0] },
+        );
+    }
+
+    /// Verify a bundle's stored signature against `secret`: true only when the
+    /// version exists, is signed, and the recomputed HMAC matches. An unsigned
+    /// or absent version, or a wrong secret/tampered content, is false.
+    pub fn verify(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, secret: []const u8) pg.Error!bool {
+        var rows = try self.conn.query(
+            "SELECT content, encode(signature, 'hex') FROM rulesets WHERE name = $1 AND version = $2",
+            &.{ name, version },
+        );
+        defer rows.deinit();
+        if (!rows.next()) return false; // no such version
+        var expected: [64]u8 = undefined;
+        signPayload(secret, rows.get(0), &expected);
+        return std.mem.eql(u8, &expected, rows.get(1)); // stored NULL → "" → mismatch
+    }
 };
 
 /// Which ruleset version each node is assigned to run (#54). The control plane
@@ -1062,6 +1092,14 @@ test "ruleset repository publishes immutable versions and rolls back" {
     // Versions are immutable: re-publishing (name, version) conflicts.
     try testing.expectError(error.QueryFailed, rulesets.publish("crs", "2", "tampered"));
     try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
+
+    // A signed bundle verifies with its secret and only with the exact content.
+    try rulesets.publishSigned("signed", "1", "SecRuleEngine On # signed", "bundle-key");
+    try testing.expect(try rulesets.verify("signed", "1", "bundle-key"));
+    try testing.expect(!try rulesets.verify("signed", "1", "wrong-key")); // wrong secret
+    try testing.expect(!try rulesets.verify("signed", "99", "bundle-key")); // absent version
+    // An unsigned bundle never verifies (its signature column is NULL).
+    try testing.expect(!try rulesets.verify("crs", "1", "bundle-key"));
 
     try conn.exec("DROP TABLE IF EXISTS security_events, rulesets, nodes, alert_rules, node_rulesets, alert_deliveries CASCADE");
     try conn.exec("DELETE FROM schema_migrations WHERE version IN (1, 2, 3, 4, 5, 6)");
