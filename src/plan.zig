@@ -186,6 +186,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     /// A `@pmFromDataset` / `@ipMatchFromDataset` named a dataset no `SecDataset`
     /// declares. Compiling it as an empty set would silently disable the rule.
     UnknownDataset,
+    /// An action neither baseline implements, which is rejected rather than
+    /// accepted and ignored — see `isUnimplementedAction`.
+    UnimplementedAction,
 };
 
 /// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
@@ -1574,6 +1577,7 @@ const Compiler = struct {
         if (parsed_actions.len > self.limits.max_actions -| self.actions.items.len) return error.TooManyActions;
         const start = try typedIndex(self.actions.items.len);
         for (parsed_actions) |action| {
+            if (isUnimplementedAction(action.name)) return error.UnimplementedAction;
             const class = classifyAction(action.name);
             const value_id = if (action.value) |value| blk: {
                 if (class != .transformation) break :blk try self.interner.intern(value);
@@ -2882,16 +2886,30 @@ fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
     return false;
 }
 
+/// Actions that are recognized but deliberately not implemented, and are therefore
+/// rejected rather than accepted and ignored.
+///
+/// `sanitizeMatchedBytes` masks only the matched bytes within a variable, and
+/// neither baseline implements it: ModSecurity 3.0.16's parser rejects it outright
+/// ("Action: SanitiseMatchedBytes is not yet supported", seclang-parser.yy), and
+/// Coraza 3.7.0 has no such action. Accepting it silently would be worse than
+/// either — a rule would look like it redacts a secret from the audit log while
+/// writing it out in full.
+fn isUnimplementedAction(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "sanitizeMatchedBytes") or
+        std.ascii.eqlIgnoreCase(name, "sanitiseMatchedBytes");
+}
+
 fn classifyAction(name: []const u8) ActionClass {
     if (std.ascii.eqlIgnoreCase(name, "t")) return .transformation;
     if (equalsAny(name, &.{ "id", "msg", "logdata", "tag", "severity", "ver", "version", "rev", "maturity", "accuracy" }))
         return .metadata;
     if (equalsAny(name, &.{
-        "capture",         "setvar",               "setenv",                "initcol",                "expirevar",
-        "deprecatevar",    "multimatch",           "log",                   "nolog",                  "auditlog",
-        "noauditlog",      "ctl",                  "exec",                  "pause",                  "prepend",
-        "status",          "append",               "setuid",                "setsid",                 "sanitizeArg",
-        "sanitizeMatched", "sanitizeMatchedBytes", "sanitizeRequestHeader", "sanitizeResponseHeader",
+        "capture",         "setvar",                "setenv",                 "initcol", "expirevar",
+        "deprecatevar",    "multimatch",            "log",                    "nolog",   "auditlog",
+        "noauditlog",      "ctl",                   "exec",                   "pause",   "prepend",
+        "status",          "append",                "setuid",                 "setsid",  "sanitizeArg",
+        "sanitizeMatched", "sanitizeRequestHeader", "sanitizeResponseHeader",
     })) return .nondisruptive;
     if (equalsAny(name, &.{ "allow", "block", "deny", "drop", "pass", "proxy", "redirect" }))
         return .disruptive;
@@ -4369,4 +4387,45 @@ test "structural plan evidence is valid and pinned to compiler ABI" {
     try std.testing.expectEqual(@as(i64, compiler_abi_version), object.get("compilerAbi").?.integer);
     try std.testing.expectEqual(@as(i64, 58), object.get("corpus").?.object.get("files").?.integer);
     try std.testing.expectEqual(@as(i64, 0), object.get("corpus").?.object.get("unexplainedExclusions").?.integer);
+}
+
+test "an action neither baseline implements is rejected, not ignored" {
+    // ModSecurity 3.0.16's parser rejects sanitiseMatchedBytes outright and Coraza
+    // 3.7.0 has no such action, so accepting it would leave a rule looking as though
+    // it redacts a secret from the audit log while writing it out in full.
+    const input =
+        \\SecRule ARGS:password "@rx ." "id:1,phase:2,pass,nolog,sanitizeMatchedBytes"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "bytes.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(
+        error.UnimplementedAction,
+        compile(std.testing.allocator, &parsed.registry, &documents, .{}),
+    );
+
+    // The British spelling ModSecurity's own scanner uses is rejected identically,
+    // so the spelling cannot be used to slip past the check.
+    const british =
+        \\SecRule ARGS:password "@rx ." "id:1,phase:2,pass,nolog,sanitiseMatchedBytes"
+    ;
+    var parsed_british = try seclang.parser.parseBytes(std.testing.allocator, "british.conf", british, .{}, .{});
+    defer parsed_british.deinit();
+    var british_documents = [_]seclang.parser.Document{parsed_british.document};
+    try std.testing.expectError(
+        error.UnimplementedAction,
+        compile(std.testing.allocator, &parsed_british.registry, &british_documents, .{}),
+    );
+
+    // The redaction actions that *are* implemented still compile.
+    const supported =
+        \\SecRule ARGS:password "@rx ." "id:1,phase:2,pass,nolog,sanitizeMatched"
+        \\SecRule ARGS:token "@rx ." "id:2,phase:2,pass,nolog,sanitizeArg:token"
+    ;
+    var parsed_supported = try seclang.parser.parseBytes(std.testing.allocator, "ok.conf", supported, .{}, .{});
+    defer parsed_supported.deinit();
+    var supported_documents = [_]seclang.parser.Document{parsed_supported.document};
+    const plan = try compile(std.testing.allocator, &parsed_supported.registry, &supported_documents, .{});
+    defer plan.deinit();
+    try std.testing.expectEqual(@as(usize, 2), plan.rules.len);
 }

@@ -249,7 +249,7 @@
       "id": "engine.audit-log-formats",
       "area": "engine",
       "name": "Native, legacy JSON, JSON, and OCSF audit-log formats",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/30",
       "modsecurity": true,
       "coraza": true,
@@ -258,7 +258,7 @@
         "src/audit.zig",
         "src/engine.zig"
       ],
-      "notes": "A transaction snapshots into an AuditRecord (identity, connection endpoints, request line, request/response headers from their collections, bodies, status, timestamp, interruption, and part-H rule messages formatted in ModSecurity's RuleMessage::log layout) and serializes via serializeAuditLog in four formats honoring SecAuditLogParts: native serial (pinned to ModSecurity toOldAuditLogFormat), structured JSON and legacy JSON (Coraza schemas), and OCSF v1.2.0 Web Resources Activity (Coraza OCSF formatter). Delivery uses an I/O-free Sink boundary with serial, callback, and ModSecurity concurrent-layout writers (src/audit_writer.zig). Redaction ports the ModSecurity sanitise actions: sanitizeRequestHeader/sanitizeResponseHeader mask header values with same-length '*', sanitizeArg masks an argument value in the request body, and sanitizeMatched masks the matched variable. sanitizeMatchedBytes and the debug-log/Prometheus/OpenTelemetry telemetry (WAF-31) remain."
+      "notes": "A transaction snapshots into an AuditRecord (identity, connection endpoints, request line, request/response headers from their collections, bodies, status, timestamp, interruption, and part-H rule messages formatted in ModSecurity's RuleMessage::log layout) and serializes via serializeAuditLog in four formats honoring SecAuditLogParts: native serial (pinned to ModSecurity toOldAuditLogFormat), structured JSON and legacy JSON (Coraza schemas), and OCSF v1.2.0 Web Resources Activity (Coraza OCSF formatter). Delivery uses an I/O-free Sink boundary with serial, callback, and ModSecurity concurrent-layout writers (src/audit_writer.zig). Redaction is a zig-waf extension over both baselines rather than a port: ModSecurity 3.0.16's parser rejects every sanitise action outright (\"is not yet supported\", seclang-parser.yy) and Coraza 3.7.0 has none. Implemented here are: sanitizeRequestHeader/sanitizeResponseHeader mask header values with same-length '*', sanitizeArg masks an argument value in the request body, and sanitizeMatched masks the matched variable. sanitizeMatchedBytes is rejected at compile time rather than accepted and ignored, matching the baselines and refusing to let a rule look as though it redacts a secret while writing it out in full. Debug-log/Prometheus/OpenTelemetry telemetry is WAF-31."
     },
     {
       "id": "engine.persistent-collections",
