@@ -39,6 +39,31 @@ pub const migrations = [_]sqlite.Migration{
         \\CREATE INDEX security_events_node_idx ON security_events (node_id, occurred_at);
         ,
     },
+    .{
+        .version = 2,
+        .name = "rulesets_and_rollout",
+        // Policy versions and their assignment to nodes, so a single-node demo can
+        // publish a ruleset and roll it out the way a fleet does.
+        .sql =
+        \\CREATE TABLE rulesets (
+        \\  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        \\  name        TEXT NOT NULL,
+        \\  version     INTEGER NOT NULL,
+        \\  content     TEXT NOT NULL,
+        \\  created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\  UNIQUE (name, version)
+        \\);
+        \\
+        \\CREATE TABLE node_rulesets (
+        \\  node_id          TEXT NOT NULL,
+        \\  ruleset_name     TEXT NOT NULL,
+        \\  version          INTEGER NOT NULL,
+        \\  running_version  INTEGER,
+        \\  assigned_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \\  PRIMARY KEY (node_id, ruleset_name)
+        \\);
+        ,
+    },
 };
 
 /// Bring `conn` up to the latest demo schema. Returns the number applied.
@@ -115,6 +140,110 @@ pub const EventRepository = struct {
     }
 };
 
+/// Immutable policy versions on SQLite (#57), mirroring `fleet.RulesetRepository`
+/// minus signing: the demo profile has no fleet to distribute a bundle to, and a
+/// signature nobody verifies would suggest a guarantee this backend does not make.
+pub const RulesetRepository = struct {
+    conn: *sqlite.Conn,
+
+    /// Publish a version. Versions are immutable, so re-publishing one fails
+    /// rather than rewriting what a node may already be running.
+    pub fn publish(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, content: [:0]const u8) sqlite.Error!void {
+        try self.conn.execParams(
+            "INSERT INTO rulesets (name, version, content) VALUES (?1, ?2, ?3)",
+            &.{ name, version, content },
+        );
+    }
+
+    /// The content of the highest version of a ruleset (caller frees), or null.
+    pub fn latest(self: RulesetRepository, allocator: std.mem.Allocator, name: [:0]const u8) sqlite.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT content FROM rulesets WHERE name = ?1 ORDER BY version DESC LIMIT 1",
+            &.{name},
+        );
+    }
+
+    /// The content of a specific version (caller frees), or null — the rollback
+    /// path, which works because versions are never rewritten.
+    pub fn atVersion(self: RulesetRepository, allocator: std.mem.Allocator, name: [:0]const u8, version: [:0]const u8) sqlite.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT content FROM rulesets WHERE name = ?1 AND version = ?2",
+            &.{ name, version },
+        );
+    }
+};
+
+/// Which version each node is assigned, and which it reports running (#57),
+/// mirroring `fleet.RolloutRepository`.
+pub const RolloutRepository = struct {
+    conn: *sqlite.Conn,
+
+    /// Assign a node to a version; re-assigning updates the target.
+    pub fn assign(self: RolloutRepository, node_id: [:0]const u8, ruleset_name: [:0]const u8, version: [:0]const u8) sqlite.Error!void {
+        try self.conn.execParams(
+            \\INSERT INTO node_rulesets (node_id, ruleset_name, version) VALUES (?1, ?2, ?3)
+            \\ON CONFLICT (node_id, ruleset_name) DO UPDATE SET version = excluded.version,
+            \\  assigned_at = CURRENT_TIMESTAMP
+        , &.{ node_id, ruleset_name, version });
+    }
+
+    /// Assign every enrolled node to a version, returning how many were moved.
+    pub fn assignAll(self: RolloutRepository, allocator: std.mem.Allocator, ruleset_name: [:0]const u8, version: [:0]const u8) sqlite.Error!?[]u8 {
+        try self.conn.execParams(
+            \\INSERT INTO node_rulesets (node_id, ruleset_name, version)
+            \\SELECT node_id, ?1, ?2 FROM nodes
+            \\-- SQLite parses a bare ON after a SELECT as a join, so the upsert clause
+            \\-- needs a WHERE to disambiguate it.
+            \\WHERE true
+            \\ON CONFLICT (node_id, ruleset_name) DO UPDATE SET version = excluded.version,
+            \\  assigned_at = CURRENT_TIMESTAMP
+        , &.{ ruleset_name, version });
+        return self.countOnVersion(allocator, ruleset_name, version);
+    }
+
+    /// The version a node is assigned (caller frees), or null if unassigned.
+    pub fn assignedVersion(self: RolloutRepository, allocator: std.mem.Allocator, node_id: [:0]const u8, ruleset_name: [:0]const u8) sqlite.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT version FROM node_rulesets WHERE node_id = ?1 AND ruleset_name = ?2",
+            &.{ node_id, ruleset_name },
+        );
+    }
+
+    /// How many nodes are assigned a version — rollout convergence.
+    pub fn countOnVersion(self: RolloutRepository, allocator: std.mem.Allocator, ruleset_name: [:0]const u8, version: [:0]const u8) sqlite.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            "SELECT count(*) FROM node_rulesets WHERE ruleset_name = ?1 AND version = ?2",
+            &.{ ruleset_name, version },
+        );
+    }
+
+    /// A node reports the version it is actually running. A node with no
+    /// assignment has nothing to drift from, so the report is ignored.
+    pub fn reportRunning(self: RolloutRepository, node_id: [:0]const u8, ruleset_name: [:0]const u8, version: [:0]const u8) sqlite.Error!void {
+        try self.conn.execParams(
+            "UPDATE node_rulesets SET running_version = ?3 WHERE node_id = ?1 AND ruleset_name = ?2",
+            &.{ node_id, ruleset_name, version },
+        );
+    }
+
+    /// How many nodes are not running the version they were assigned. A node that
+    /// has never reported counts as drifted, as in the PostgreSQL repository:
+    /// silence is not evidence of compliance.
+    pub fn driftCount(self: RolloutRepository, allocator: std.mem.Allocator, ruleset_name: [:0]const u8) sqlite.Error!?[]u8 {
+        return self.conn.queryScalarParams(
+            allocator,
+            \\SELECT count(*) FROM node_rulesets
+            \\WHERE ruleset_name = ?1 AND (running_version IS NULL OR running_version <> version)
+        ,
+            &.{ruleset_name},
+        );
+    }
+};
+
 // ---- tests ----------------------------------------------------------------
 // A private in-memory database — no server, runs under `zig build sqlite-test`.
 
@@ -176,4 +305,65 @@ test "sqlite fleet: event ingestion, counts, and recent search" {
     try testing.expect(rows.next());
     try testing.expectEqualStrings("/x?id=1", rows.get(2));
     try testing.expect(!rows.next());
+}
+
+test "sqlite fleet: rulesets are immutable and roll out per node" {
+    var conn = try sqlite.Conn.openMemory();
+    defer conn.close();
+    _ = try apply(&conn, testing.allocator);
+
+    const nodes = NodeRepository{ .conn = &conn };
+    const rulesets = RulesetRepository{ .conn = &conn };
+    const rollout = RolloutRepository{ .conn = &conn };
+    const a = "33333333-3333-3333-3333-333333333333";
+    const b = "44444444-4444-4444-4444-444444444444";
+    try nodes.enroll(a, "edge-a", "1.0");
+    try nodes.enroll(b, "edge-b", "1.0");
+
+    try rulesets.publish("crs", "1", "SecRuleEngine On # v1");
+    try rulesets.publish("crs", "2", "SecRuleEngine On # v2");
+    {
+        const latest = (try rulesets.latest(testing.allocator, "crs")).?;
+        defer testing.allocator.free(latest);
+        try testing.expectEqualStrings("SecRuleEngine On # v2", latest);
+        const first = (try rulesets.atVersion(testing.allocator, "crs", "1")).?;
+        defer testing.allocator.free(first);
+        try testing.expectEqualStrings("SecRuleEngine On # v1", first);
+    }
+    // A published version is never rewritten — the same guarantee the PostgreSQL
+    // repository makes, so a demo cannot behave in a way a fleet would not.
+    try testing.expectError(error.QueryFailed, rulesets.publish("crs", "2", "tampered"));
+    try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
+
+    // Canary one node, then the whole fleet.
+    try rollout.assign(a, "crs", "2");
+    {
+        const assigned = (try rollout.assignedVersion(testing.allocator, a, "crs")).?;
+        defer testing.allocator.free(assigned);
+        try testing.expectEqualStrings("2", assigned);
+        try testing.expect((try rollout.assignedVersion(testing.allocator, b, "crs")) == null);
+    }
+    {
+        const rolled = (try rollout.assignAll(testing.allocator, "crs", "3")).?;
+        defer testing.allocator.free(rolled);
+        try testing.expectEqualStrings("2", rolled);
+    }
+
+    // Drift: neither node has confirmed v3 yet.
+    {
+        const drifted = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(drifted);
+        try testing.expectEqualStrings("2", drifted);
+    }
+    try rollout.reportRunning(a, "crs", "3");
+    try rollout.reportRunning(b, "crs", "2"); // failed to apply
+    {
+        const drifted = (try rollout.driftCount(testing.allocator, "crs")).?;
+        defer testing.allocator.free(drifted);
+        try testing.expectEqualStrings("1", drifted);
+    }
+
+    // A report for an unassigned ruleset invents no assignment.
+    try rollout.reportRunning(a, "other", "1");
+    try testing.expect((try rollout.assignedVersion(testing.allocator, a, "other")) == null);
 }
