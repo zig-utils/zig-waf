@@ -134,6 +134,97 @@ pub const Conn = struct {
         return std.fmt.parseInt(usize, tuples, 10) catch error.QueryFailed;
     }
 
+    /// Parse and plan a statement once under `name`, to be run repeatedly with
+    /// `execPrepared`/`queryPrepared` (#53). The control plane's hot statements —
+    /// heartbeats, event inserts, assignment lookups — are the same handful of
+    /// shapes on every call, and preparing them moves parsing off each one.
+    ///
+    /// The name is scoped to this connection and lives until the session ends, so a
+    /// pooled connection keeps its prepared statements across checkouts. Preparing
+    /// the same name twice is an error, not a redefinition.
+    pub fn prepare(self: *Conn, name: [:0]const u8, sql: [:0]const u8) Error!void {
+        // Zero parameter types: the server infers them from the statement.
+        const result = c.PQprepare(self.handle, name.ptr, sql.ptr, 0, null);
+        defer c.PQclear(result);
+        if (c.PQresultStatus(result) != c.PGRES_COMMAND_OK) return error.QueryFailed;
+    }
+
+    /// Run a prepared statement, returning how many rows it affected. Parameters
+    /// may be null to bind SQL NULL.
+    pub fn execPrepared(self: *Conn, name: [:0]const u8, params: []const ?[:0]const u8) Error!usize {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = if (param) |p| p.ptr else null;
+        const result = c.PQexecPrepared(self.handle, name.ptr, @intCast(params.len), &values, null, null, 0);
+        defer c.PQclear(result);
+        switch (c.PQresultStatus(result)) {
+            c.PGRES_COMMAND_OK, c.PGRES_TUPLES_OK => {},
+            else => return error.QueryFailed,
+        }
+        const tuples = std.mem.span(c.PQcmdTuples(result));
+        if (tuples.len == 0) return 0;
+        return std.fmt.parseInt(usize, tuples, 10) catch error.QueryFailed;
+    }
+
+    /// Run a prepared statement and return a row cursor over its results.
+    pub fn queryPrepared(self: *Conn, name: [:0]const u8, params: []const [:0]const u8) Error!Rows {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = param.ptr;
+        const result = c.PQexecPrepared(self.handle, name.ptr, @intCast(params.len), &values, null, null, 0) orelse return error.QueryFailed;
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            c.PQclear(result);
+            return error.QueryFailed;
+        }
+        return .{ .result = result, .count = c.PQntuples(result) };
+    }
+
+    /// Bound how long any statement on this connection may run (#53). The server
+    /// cancels one that exceeds it, so a pathological query cannot hold a pooled
+    /// connection — and the pool's whole budget — indefinitely. Zero disables the
+    /// bound.
+    ///
+    /// This is session state, so it must be re-applied after `reset`.
+    pub fn setStatementTimeout(self: *Conn, milliseconds: u32) Error!void {
+        var buffer: [64]u8 = undefined;
+        try self.exec(try bufSqlZ(&buffer, "SET statement_timeout = {d}", .{milliseconds}));
+    }
+
+    /// Send a statement without waiting for it (#53), so the caller can `cancel` it
+    /// or do other work while the server runs it. Every send must be followed by
+    /// `discardResults` (or a `cancel` and then `discardResults`) before the
+    /// connection is used again, since libpq refuses a new command while results
+    /// are outstanding.
+    pub fn sendQuery(self: *Conn, sql: [:0]const u8) Error!void {
+        if (c.PQsendQuery(self.handle, sql.ptr) != 1) return error.QueryFailed;
+    }
+
+    /// Ask the server to abandon the statement in flight on this connection (#53).
+    /// Cancellation is a request, not a guarantee: a statement that has already
+    /// finished completes normally, so the caller learns the outcome from
+    /// `discardResults` rather than from this call.
+    pub fn cancel(self: *const Conn) Error!void {
+        const handle = c.PQgetCancel(@constCast(self.handle)) orelse return error.ConnectionFailed;
+        defer c.PQfreeCancel(handle);
+        var message: [256]u8 = undefined;
+        if (c.PQcancel(handle, &message, message.len) != 1) return error.QueryFailed;
+    }
+
+    /// Drain the results of a `sendQuery`, reporting whether the statement
+    /// succeeded. A cancelled statement reports false — the error libpq holds says
+    /// it was cancelled.
+    pub fn discardResults(self: *Conn) bool {
+        var succeeded = true;
+        while (c.PQgetResult(self.handle)) |result| {
+            switch (c.PQresultStatus(result)) {
+                c.PGRES_COMMAND_OK, c.PGRES_TUPLES_OK => {},
+                else => succeeded = false,
+            }
+            c.PQclear(result);
+        }
+        return succeeded;
+    }
+
     /// Stream `data` into the server with `COPY … FROM STDIN` (#55) — one round
     /// trip and one parse for a whole batch, instead of a statement per row.
     ///
@@ -454,6 +545,80 @@ fn testDsn(allocator: std.mem.Allocator) !?[:0]u8 {
     const owned = try allocator.allocSentinel(u8, value.len, 0);
     @memcpy(owned, value);
     return owned;
+}
+
+test "prepared statements run repeatedly and bind NULL" {
+    var db = try TestSchema.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    try conn.exec("CREATE TABLE prepared_probe (id int, label text)");
+    try conn.prepare("insert_probe", "INSERT INTO prepared_probe (id, label) VALUES ($1::int, $2)");
+    try testing.expectEqual(@as(usize, 1), try conn.execPrepared("insert_probe", &.{ "1", "first" }));
+    try testing.expectEqual(@as(usize, 1), try conn.execPrepared("insert_probe", &.{ "2", "second" }));
+    // A null parameter binds SQL NULL through the prepared path too.
+    try testing.expectEqual(@as(usize, 1), try conn.execPrepared("insert_probe", &.{ "3", null }));
+
+    try conn.prepare("select_probe", "SELECT label FROM prepared_probe WHERE id = $1::int");
+    {
+        var rows = try conn.queryPrepared("select_probe", &.{"2"});
+        defer rows.deinit();
+        try testing.expect(rows.next());
+        try testing.expectEqualStrings("second", rows.get(0));
+    }
+    const nulls = (try conn.queryScalar(testing.allocator, "SELECT count(*) FROM prepared_probe WHERE label IS NULL")).?;
+    defer testing.allocator.free(nulls);
+    try testing.expectEqualStrings("1", nulls);
+
+    // A name is defined once; redefining it is an error rather than a silent
+    // replacement of a statement other call sites are using.
+    try testing.expectError(error.QueryFailed, conn.prepare("insert_probe", "SELECT 1"));
+    // An unprepared name is an error, not an empty result.
+    try testing.expectError(error.QueryFailed, conn.execPrepared("absent", &.{}));
+}
+
+test "a statement timeout bounds a pathological query" {
+    var db = try TestSchema.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    try conn.setStatementTimeout(50);
+    // The server cancels the sleep, so a query that would hold the connection for
+    // a second fails in a fraction of it.
+    try testing.expectError(error.QueryFailed, conn.exec("SELECT pg_sleep(1)"));
+    // The connection stays usable afterwards: the statement was cancelled, not the
+    // session.
+    try testing.expect(conn.isOpen());
+    const one = (try conn.queryScalar(testing.allocator, "SELECT 1")).?;
+    defer testing.allocator.free(one);
+    try testing.expectEqualStrings("1", one);
+
+    // Zero lifts the bound.
+    try conn.setStatementTimeout(0);
+    try conn.exec("SELECT pg_sleep(0.05)");
+}
+
+test "an in-flight statement can be cancelled" {
+    var db = try TestSchema.open(testing.allocator);
+    defer db.close();
+    const conn = &db.conn;
+
+    // A statement that would run for a second, abandoned before it finishes.
+    try conn.sendQuery("SELECT pg_sleep(1)");
+    try conn.cancel();
+    try testing.expect(!conn.discardResults()); // reported as failed: cancelled
+
+    // The session survives its statement being cancelled and is immediately usable.
+    try testing.expect(conn.isOpen());
+    const one = (try conn.queryScalar(testing.allocator, "SELECT 1")).?;
+    defer testing.allocator.free(one);
+    try testing.expectEqualStrings("1", one);
+
+    // Cancelling when nothing is in flight is not an error — cancellation is a
+    // request about whatever the server is doing, and it may already have finished.
+    try conn.sendQuery("SELECT 2");
+    try testing.expect(conn.discardResults());
+    try conn.cancel();
 }
 
 test "connection pool reuses connections and bounds concurrency" {
