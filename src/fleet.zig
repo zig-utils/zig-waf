@@ -110,6 +110,16 @@ pub const EventRepository = struct {
         return self.conn.queryScalarParams(allocator, "SELECT count(*) FROM security_events WHERE node_id = $1", &.{node_id});
     }
 
+    /// The most recent events for a node, newest first, up to `limit` — the
+    /// event-search / transaction-detail view (#56/#66). The row cursor yields
+    /// columns (0) occurred_at, (1) action, (2) uri; the caller `deinit`s it.
+    pub fn recentForNode(self: EventRepository, node_id: [:0]const u8, limit: [:0]const u8) pg.Error!pg.Rows {
+        return self.conn.query(
+            "SELECT occurred_at, action, uri FROM security_events WHERE node_id = $1 ORDER BY occurred_at DESC LIMIT $2::int",
+            &.{ node_id, limit },
+        );
+    }
+
     /// Delete events older than `retention_days` (retention policy #56). Returns
     /// the number of rows deleted (caller frees the text count).
     pub fn pruneOlderThan(self: EventRepository, allocator: std.mem.Allocator, retention_days: u32) pg.Error!?[]u8 {
@@ -316,6 +326,18 @@ test "node and event repositories enroll, heartbeat, and ingest safely" {
     const count = (try events.countForNode(testing.allocator, node_id)).?;
     defer testing.allocator.free(count);
     try testing.expectEqualStrings("2", count);
+
+    // Event search returns rows newest-first, bounded by the limit. The second
+    // insert ("pass") is the most recent, so it comes first.
+    var rows = try events.recentForNode(node_id, "5");
+    defer rows.deinit();
+    try testing.expectEqual(@as(usize, 2), rows.len());
+    try testing.expect(rows.next());
+    try testing.expectEqualStrings("pass", rows.get(1)); // action of the newest event
+    try testing.expect(rows.next());
+    try testing.expectEqualStrings("deny", rows.get(1));
+    try testing.expect(!rows.next());
+
     // The nodes table still exists — the injection did not execute.
     const still_active = (try nodes.statusOf(testing.allocator, node_id)).?;
     defer testing.allocator.free(still_active);

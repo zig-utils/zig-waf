@@ -89,6 +89,49 @@ pub const Conn = struct {
         if (c.PQntuples(result) == 0 or c.PQnfields(result) == 0) return null;
         return try allocator.dupe(u8, std.mem.span(c.PQgetvalue(result, 0, 0)));
     }
+
+    /// Run a parameterized query and return a row cursor. The caller iterates
+    /// with `next()`, reads borrowed column text with `get()`, and must
+    /// `deinit()` to release the result.
+    pub fn query(self: *Conn, sql: [:0]const u8, params: []const [:0]const u8) Error!Rows {
+        if (params.len > max_params) return error.QueryFailed;
+        var values: [max_params][*c]const u8 = undefined;
+        for (params, 0..) |param, index| values[index] = param.ptr;
+        const result = c.PQexecParams(self.handle, sql.ptr, @intCast(params.len), null, &values, null, null, 0) orelse return error.QueryFailed;
+        if (c.PQresultStatus(result) != c.PGRES_TUPLES_OK) {
+            c.PQclear(result);
+            return error.QueryFailed;
+        }
+        return .{ .result = result, .count = c.PQntuples(result) };
+    }
+};
+
+/// A forward cursor over a query result. Column values are borrowed from the
+/// result and valid only until `deinit`.
+pub const Rows = struct {
+    result: *c.PGresult,
+    count: c_int,
+    index: c_int = -1,
+
+    pub fn deinit(self: *Rows) void {
+        c.PQclear(self.result);
+        self.* = undefined;
+    }
+
+    /// Advance to the next row; false when exhausted.
+    pub fn next(self: *Rows) bool {
+        self.index += 1;
+        return self.index < self.count;
+    }
+
+    /// Borrowed text of column `col` in the current row (valid until `deinit`).
+    pub fn get(self: *const Rows, col: usize) []const u8 {
+        return std.mem.span(c.PQgetvalue(self.result, self.index, @intCast(col)));
+    }
+
+    pub fn len(self: *const Rows) usize {
+        return @intCast(self.count);
+    }
 };
 
 /// A bounded pool of PostgreSQL connections, opened lazily and reused (#53).
