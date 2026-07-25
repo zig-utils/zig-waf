@@ -140,6 +140,13 @@ zig_waf_status_t zig_waf_transaction_write_response_body(
     size_t chunk_len);
 zig_waf_status_t zig_waf_transaction_process_response_body(zig_waf_transaction_t *transaction);
 zig_waf_status_t zig_waf_transaction_process_logging(zig_waf_transaction_t *transaction);
+
+/* Evaluate every rule in a phase (1=request headers .. 5=logging) against the
+ * current transaction state and apply matches; then read the decision with
+ * zig_waf_transaction_intervention. */
+zig_waf_status_t zig_waf_transaction_evaluate_phase(
+    zig_waf_transaction_t *transaction,
+    uint32_t phase);
 zig_waf_status_t zig_waf_transaction_intervention(
     const zig_waf_transaction_t *transaction,
     zig_waf_intervention_t *out_intervention);

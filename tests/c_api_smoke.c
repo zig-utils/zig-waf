@@ -65,6 +65,9 @@ int main(void) {
                (const uint8_t *)header_value,
                strlen(header_value)) == ZIG_WAF_OK);
     assert(zig_waf_transaction_process_request_headers(transaction) == ZIG_WAF_OK);
+    /* Evaluate the request-headers phase (no rules loaded → no intervention). */
+    assert(zig_waf_transaction_evaluate_phase(transaction, ZIG_WAF_PHASE_REQUEST_HEADERS) == ZIG_WAF_OK);
+    assert(zig_waf_transaction_evaluate_phase(transaction, 99) == ZIG_WAF_ERROR_INVALID_ARGUMENT);
     assert(zig_waf_transaction_write_request_body(
                transaction,
                (const uint8_t *)body,

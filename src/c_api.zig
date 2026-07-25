@@ -239,6 +239,17 @@ export fn zig_waf_transaction_process_logging(handle: ?*TransactionHandle) callc
     return .ok;
 }
 
+/// Autonomously evaluate every rule in `phase` (1=request headers … 5=logging)
+/// against the current transaction state, applying matches. After this returns
+/// OK, query zig_waf_transaction_intervention for the decision.
+export fn zig_waf_transaction_evaluate_phase(handle: ?*TransactionHandle, phase: u32) callconv(.c) Status {
+    const transaction = getTransaction(handle) orelse return .invalid_argument;
+    if (phase < 1 or phase > 5) return .invalid_argument;
+    const resolved: waf.engine.Phase = @fromBackingInt(@intCast(@as(u8, @intCast(phase))));
+    transaction.evaluatePhase(std.heap.page_allocator, resolved) catch |err| return mapError(err);
+    return .ok;
+}
+
 export fn zig_waf_transaction_intervention(
     handle: ?*const TransactionHandle,
     out_intervention: ?*CIntervention,
