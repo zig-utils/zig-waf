@@ -127,3 +127,40 @@ test "detectSQLi routes through the compile-free path" {
     try testing.expect(op.evaluate("1' OR '1'='1", .modsecurity));
     try testing.expect(!op.evaluate("just text", .modsecurity));
 }
+
+test "random operators, patterns, and inputs never crash or leak" {
+    var prng = std.Random.DefaultPrng.init(0x0FEED_0BEC_2210);
+    const random = prng.random();
+    const names = [_][]const u8{
+        "@rx",         "@pm",         "@ipMatch",   "@streq",             "@contains",
+        "@beginsWith", "@detectSQLi", "@detectXSS", "@validateByteRange", "@unknownOp",
+    };
+    var pattern_buf: [64]u8 = undefined;
+    var input_buf: [128]u8 = undefined;
+    var iteration: usize = 0;
+    while (iteration < 4000) : (iteration += 1) {
+        const name = names[random.uintLessThan(usize, names.len)];
+        const pattern_len = random.uintLessThan(usize, pattern_buf.len + 1);
+        for (pattern_buf[0..pattern_len]) |*byte| {
+            // Bias toward regex/CIDR metacharacters so compilation is exercised.
+            byte.* = switch (random.uintLessThan(u8, 8)) {
+                0 => '(',
+                1 => ')',
+                2 => '[',
+                3 => '*',
+                4 => '.',
+                5 => '/',
+                else => random.int(u8),
+            };
+        }
+        const input_len = random.uintLessThan(usize, input_buf.len + 1);
+        random.bytes(input_buf[0..input_len]);
+
+        // Compilation may fail on a malformed pattern; that must be a clean error,
+        // never a crash or leak. Evaluation of a compiled operator must not crash.
+        var op = RuntimeOperator.compile(testing.allocator, name, pattern_buf[0..pattern_len]) catch continue;
+        defer op.deinit();
+        _ = op.evaluate(input_buf[0..input_len], .modsecurity);
+        _ = op.match(input_buf[0..input_len], .coraza);
+    }
+}
