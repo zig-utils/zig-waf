@@ -627,6 +627,22 @@
         "src/engine.zig"
       ],
       "notes": "Flattens by streaming rather than materializing a value tree. A duplicated key publishes every value under the same argument, because parsers disagree about which one wins and inspecting only one leaves the other unfiltered; refusing such a body would publish no arguments at all, making one repeated key a bypass. Nesting is bounded by SecRequestBodyJsonDepthLimit (Coraza's 1024 default), since flattening costs a frame per level. A truncated body is inspected as far as it was read and reports REQBODY_PROCESSOR_ERROR. Dotted json.* keys, array indices, and array-length entries match Coraza."
+    },
+    {
+      "id": "api.plugin-registry",
+      "area": "integration",
+      "name": "Host extension registry for operators and body processors",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/23",
+      "modsecurity": false,
+      "coraza": false,
+      "crs_required": false,
+      "evidence": [
+        "src/plugin.zig",
+        "src/engine.zig",
+        "docs/plugins.md"
+      ],
+      "notes": "Operators and body processors a host registers, called where the configuration names them. An extension nothing provides fails to compile rather than leaving a rule that never matches or a body nothing reads. An operator plugin reports unavailable distinctly from no-match and the engine counts it, so a data source that failed to load is visible instead of reading as clean traffic. Transformations, actions, and directives are deliberately closed \u2014 their semantics are the compatibility surface \u2014 and the C ABI (#33) is the cross-language boundary rather than an embedded WASM runtime."
     }
   ]
 }

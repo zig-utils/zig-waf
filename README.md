@@ -46,6 +46,9 @@ constraints for transformations are documented in
 The fleet schema, repositories, and the durability and idempotency guarantees of
 event ingestion are documented in
 [`docs/fleet-storage.md`](docs/fleet-storage.md).
+The host extension contracts — what can be registered, what deliberately cannot,
+and why an unavailable plugin is not the same as a clean request — are documented in
+[`docs/plugins.md`](docs/plugins.md).
 
 ## License
 
