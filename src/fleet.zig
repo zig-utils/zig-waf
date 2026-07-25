@@ -922,36 +922,91 @@ pub const RulesetRepository = struct {
         );
     }
 
-    /// Publish a signed bundle version (#54): the HMAC-SHA256 of the content
-    /// under `secret` is stored in the `signature` column, so a node can verify
-    /// the bundle was authored by the control plane and not tampered with in
-    /// transit before applying it. Like `publish`, versions are immutable.
-    pub fn publishSigned(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, content: [:0]const u8, secret: []const u8) pg.Error!void {
-        var signature: [65]u8 = undefined;
-        signPayload(secret, content, signature[0..64]);
-        signature[64] = 0;
-        // decode($4, 'hex') stores the hex digest into the bytea signature column.
+    /// Publish a signed bundle version (#54): the Ed25519 signature over the
+    /// content is stored in the `signature` column, so a node verifies the bundle
+    /// was authored by the control plane and not tampered with in transit before
+    /// applying it. Like `publish`, versions are immutable.
+    ///
+    /// The signature is asymmetric on purpose. A bundle is verified by every node
+    /// in the fleet, and a shared secret would have to be distributed to all of
+    /// them — after which any single compromised node could forge a policy the
+    /// whole fleet would accept. With Ed25519 nodes hold only the public key, and
+    /// the signing key never leaves the control plane.
+    pub fn publishSigned(
+        self: RulesetRepository,
+        name: [:0]const u8,
+        version: [:0]const u8,
+        content: [:0]const u8,
+        key_pair: std.crypto.sign.Ed25519.KeyPair,
+    ) pg.Error!void {
+        const signature = key_pair.sign(content, null) catch return error.QueryFailed;
+        var hex: [signature_hex_len + 1]u8 = undefined;
+        toHex(&signature.toBytes(), hex[0..signature_hex_len]);
+        hex[signature_hex_len] = 0;
+        // decode($4, 'hex') stores the hex signature into the bytea column.
         try self.conn.execParams(
             "INSERT INTO rulesets (name, version, content, signature) VALUES ($1, $2, $3, decode($4, 'hex'))",
-            &.{ name, version, content, signature[0..64 :0] },
+            &.{ name, version, content, hex[0..signature_hex_len :0] },
         );
     }
 
-    /// Verify a bundle's stored signature against `secret`: true only when the
-    /// version exists, is signed, and the recomputed HMAC matches. An unsigned
-    /// or absent version, or a wrong secret/tampered content, is false.
-    pub fn verify(self: RulesetRepository, name: [:0]const u8, version: [:0]const u8, secret: []const u8) pg.Error!bool {
+    /// Verify a bundle's stored signature against `public_key`: true only when the
+    /// version exists, is signed, and the signature is valid for the stored
+    /// content. Fails closed — an absent or unsigned version, a signature from
+    /// another key, and tampered content are all false rather than an error the
+    /// caller might ignore.
+    pub fn verify(
+        self: RulesetRepository,
+        name: [:0]const u8,
+        version: [:0]const u8,
+        public_key: std.crypto.sign.Ed25519.PublicKey,
+    ) pg.Error!bool {
         var rows = try self.conn.query(
             "SELECT content, encode(signature, 'hex') FROM rulesets WHERE name = $1 AND version = $2",
             &.{ name, version },
         );
         defer rows.deinit();
         if (!rows.next()) return false; // no such version
-        var expected: [64]u8 = undefined;
-        signPayload(secret, rows.get(0), &expected);
-        return std.mem.eql(u8, &expected, rows.get(1)); // stored NULL → "" → mismatch
+        const hex = rows.get(1); // a NULL signature reads as "" — unsigned, so false
+        if (hex.len != signature_hex_len) return false;
+        var raw: [std.crypto.sign.Ed25519.Signature.encoded_length]u8 = undefined;
+        fromHex(hex, &raw) catch return false;
+        const signature = std.crypto.sign.Ed25519.Signature.fromBytes(raw);
+        signature.verify(rows.get(0), public_key) catch return false;
+        return true;
     }
+
+    const signature_hex_len = std.crypto.sign.Ed25519.Signature.encoded_length * 2;
 };
+
+const hex_digits = "0123456789abcdef";
+
+/// Write `bytes` as lowercase hex into `out`, which must be twice as long.
+fn toHex(bytes: []const u8, out: []u8) void {
+    for (bytes, 0..) |byte, index| {
+        out[index * 2] = hex_digits[byte >> 4];
+        out[index * 2 + 1] = hex_digits[byte & 0x0f];
+    }
+}
+
+/// Decode lowercase or uppercase hex into `out`, rejecting anything else.
+fn fromHex(hex: []const u8, out: []u8) error{InvalidHex}!void {
+    if (hex.len != out.len * 2) return error.InvalidHex;
+    for (out, 0..) |*byte, index| {
+        const high = try hexDigit(hex[index * 2]);
+        const low = try hexDigit(hex[index * 2 + 1]);
+        byte.* = (high << 4) | low;
+    }
+}
+
+fn hexDigit(char: u8) error{InvalidHex}!u8 {
+    return switch (char) {
+        '0'...'9' => char - '0',
+        'a'...'f' => char - 'a' + 10,
+        'A'...'F' => char - 'A' + 10,
+        else => error.InvalidHex,
+    };
+}
 
 /// Which ruleset version each node is assigned to run (#54). The control plane
 /// records the desired version per node; a node reconciles by fetching the
@@ -1615,13 +1670,47 @@ test "ruleset repository publishes immutable versions and rolls back" {
     try testing.expectError(error.QueryFailed, rulesets.publish("crs", "2", "tampered"));
     try testing.expect((try rulesets.latest(testing.allocator, "absent")) == null);
 
-    // A signed bundle verifies with its secret and only with the exact content.
-    try rulesets.publishSigned("signed", "1", "SecRuleEngine On # signed", "bundle-key");
-    try testing.expect(try rulesets.verify("signed", "1", "bundle-key"));
-    try testing.expect(!try rulesets.verify("signed", "1", "wrong-key")); // wrong secret
-    try testing.expect(!try rulesets.verify("signed", "99", "bundle-key")); // absent version
-    // An unsigned bundle never verifies (its signature column is NULL).
-    try testing.expect(!try rulesets.verify("crs", "1", "bundle-key"));
+    // A signed bundle verifies under the control plane's public key. A fixed seed
+    // keeps the test deterministic; a real control plane generates its key once.
+    const signing_key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(7));
+    const other_key = try std.crypto.sign.Ed25519.KeyPair.generateDeterministic(@splat(9));
+    try rulesets.publishSigned("signed", "1", "SecRuleEngine On # signed", signing_key);
+    try testing.expect(try rulesets.verify("signed", "1", signing_key.public_key));
+
+    // Every way a bundle can fail to be the one the control plane signed is
+    // false, not an error a caller might overlook: another key's signature, an
+    // absent version, and an unsigned bundle whose signature column is NULL.
+    try testing.expect(!try rulesets.verify("signed", "1", other_key.public_key));
+    try testing.expect(!try rulesets.verify("signed", "99", signing_key.public_key));
+    try testing.expect(!try rulesets.verify("crs", "1", signing_key.public_key));
+
+    // Tampering with the content of a published bundle breaks its signature. The
+    // schema keeps versions immutable, so this takes direct SQL — which is exactly
+    // the situation the signature is there to catch.
+    try conn.execParams("UPDATE rulesets SET content = $1 WHERE name = 'signed' AND version = 1", &.{"SecRuleEngine Off # tampered"});
+    try testing.expect(!try rulesets.verify("signed", "1", signing_key.public_key));
+
+    // A signature that is not hex, or is the wrong length, is rejected rather than
+    // decoded into whatever it happens to parse as.
+    try conn.exec("UPDATE rulesets SET signature = decode('00ff', 'hex') WHERE name = 'signed' AND version = 1");
+    try testing.expect(!try rulesets.verify("signed", "1", signing_key.public_key));
+}
+
+test "hex round-trips and rejects non-hex" {
+    var encoded: [8]u8 = undefined;
+    toHex(&[_]u8{ 0x00, 0x0f, 0xa5, 0xff }, &encoded);
+    try testing.expectEqualStrings("000fa5ff", &encoded);
+
+    var decoded: [4]u8 = undefined;
+    try fromHex("000fa5ff", &decoded);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x0f, 0xa5, 0xff }, &decoded);
+    // Uppercase decodes; anything outside the alphabet, or a length mismatch, does
+    // not.
+    try fromHex("000FA5FF", &decoded);
+    try testing.expectEqualSlices(u8, &[_]u8{ 0x00, 0x0f, 0xa5, 0xff }, &decoded);
+    try testing.expectError(error.InvalidHex, fromHex("00 fa5ff", &decoded));
+    try testing.expectError(error.InvalidHex, fromHex("zz0fa5ff", &decoded));
+    try testing.expectError(error.InvalidHex, fromHex("000fa5f", &decoded));
 }
 
 test "rollout assigns ruleset versions per node and fleet-wide" {

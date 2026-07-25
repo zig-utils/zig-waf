@@ -62,9 +62,14 @@ canary.
 
 `RulesetRepository` publishes immutable versions: a published version is never
 rewritten, so a rollback is a rollout of an earlier version rather than an edit.
-`publishSigned` stores an HMAC-SHA256 signature over the content and `verify`
-fails closed — a wrong secret, an absent signature, and an unsigned bundle are
-all rejected rather than trusted.
+`publishSigned` stores an Ed25519 signature over the content and `verify` fails
+closed — a signature from another key, an absent signature, an unsigned bundle,
+and content altered after publication are all false rather than an error a caller
+might overlook. The signature is asymmetric because every node in the fleet
+verifies bundles: a shared secret would have to reach all of them, after which one
+compromised node could forge a policy the whole fleet accepts. Nodes hold only the
+public key, and the signing key never leaves the control plane. Webhook payloads
+keep HMAC-SHA256, where the secret is shared with exactly one receiver by design.
 
 `RolloutRepository` assigns versions to one node (a canary), to a labeled cohort,
 or fleet-wide, and reports how many nodes are on a version so convergence is
