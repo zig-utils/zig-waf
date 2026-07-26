@@ -46,6 +46,9 @@ constraints for transformations are documented in
 The fleet schema, repositories, and the durability and idempotency guarantees of
 event ingestion are documented in
 [`docs/fleet-storage.md`](docs/fleet-storage.md).
+Running that database — deployment profile, TLS, backups, point-in-time recovery,
+failover, and the operator drills that verify each one — is documented in
+[`docs/postgres-operations.md`](docs/postgres-operations.md).
 The control-plane API's resources, authorization, and versioning are defined in
 [`src/api-v1.json`](src/api-v1.json) (OpenAPI 3.1), held in step with the route table
 in `src/api.zig` by a test.
