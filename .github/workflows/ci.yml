@@ -284,8 +284,11 @@ jobs:
         ports:
           - 5432:5432
         # Without this the job races the container's startup and fails on connect.
+        # The role has to be named: pg_isready defaults to the invoking user, which
+        # inside the runner is root, and every probe then fails for a reason that has
+        # nothing to do with whether the server is up.
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres -d waf"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
@@ -317,5 +320,11 @@ jobs:
           # A real server, over TCP. The tests each take a private schema, so they
           # can share one database without contending on DDL.
           PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=waf-ci dbname=waf
-          LD_LIBRARY_PATH: ${{ github.workspace }}/zig-waf/pantry/postgresql.org/libpq/v18.0.0/lib
-        run: zig build pg-test
+        # libpq is a shared library and brings its own transitive ones — OpenSSL and
+        # Kerberos among them — all installed under the Pantry prefix. Every lib
+        # directory in that prefix goes on the loader path rather than a list of
+        # named ones, so a dependency gaining a new transitive library does not turn
+        # into "cannot open shared object file" here.
+        run: |
+          export LD_LIBRARY_PATH="$(find pantry -maxdepth 4 -type d -name lib | tr '\n' ':')$LD_LIBRARY_PATH"
+          zig build pg-test
