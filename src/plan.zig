@@ -196,6 +196,9 @@ pub const CompileError = std.mem.Allocator.Error || error{
     /// A directive that is recognized but deliberately not implemented — see
     /// `isUnimplementedDirective`.
     UnimplementedDirective,
+    /// An `XML:` target whose XPath the engine cannot evaluate. Compiling it would
+    /// leave a rule that cannot match — see `isEvaluableXmlSelector`.
+    UnsupportedXmlSelector,
 };
 
 /// Supplies the bytes of an operator data file (`@pmFromFile`, `@ipMatchFromFile`)
@@ -238,6 +241,7 @@ pub const DiagnosticCode = enum {
     unknown_operator,
     unimplemented_action,
     unimplemented_directive,
+    unsupported_xml_selector,
     unknown_dataset,
 
     pub fn id(self: DiagnosticCode) []const u8 {
@@ -253,6 +257,7 @@ pub const DiagnosticCode = enum {
             .unknown_operator => "WAF-PLAN-0124",
             .unimplemented_action => "WAF-PLAN-0125",
             .unimplemented_directive => "WAF-PLAN-0127",
+            .unsupported_xml_selector => "WAF-PLAN-0128",
             .unknown_dataset => "WAF-PLAN-0126",
             .invalid_default_action => "WAF-PLAN-0109",
             .duplicate_default_phase => "WAF-PLAN-0110",
@@ -297,6 +302,7 @@ pub const DiagnosticCode = enum {
             .unimplemented_action => "action is not implemented, so it would have no effect",
             .unimplemented_directive => "directive is not implemented, so it would have no effect",
             .unknown_dataset => "dataset is not declared by any SecDataset, so the set would be empty",
+            .unsupported_xml_selector => "XML target uses an XPath the engine cannot evaluate, so the rule could never match (only /* and //@* are supported)",
         };
     }
 };
@@ -1477,6 +1483,7 @@ const Compiler = struct {
         if (directive.parsed_targets.len > self.limits.max_targets -| self.targets.items.len) return error.TooManyTargets;
         const targets_start = try typedIndex(self.targets.items.len);
         for (directive.parsed_targets) |target| {
+            if (!isEvaluableXmlSelector(target)) return self.fail(error.UnsupportedXmlSelector, directive.physical, null);
             try self.targets.append(self.allocator, .{
                 .raw = try self.interner.intern(target.raw),
                 .modifier = target.modifier,
@@ -2987,6 +2994,25 @@ fn hasAction(actions: []const seclang.syntax.Action, name: []const u8) bool {
     return false;
 }
 
+/// The `XML:` selectors the engine can actually evaluate.
+///
+/// The XML body processor flattens a document into two pseudo-selectors — `/*` for
+/// element text and `//@*` for attribute values — which is what CRS 4.28 uses
+/// (every one of its 177 `XML:` targets is one or both of those). A rule naming any
+/// other XPath expression would resolve to nothing: not a rule that fails to match,
+/// but a rule that *cannot* match, silently, while reading as though it inspects the
+/// document. That is the same reasoning that rejects an unknown operator, so it gets
+/// the same answer — refuse to compile it and say why.
+///
+/// General XPath needs the libxml2 adapter in `src/xml2.zig` to be wired to target
+/// resolution, which is tracked as the remainder of #28. Until then, refusing is the
+/// honest response; the alternative is a configuration that looks enforced.
+fn isEvaluableXmlSelector(target: seclang.syntax.Target) bool {
+    if (collections.Name.parse(target.collection) != .xml) return true;
+    const selector = target.selector orelse return true; // bare `XML` is the whole document
+    return std.mem.eql(u8, selector, "/*") or std.mem.eql(u8, selector, "//@*");
+}
+
 /// Actions that are recognized but deliberately not implemented, and are therefore
 /// rejected rather than accepted and ignored. Every one of these is also rejected
 /// by ModSecurity 3.0.16's parser ("Action: X is not yet supported",
@@ -3134,6 +3160,7 @@ fn diagnosticCode(cause: anyerror) ?DiagnosticCode {
         error.UnimplementedAction => .unimplemented_action,
         error.UnimplementedDirective => .unimplemented_directive,
         error.UnknownDataset => .unknown_dataset,
+        error.UnsupportedXmlSelector => .unsupported_xml_selector,
         error.UnterminatedMacro => .unterminated_macro,
         error.EmptyMacroExpression => .empty_macro_expression,
         else => null,
@@ -4643,4 +4670,38 @@ test "a directive that would silently do nothing is refused" {
     var outcome = try compileOutcome(std.testing.allocator, &parsed.registry, &documents, .{});
     defer outcome.deinit();
     try std.testing.expectEqual(DiagnosticCode.unimplemented_directive, outcome.diagnostic.code);
+}
+
+test "an XML target the engine cannot evaluate is refused, not silently unmatched" {
+    // CRS 4.28 uses only /* and //@*, so these compile.
+    for ([_][]const u8{
+        "SecRule XML:/* \"@rx attack\" \"id:1,phase:2,deny\"",
+        "SecRule XML://@* \"@rx attack\" \"id:2,phase:2,deny\"",
+        "SecRule \"XML:/*|XML://@*\" \"@rx attack\" \"id:3,phase:2,deny\"",
+        "SecRule XML \"@rx attack\" \"id:4,phase:2,deny\"",
+    }) |input| {
+        var parsed = try seclang.parser.parseBytes(std.testing.allocator, "xml-ok.conf", input, .{}, .{});
+        defer parsed.deinit();
+        var documents = [_]seclang.parser.Document{parsed.document};
+        const compiled = try compile(std.testing.allocator, &parsed.registry, &documents, .{});
+        defer compiled.deinit();
+    }
+
+    // An arbitrary XPath cannot be evaluated, so the rule could never match. Refusing
+    // it is the same call as an unknown operator: a rule that reads as though it
+    // inspects the document and cannot is worse than a configuration error.
+    var parsed = try seclang.parser.parseBytes(
+        std.testing.allocator,
+        "xml-bad.conf",
+        "SecRule XML:/order/item/text() \"@rx attack\" \"id:5,phase:2,deny\"",
+        .{},
+        .{},
+    );
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    try std.testing.expectError(
+        error.UnsupportedXmlSelector,
+        compile(std.testing.allocator, &parsed.registry, &documents, .{}),
+    );
+    try std.testing.expectEqualStrings("WAF-PLAN-0128", DiagnosticCode.unsupported_xml_selector.id());
 }
