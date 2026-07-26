@@ -62,6 +62,12 @@ pub fn main(init: std.process.Init) !void {
         try explain(gpa, io, &args);
     } else if (std.mem.eql(u8, command, "test")) {
         try testRequest(gpa, io, &args);
+    } else if (std.mem.eql(u8, command, "format")) {
+        try format(gpa, io, &args);
+    } else if (std.mem.eql(u8, command, "replay")) {
+        try replay(gpa, io, &args);
+    } else if (std.mem.eql(u8, command, "benchmark")) {
+        try benchmark(gpa, io, &args);
     } else if (std.mem.eql(u8, command, "version")) {
         std.debug.print("zig-waf {s}\n", .{waf.version});
     } else if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
@@ -82,10 +88,256 @@ fn usage() void {
         \\  zig-waf explain <file.conf>       list the compiled rules (phase, id, action, location)
         \\  zig-waf test <file.conf> [METHOD] [URI] [BODY] [CONTENT-TYPE] [--status N] [--response-body TEXT] [--response-type CT]
         \\      run a request (and optional simulated response) through the engine and report the decision
+        \\  zig-waf format <file.conf>        print the config with one directive per logical line
+        \\  zig-waf replay <file.conf> <request.txt>
+        \\      replay a recorded HTTP request through the engine and report the decision
+        \\  zig-waf benchmark <file.conf> [ITERATIONS] [URI]
+        \\      time rule evaluation for a request against a compiled rule set
         \\  zig-waf version                   print the engine version
         \\  zig-waf help                      show this help
         \\
     , .{});
+}
+
+/// Print a config canonically: one directive per line, continuations joined,
+/// comments and blank lines dropped.
+///
+/// This deliberately reprints what the *parser* saw rather than reflowing the
+/// original text. A formatter that guessed at intent could silently change which
+/// rule a continuation belongs to; printing the parse means the output is by
+/// construction the configuration the engine will run, which is the property that
+/// makes a formatter safe to apply to a security policy.
+fn format(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse {
+        std.debug.print("zig-waf format: expected a config file\n", .{});
+        std.process.exit(2);
+    };
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(bytes);
+
+    var parsed = try waf.seclang.parser.parseBytesOutcome(gpa, path, bytes, .{}, .{});
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .diagnostic => |value| {
+            // A config that does not parse is not formatted: rewriting something the
+            // engine could not read would produce a file nobody can trust.
+            const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
+            defer gpa.free(rendered);
+            std.debug.print("{s}", .{rendered});
+            std.process.exit(1);
+        },
+        .document => |document| document,
+    };
+
+    for (document.directives.items) |directive| {
+        std.debug.print("{s}", .{directive.name});
+        for (directive.arguments) |argument| std.debug.print(" {s}", .{argument.raw});
+        std.debug.print("\n", .{});
+    }
+}
+
+/// Replay a recorded HTTP request against a rule set.
+///
+/// The request file is the request as it went over the wire — a request line, header
+/// lines, a blank line, then the body — which is what an audit record's parts B and
+/// C contain and what a `curl -v` transcript or a proxy capture produces. Replaying
+/// the bytes rather than a reconstructed model is the point: a rule that fires on a
+/// header the recorder normalized away would not be reproduced by anything else.
+fn replay(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const config_path = args.next() orelse {
+        std.debug.print("zig-waf replay: expected a config file\n", .{});
+        std.process.exit(2);
+    };
+    const request_path = args.next() orelse {
+        std.debug.print("zig-waf replay: expected a recorded request file\n", .{});
+        std.process.exit(2);
+    };
+
+    const config_bytes = std.Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ config_path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(config_bytes);
+    const request_bytes = std.Io.Dir.cwd().readFileAlloc(io, request_path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ request_path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(request_bytes);
+
+    var parsed = try waf.seclang.parser.parseBytesOutcome(gpa, config_path, config_bytes, .{}, .{});
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .diagnostic => |value| {
+            const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
+            defer gpa.free(rendered);
+            std.debug.print("{s}", .{rendered});
+            std.process.exit(1);
+        },
+        .document => |document| document,
+    };
+    var documents = [_]waf.seclang.parser.Document{document};
+    const compiled = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+        std.debug.print("{s}: plan compilation failed: {t}\n", .{ config_path, failure });
+        std.process.exit(1);
+    };
+    defer compiled.deinit();
+
+    var builder = waf.engine.Builder.init(gpa);
+    builder.setRetainedPlan(compiled);
+    const engine = builder.build() catch |err| {
+        std.debug.print("{s}: cannot build engine: {t}\n", .{ config_path, err });
+        std.process.exit(1);
+    };
+    defer engine.deinit() catch unreachable;
+
+    const recorded = parseRecordedRequest(request_bytes) orelse {
+        std.debug.print("{s}: not an HTTP request (expected a request line, headers, a blank line, then the body)\n", .{request_path});
+        std.process.exit(1);
+    };
+
+    var transaction = engine.newTransaction();
+    defer transaction.deinit();
+    try transaction.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try transaction.processUri(recorded.target, recorded.method, recorded.version);
+    var headers = std.mem.splitSequence(u8, recorded.headers, "\n");
+    while (headers.next()) |line| {
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        if (trimmed.len == 0) continue;
+        const colon = std.mem.indexOfScalar(u8, trimmed, ':') orelse continue;
+        const name = std.mem.trim(u8, trimmed[0..colon], " \t");
+        const value = std.mem.trim(u8, trimmed[colon + 1 ..], " \t");
+        transaction.addRequestHeader(name, value) catch {};
+    }
+    try transaction.processRequestHeaders();
+    try transaction.evaluatePhase(gpa, .request_headers);
+    if (recorded.body.len != 0) {
+        try transaction.writeRequestBody(recorded.body);
+        try transaction.processRequestBody();
+        try transaction.evaluatePhase(gpa, .request_body);
+    }
+
+    const decision = try transaction.intervention();
+    if (decision) |value| {
+        std.debug.print("{s}: blocked status={d} rules_matched={d}\n", .{
+            request_path,
+            value.status,
+            transaction.matchIntentCount(),
+        });
+        std.process.exit(1);
+    }
+    std.debug.print("{s}: allowed rules_matched={d}\n", .{ request_path, transaction.matchIntentCount() });
+}
+
+/// A recorded request split into its wire parts. Everything borrows the file.
+const RecordedRequest = struct {
+    method: []const u8,
+    target: []const u8,
+    version: []const u8,
+    headers: []const u8,
+    body: []const u8,
+};
+
+fn parseRecordedRequest(bytes: []const u8) ?RecordedRequest {
+    const line_end = std.mem.indexOfScalar(u8, bytes, '\n') orelse return null;
+    const request_line = std.mem.trimEnd(u8, bytes[0..line_end], "\r");
+    var fields = std.mem.tokenizeScalar(u8, request_line, ' ');
+    const method = fields.next() orelse return null;
+    const target = fields.next() orelse return null;
+    // A recorded request without a version is HTTP/1.1 by convention, which is what
+    // a hand-written reproduction usually omits.
+    const version = fields.next() orelse "HTTP/1.1";
+
+    const rest = bytes[line_end + 1 ..];
+    // The blank line ends the headers; a request with none is still valid.
+    const separator = std.mem.indexOf(u8, rest, "\r\n\r\n") orelse std.mem.indexOf(u8, rest, "\n\n");
+    if (separator) |index| {
+        const skip: usize = if (rest[index] == '\r') 4 else 2;
+        return .{
+            .method = method,
+            .target = target,
+            .version = version,
+            .headers = rest[0..index],
+            .body = rest[index + skip ..],
+        };
+    }
+    return .{ .method = method, .target = target, .version = version, .headers = rest, .body = "" };
+}
+
+/// Compile a config and time repeated evaluation of one request through it, so a
+/// rule set's cost can be measured before it is deployed rather than after.
+fn benchmark(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse {
+        std.debug.print("zig-waf benchmark: expected a config file\n", .{});
+        std.process.exit(2);
+    };
+    const iterations_text = args.next() orelse "1000";
+    const iterations = std.fmt.parseInt(usize, iterations_text, 10) catch {
+        std.debug.print("zig-waf benchmark: iterations must be a positive integer\n", .{});
+        std.process.exit(2);
+    };
+    if (iterations == 0) {
+        std.debug.print("zig-waf benchmark: iterations must be a positive integer\n", .{});
+        std.process.exit(2);
+    }
+    const uri = args.next() orelse "/?id=1";
+
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
+        std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
+        std.process.exit(1);
+    };
+    defer gpa.free(bytes);
+    var parsed = try waf.seclang.parser.parseBytesOutcome(gpa, path, bytes, .{}, .{});
+    defer parsed.deinit();
+    const document = switch (parsed.outcome) {
+        .diagnostic => |value| {
+            const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
+            defer gpa.free(rendered);
+            std.debug.print("{s}", .{rendered});
+            std.process.exit(1);
+        },
+        .document => |document| document,
+    };
+    var documents = [_]waf.seclang.parser.Document{document};
+    const compiled = waf.plan.compile(gpa, &parsed.registry, &documents, .{}) catch |failure| {
+        std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
+        std.process.exit(1);
+    };
+
+    // A retained plan is borrowed by the engine, not owned by it, so the caller
+    // frees it — the same ownership the `test` subcommand follows.
+    defer compiled.deinit();
+    var builder = waf.engine.Builder.init(gpa);
+    builder.setRetainedPlan(compiled);
+    const engine = builder.build() catch |err| {
+        std.debug.print("{s}: cannot build engine: {t}\n", .{ path, err });
+        std.process.exit(1);
+    };
+    defer engine.deinit() catch unreachable;
+
+    var blocked: usize = 0;
+    const started = std.Io.Clock.now(.awake, io);
+    for (0..iterations) |_| {
+        var transaction = engine.newTransaction();
+        defer transaction.deinit();
+        transaction.processConnection("192.0.2.1", 1234, "198.51.100.1", 443) catch continue;
+        transaction.processUri(uri, "GET", "HTTP/1.1") catch continue;
+        transaction.processRequestHeaders() catch continue;
+        transaction.evaluatePhase(gpa, .request_headers) catch continue;
+        const decision = transaction.intervention() catch continue;
+        if (decision != null) blocked += 1;
+    }
+    const elapsed: u64 = @intCast(started.durationTo(std.Io.Clock.now(.awake, io)).nanoseconds);
+
+    // Per-request nanoseconds is the number that matters for a request path; the
+    // blocked count is reported so a benchmark that measured nothing (a rule set
+    // that never matched the sample request) is visible rather than misleading.
+    std.debug.print(
+        "benchmark rules={d} iterations={d} ns_per_request={d} blocked={d}\n",
+        .{ compiled.rules.len, iterations, elapsed / iterations, blocked },
+    );
 }
 
 /// Compile a config and print one line per rule: index, phase, id, disruptive
