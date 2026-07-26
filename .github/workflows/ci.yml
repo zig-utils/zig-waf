@@ -47,6 +47,38 @@ jobs:
       - name: Install locked LMDB
         working-directory: zig-waf
         run: ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+      - name: Verify dependency pins are authoritative
+        working-directory: zig-waf
+        # Installing must not change a manifest. If it does, the lockfile was not
+        # what the build actually resolved, and every downstream claim about which
+        # versions were built — including the SBOM — describes something else.
+        run: git diff --exit-code pantry.lock package.json deps.yaml build.zig.zon
+      - name: Software bill of materials
+        working-directory: zig-waf
+        # Generated from the pinned manifests rather than an environment scan, so it
+        # describes what the build is defined to use rather than what happened to be
+        # installed on the runner.
+        run: |
+          zig build sbom -Dsbom-timestamp="$(git log -1 --format=%cI)" > sbom.json
+          python3 -c "import json,sys; d=json.load(open('sbom.json')); print('components:', len(d['components'])); sys.exit(0 if d['components'] else 1)"
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: zig-waf/sbom.json
+      - name: Secret scan
+        working-directory: zig-waf
+        # A private key or an obvious credential must never reach a commit. The
+        # patterns live in a file so this step does not match itself, and that file is
+        # the only path excluded — a narrow, explainable hole rather than skipping the
+        # whole workflow directory.
+        #
+        # A floor, not a substitute for a scanning service: it catches the accident of
+        # pasting a key into a fixture, which is how it usually happens.
+        run: |
+          if git grep -nIE -f .github/secret-patterns.txt -- . ':!.github/secret-patterns.txt'; then
+            echo "possible secret committed"; exit 1
+          fi
       - name: Reject Git submodules
         working-directory: zig-waf
         run: test ! -f .gitmodules

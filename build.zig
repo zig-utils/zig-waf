@@ -384,6 +384,21 @@ pub fn build(b: *std.Build) void {
     const body_fuzz_step = b.step("fuzz-bodies", "Run deterministic request-body processor fuzz cases");
     body_fuzz_step.dependOn(&run_body_fuzz.step);
 
+    const sbom_module = b.createModule(.{
+        .root_source_file = b.path("tools/sbom.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const sbom_tool = b.addExecutable(.{ .name = "sbom", .root_module = sbom_module });
+    const run_sbom = b.addRunArtifact(sbom_tool);
+    run_sbom.addArgs(&.{ "build.zig.zon", "pantry.lock" });
+    // The timestamp is an input, not the clock: an SBOM that changes on every run
+    // cannot be compared between builds, which is the property it exists to support.
+    if (b.option([]const u8, "sbom-timestamp", "ISO-8601 timestamp recorded in the SBOM")) |stamp|
+        run_sbom.addArg(stamp);
+    const sbom_step = b.step("sbom", "Generate a CycloneDX SBOM from the pinned manifests");
+    sbom_step.dependOn(&run_sbom.step);
+
     const audit_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/audit_fuzz.zig"),
         .target = target,
