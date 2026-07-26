@@ -267,3 +267,55 @@ jobs:
       - name: Request parsing benchmark
         working-directory: zig-waf
         run: zig build bench-request -Doptimize=ReleaseFast
+
+  # The fleet control-plane's storage layer talks to a real PostgreSQL rather than a
+  # fake, because what it has to get right — partition routing, cursor pagination,
+  # single-statement claims, unique-violation semantics, COPY — is exactly what a
+  # fake would define away. A separate job, so a database problem reads as a database
+  # problem instead of failing the engine suite.
+  fleet-storage:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: waf-ci
+          POSTGRES_DB: waf
+        ports:
+          - 5432:5432
+        # Without this the job races the container's startup and fails on connect.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: zig-waf
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1441+d5181a9c9
+      - name: Install Pantry 0.10.47
+        env:
+          PANTRY_VERSION: 0.10.47
+        run: curl -fsSL https://pantry.dev | bash
+      - name: Install the locked libraries this suite links
+        working-directory: zig-waf
+        run: |
+          ~/.local/bin/pantry install postgresql.org/libpq@18
+          ~/.local/bin/pantry install facebook.com/zstd@1.5.7
+          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+      - name: Restore manifests after install
+        working-directory: zig-waf
+        # Same reason as the test job: installing by name rewrites deps.yaml, and the
+        # committed manifests are the source of truth for what this build uses.
+        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
+      - name: Fleet storage integration tests
+        working-directory: zig-waf
+        env:
+          # A real server, over TCP. The tests each take a private schema, so they
+          # can share one database without contending on DDL.
+          PG_TEST_DSN: host=127.0.0.1 port=5432 user=postgres password=waf-ci dbname=waf
+          LD_LIBRARY_PATH: ${{ github.workspace }}/zig-waf/pantry/postgresql.org/libpq/v18.0.0/lib
+        run: zig build pg-test

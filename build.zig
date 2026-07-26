@@ -113,8 +113,19 @@ pub fn build(b: *std.Build) void {
     // runner. Kept out of the default `test` step (it links libpq and its
     // integration tests need a live database); run it with `zig build pg-test`
     // after setting PG_TEST_DSN.
+    //
+    // The shared library's extension follows the host, so the same step builds on a
+    // developer's macOS and on a Linux runner. Naming one of them would not fail at
+    // configure time — it fails when the linker is already running, which reads as a
+    // broken build rather than as an unportable path.
+    const libpq_prefix = "pantry/postgresql.org/libpq/v18.0.0";
+    const libpq_library = switch (target.result.os.tag) {
+        .macos, .ios, .tvos, .watchos => libpq_prefix ++ "/lib/libpq.dylib",
+        .windows => libpq_prefix ++ "/lib/libpq.lib",
+        else => libpq_prefix ++ "/lib/libpq.so",
+    };
     const pq_translate = b.addTranslateC(.{
-        .root_source_file = b.path("pantry/postgresql.org/libpq/v18.0.0/include/libpq-fe.h"),
+        .root_source_file = b.path(libpq_prefix ++ "/include/libpq-fe.h"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -149,8 +160,8 @@ pub fn build(b: *std.Build) void {
     });
     pg_module.addImport("pq", pq_module);
     pg_module.addImport("zstd", zstd_module);
-    pg_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
-    pg_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
+    pg_module.addIncludePath(b.path(libpq_prefix ++ "/include"));
+    pg_module.addObjectFile(b.path(libpq_library));
     const pg_tests = b.addTest(.{ .root_module = pg_module });
     const run_pg_tests = b.addRunArtifact(pg_tests);
     const pg_test_step = b.step("pg-test", "Run PostgreSQL integration tests (needs PG_TEST_DSN)");
@@ -167,8 +178,8 @@ pub fn build(b: *std.Build) void {
     });
     fleet_module.addImport("pq", pq_module);
     fleet_module.addImport("zstd", zstd_module);
-    fleet_module.addIncludePath(b.path("pantry/postgresql.org/libpq/v18.0.0/include"));
-    fleet_module.addObjectFile(b.path("pantry/postgresql.org/libpq/v18.0.0/lib/libpq.dylib"));
+    fleet_module.addIncludePath(b.path(libpq_prefix ++ "/include"));
+    fleet_module.addObjectFile(b.path(libpq_library));
     const ingestion_benchmark_module = b.createModule(.{
         .root_source_file = b.path("benchmarks/ingestion.zig"),
         .target = target,
