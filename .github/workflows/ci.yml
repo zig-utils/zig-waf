@@ -226,6 +226,20 @@ jobs:
       - name: Deterministic operator fuzzing
         working-directory: zig-waf
         run: zig build fuzz-operators -Doperator-fuzz-iterations=10000
+      - name: Request-path release gate
+        working-directory: zig-waf
+        # Thresholds with roughly an order of magnitude of headroom over what this
+        # rule set measures (p99 ~10us, ~125k rps, ~4MB on a developer machine). A
+        # shared runner is several times slower than a laptop, so a tight bound would
+        # fail for reasons unrelated to the change — and a gate that cries wolf gets
+        # disabled. These catch a regression in kind: a rule set recompiling per
+        # request, an allocation that became a leak, a matcher that lost its cache.
+        run: >-
+          zig build gate-request-path -Doptimize=ReleaseFast
+          -Dgate-iterations=20000
+          -Dgate-max-p99-ns=200000
+          -Dgate-min-throughput=5000
+          -Dgate-max-rss-bytes=268435456
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast

@@ -384,6 +384,32 @@ pub fn build(b: *std.Build) void {
     const body_fuzz_step = b.step("fuzz-bodies", "Run deterministic request-body processor fuzz cases");
     body_fuzz_step.dependOn(&run_body_fuzz.step);
 
+    // Request-path release gate (#40): throughput, tail latency, and peak RSS.
+    const request_path_module = b.createModule(.{
+        .root_source_file = b.path("benchmarks/request_path.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    request_path_module.addImport("waf", waf);
+    const request_path_gate = b.addExecutable(.{
+        .name = "request-path-gate",
+        .root_module = request_path_module,
+    });
+    const run_request_path_gate = b.addRunArtifact(request_path_gate);
+    const gate_iterations = b.option(usize, "gate-iterations", "Request-path gate iteration count") orelse 20_000;
+    // Zero disables a threshold, so the same binary measures and enforces.
+    const gate_p99 = b.option(u64, "gate-max-p99-ns", "Fail when p99 request latency exceeds this") orelse 0;
+    const gate_throughput = b.option(u64, "gate-min-throughput", "Fail when throughput falls below this (requests/second)") orelse 0;
+    const gate_rss = b.option(u64, "gate-max-rss-bytes", "Fail when peak RSS exceeds this") orelse 0;
+    run_request_path_gate.addArgs(&.{
+        b.fmt("{d}", .{gate_iterations}),
+        b.fmt("{d}", .{gate_p99}),
+        b.fmt("{d}", .{gate_throughput}),
+        b.fmt("{d}", .{gate_rss}),
+    });
+    const gate_step = b.step("gate-request-path", "Enforce request-path throughput, p99, and RSS thresholds");
+    gate_step.dependOn(&run_request_path_gate.step);
+
     const matrix_module = b.createModule(.{
         .root_source_file = b.path("tools/matrix.zig"),
         .target = target,
