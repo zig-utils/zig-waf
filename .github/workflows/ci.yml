@@ -44,13 +44,18 @@ jobs:
         env:
           PANTRY_VERSION: 0.10.47
         run: curl -fsSL https://pantry.dev | bash
-      - name: Install locked dependencies
+      - name: Install locked LMDB
         working-directory: zig-waf
-        # Install what the manifests declare, rather than naming a package. Naming one
-        # re-adds it — leaving a duplicate key in deps.yaml and rewriting the lock —
-        # which makes the manifests describe the install instead of the install
-        # following the manifests.
-        run: ~/.local/bin/pantry install
+        run: ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+      - name: Restore manifests after install
+        working-directory: zig-waf
+        # Pantry rewrites the manifests as a side effect of installing: naming a
+        # package re-adds it to deps.yaml, and a bare install strips the Zig
+        # dependencies out of build.zig.zon entirely (which breaks configure). The
+        # committed manifests are the source of truth for what this build uses, so
+        # they are restored before anything reads them — in particular the SBOM,
+        # which must describe the repository rather than the runner.
+        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
       - name: Verify the SBOM covers every declared dependency
         working-directory: zig-waf
         # Not "installing changes no manifest": Pantry rewrites build.zig.zon as part
