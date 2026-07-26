@@ -384,6 +384,23 @@ pub fn build(b: *std.Build) void {
     const body_fuzz_step = b.step("fuzz-bodies", "Run deterministic request-body processor fuzz cases");
     body_fuzz_step.dependOn(&run_body_fuzz.step);
 
+    const audit_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/audit_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    audit_fuzz_module.addImport("waf", waf);
+    const audit_fuzz = b.addExecutable(.{
+        .name = "audit-fuzz",
+        .root_module = audit_fuzz_module,
+    });
+    const run_audit_fuzz = b.addRunArtifact(audit_fuzz);
+    const audit_fuzz_iterations = b.option(usize, "audit-fuzz-iterations", "Deterministic audit-serialization fuzz case count") orelse 5_000;
+    const audit_fuzz_seed = b.option(u64, "audit-fuzz-seed", "Deterministic audit-serialization fuzz seed") orelse 7_043_215_681_320_074_321;
+    run_audit_fuzz.addArgs(&.{ b.fmt("{d}", .{audit_fuzz_iterations}), b.fmt("{d}", .{audit_fuzz_seed}) });
+    const audit_fuzz_step = b.step("fuzz-audit", "Run deterministic audit-serialization fuzz cases");
+    audit_fuzz_step.dependOn(&run_audit_fuzz.step);
+
     const action_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/action_fuzz.zig"),
         .target = target,

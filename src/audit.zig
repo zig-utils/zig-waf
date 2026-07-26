@@ -526,19 +526,76 @@ fn appendHeaderObjectJoined(out: *std.ArrayList(u8), allocator: std.mem.Allocato
 }
 
 /// Append `value` as a JSON string literal with the mandatory escapes.
+///
+/// A request may contain any bytes at all — a URI, a header, or a body is not
+/// required to be UTF-8, and an attacker chooses them. JSON strings *are* required
+/// to be UTF-8, so a byte sequence that is not valid UTF-8 is replaced with U+FFFD
+/// rather than copied through. Copying it through produced a document a log consumer
+/// could not parse, which let a request make the record of its own attack
+/// unreadable.
 fn appendJsonString(out: *std.ArrayList(u8), allocator: std.mem.Allocator, value: []const u8) !void {
     try out.append(allocator, '"');
-    for (value) |byte| {
+    var index: usize = 0;
+    while (index < value.len) {
+        const byte = value[index];
         switch (byte) {
-            '"' => try out.appendSlice(allocator, "\\\""),
-            '\\' => try out.appendSlice(allocator, "\\\\"),
-            '\n' => try out.appendSlice(allocator, "\\n"),
-            '\r' => try out.appendSlice(allocator, "\\r"),
-            '\t' => try out.appendSlice(allocator, "\\t"),
-            0x08 => try out.appendSlice(allocator, "\\b"),
-            0x0C => try out.appendSlice(allocator, "\\f"),
-            0...7, 0x0B, 0x0E...0x1F => try appendFmt(out, allocator, "\\u{x:0>4}", .{byte}),
-            else => try out.append(allocator, byte),
+            '"' => {
+                try out.appendSlice(allocator, "\\\"");
+                index += 1;
+            },
+            '\\' => {
+                try out.appendSlice(allocator, "\\\\");
+                index += 1;
+            },
+            '\n' => {
+                try out.appendSlice(allocator, "\\n");
+                index += 1;
+            },
+            '\r' => {
+                try out.appendSlice(allocator, "\\r");
+                index += 1;
+            },
+            '\t' => {
+                try out.appendSlice(allocator, "\\t");
+                index += 1;
+            },
+            0x08 => {
+                try out.appendSlice(allocator, "\\b");
+                index += 1;
+            },
+            0x0C => {
+                try out.appendSlice(allocator, "\\f");
+                index += 1;
+            },
+            0...7, 0x0B, 0x0E...0x1F => {
+                try appendFmt(out, allocator, "\\u{x:0>4}", .{byte});
+                index += 1;
+            },
+            // Printable ASCII minus the quote (0x22) and backslash (0x5C), which the
+            // cases above already handled.
+            0x20...0x21, 0x23...0x5B, 0x5D...0x7F => {
+                try out.append(allocator, byte);
+                index += 1;
+            },
+            else => {
+                // A multi-byte sequence is copied only if it is well-formed; anything
+                // else becomes the replacement character, one per offending byte, so
+                // the value's length still reflects that bytes were there.
+                const sequence_len = std.unicode.utf8ByteSequenceLength(byte) catch {
+                    try out.appendSlice(allocator, "\u{fffd}");
+                    index += 1;
+                    continue;
+                };
+                if (index + sequence_len > value.len or
+                    !std.unicode.utf8ValidateSlice(value[index..][0..sequence_len]))
+                {
+                    try out.appendSlice(allocator, "\u{fffd}");
+                    index += 1;
+                    continue;
+                }
+                try out.appendSlice(allocator, value[index..][0..sequence_len]);
+                index += sequence_len;
+            },
         }
     }
     try out.append(allocator, '"');
@@ -903,4 +960,35 @@ test "serializers survive tricky bytes and JSON formats stay parseable" {
             }
         }
     }
+}
+
+test "a request that is not UTF-8 still produces parseable JSON" {
+    // A URI, header, or body is not required to be UTF-8 and an attacker chooses its
+    // bytes; a JSON string is required to be UTF-8. Copying the bytes through
+    // produced a document a log consumer could not parse — letting a request make
+    // the record of its own attack unreadable. Found by `zig build fuzz-audit`.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(testing.allocator);
+
+    // A lone continuation byte, a truncated sequence, and an overlong-looking lead.
+    try appendJsonString(&out, testing.allocator, "a\x80b\xC3z\xF0\x9F");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer parsed.deinit();
+    try testing.expect(std.mem.indexOf(u8, parsed.value.string, "a") != null);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.string, "\u{fffd}") != null);
+
+    // Well-formed multi-byte text is preserved exactly rather than being mangled by
+    // the same pass.
+    out.clearRetainingCapacity();
+    try appendJsonString(&out, testing.allocator, "naïve → 日本語");
+    var kept = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer kept.deinit();
+    try testing.expectEqualStrings("naïve → 日本語", kept.value.string);
+
+    // And the escapes that were already correct still are.
+    out.clearRetainingCapacity();
+    try appendJsonString(&out, testing.allocator, "quote\" back\\ tab\t null\x00");
+    var escaped = try std.json.parseFromSlice(std.json.Value, testing.allocator, out.items, .{});
+    defer escaped.deinit();
+    try testing.expectEqualStrings("quote\" back\\ tab\t null\x00", escaped.value.string);
 }

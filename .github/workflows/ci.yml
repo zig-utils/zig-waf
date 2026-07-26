@@ -135,6 +135,9 @@ jobs:
       - name: Deterministic request-body processor fuzzing
         working-directory: zig-waf
         run: zig build fuzz-bodies -Dbody-fuzz-iterations=10000
+      - name: Deterministic audit-serialization fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-audit -Daudit-fuzz-iterations=5000
       - name: Deterministic non-disruptive action fuzzing
         working-directory: zig-waf
         run: zig build fuzz-actions -Daction-fuzz-iterations=10000

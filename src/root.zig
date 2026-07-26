@@ -6,6 +6,7 @@ pub const action_config = @import("action_config.zig");
 pub const action_evidence = @import("action_evidence.zig");
 pub const action_fuzz = @import("action_fuzz.zig");
 pub const body_fuzz = @import("body_fuzz.zig");
+pub const audit_fuzz = @import("audit_fuzz.zig");
 pub const collections = @import("collections.zig");
 pub const directives = @import("directives.zig");
 pub const engine = @import("engine.zig");
