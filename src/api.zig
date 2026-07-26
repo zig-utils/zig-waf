@@ -294,7 +294,26 @@ test "every path parameter is declared, and declares nothing the path does not h
         var method_entries = path_entry.value_ptr.object.iterator();
         while (method_entries.next()) |method_entry| {
             const operation = method_entry.value_ptr.object;
-            const declared = if (operation.get("parameters")) |value| value.array.items else &.{};
+            const all = if (operation.get("parameters")) |value| value.array.items else &.{};
+
+            // Path parameters are checked against the template; query parameters are
+            // checked for shape only, since the template says nothing about them.
+            var declared: std.ArrayList(std.json.Value) = .empty;
+            defer declared.deinit(testing.allocator);
+            for (all) |parameter| {
+                const location = parameter.object.get("in").?.string;
+                if (std.mem.eql(u8, location, "path")) {
+                    try declared.append(testing.allocator, parameter);
+                    continue;
+                }
+                try testing.expectEqualStrings("query", location);
+                // Optionality must be stated rather than left to a generator's
+                // default, which would silently turn a mandatory filter — the node a
+                // search is scoped to — into one a caller may omit.
+                const required = parameter.object.get("required") orelse return error.QueryParameterOptionalityUnstated;
+                try testing.expect(required == .bool);
+                try testing.expect(parameter.object.get("schema") != null);
+            }
 
             // Every `{name}` in the template is declared, in order, as a required
             // path parameter.
@@ -305,11 +324,11 @@ test "every path parameter is declared, and declares nothing the path does not h
                 const name = rest[open + 1 .. close];
                 rest = rest[close + 1 ..];
 
-                if (index >= declared.len) {
+                if (index >= declared.items.len) {
                     std.debug.print("undeclared path parameter: {s} in {s}\n", .{ name, template });
                     return error.PathParameterUndeclared;
                 }
-                const parameter = declared[index].object;
+                const parameter = declared.items[index].object;
                 try testing.expectEqualStrings(name, parameter.get("name").?.string);
                 try testing.expectEqualStrings("path", parameter.get("in").?.string);
                 // OpenAPI requires `required: true` on a path parameter; a client
@@ -318,7 +337,7 @@ test "every path parameter is declared, and declares nothing the path does not h
                 try testing.expect(parameter.get("schema") != null);
                 index += 1;
             }
-            if (index != declared.len) {
+            if (index != declared.items.len) {
                 std.debug.print("declared parameter not in path: {s}\n", .{template});
                 return error.ParameterNotInPath;
             }
@@ -370,6 +389,127 @@ test "every failure is the one documented error shape, and every reference resol
         try testing.expectEqualStrings("#/components/schemas/Error", schema.get("$ref").?.string);
     }
     try testing.expect(resolves(root, "#/components/schemas/Error"));
+}
+
+test "every operation describes what it returns and what it accepts" {
+    // An operation documented as returning 200 with no body shape tells a client
+    // nothing it can be written against, which is the state this document was in:
+    // thirty-four operations, none of them describing a payload.
+    const document = @embedFile("api-v1.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, document, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    var referenced: std.StringHashMapUnmanaged(void) = .empty;
+    defer referenced.deinit(testing.allocator);
+
+    const paths = root.get("paths").?.object;
+    var path_entries = paths.iterator();
+    while (path_entries.next()) |path_entry| {
+        var method_entries = path_entry.value_ptr.object.iterator();
+        while (method_entries.next()) |method_entry| {
+            const operation = method_entry.value_ptr.object;
+            const name = operation.get("operationId").?.string;
+
+            if (operation.get("requestBody")) |body| {
+                // A request body that is not required is one the server must handle
+                // both with and without, doubling the cases every handler gets right.
+                try testing.expect(body.object.get("required").?.bool);
+                const schema = try onlyContentSchema(body.object.get("content").?.object);
+                try collectReferences(testing.allocator, &referenced, root, schema);
+            }
+
+            var success_seen = false;
+            var status_entries = operation.get("responses").?.object.iterator();
+            while (status_entries.next()) |status_entry| {
+                const status = status_entry.key_ptr.*;
+                if (status[0] != '2') continue;
+                success_seen = true;
+                const body = status_entry.value_ptr.object;
+                if (std.mem.eql(u8, status, "204")) {
+                    // 204 means no body; declaring content for one is a contradiction
+                    // a client resolves by guessing.
+                    try testing.expect(body.get("content") == null);
+                    continue;
+                }
+                const content = body.get("content") orelse {
+                    std.debug.print("no response body shape: {s}\n", .{name});
+                    return error.ResponseBodyUndescribed;
+                };
+                const schema = try onlyContentSchema(content.object);
+                try collectReferences(testing.allocator, &referenced, root, schema);
+            }
+            try testing.expect(success_seen);
+        }
+    }
+
+    // Follow references through the schemas themselves: a resource is usually
+    // reachable only via the collection that lists it, so stopping at the operations
+    // would report most of the document as unused.
+    const schemas = root.get("components").?.object.get("schemas").?.object;
+    var grew = true;
+    while (grew) {
+        grew = false;
+        var reachable = referenced.keyIterator();
+        var pending: std.ArrayList([]const u8) = .empty;
+        defer pending.deinit(testing.allocator);
+        while (reachable.next()) |name| try pending.append(testing.allocator, name.*);
+        for (pending.items) |name| {
+            const before = referenced.count();
+            try collectReferences(testing.allocator, &referenced, root, schemas.get(name).?);
+            if (referenced.count() != before) grew = true;
+        }
+    }
+
+    // A schema nothing points at is dead weight that still reads as part of the
+    // contract, so it either gets used or gets deleted.
+    var declared = schemas.iterator();
+    while (declared.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "Error")) continue; // reached via components.responses
+        if (!referenced.contains(entry.key_ptr.*)) {
+            std.debug.print("schema declared but never used: {s}\n", .{entry.key_ptr.*});
+            return error.SchemaUnreferenced;
+        }
+    }
+}
+
+/// The schema of a content map that must describe exactly one media type. More than
+/// one would mean the operation returns different shapes depending on what the caller
+/// asked for, which every reference in this document treats as a mistake rather than
+/// a feature.
+fn onlyContentSchema(content: std.json.ObjectMap) !std.json.Value {
+    if (content.count() != 1) return error.AmbiguousMediaType;
+    var entries = content.iterator();
+    return entries.next().?.value_ptr.object.get("schema") orelse error.MediaTypeHasNoSchema;
+}
+
+/// Record every schema reference in a JSON subtree, checking that each resolves.
+/// Walks the whole subtree rather than known keys, so a reference in a shape this
+/// document does not use yet is still followed rather than quietly missed.
+fn collectReferences(
+    allocator: std.mem.Allocator,
+    into: *std.StringHashMapUnmanaged(void),
+    root: std.json.ObjectMap,
+    value: std.json.Value,
+) !void {
+    switch (value) {
+        .object => |fields| {
+            if (fields.get("$ref")) |reference| {
+                if (reference != .string or !resolves(root, reference.string))
+                    return error.UnresolvableReference;
+                const prefix = "#/components/schemas/";
+                if (std.mem.startsWith(u8, reference.string, prefix))
+                    try into.put(allocator, reference.string[prefix.len..], {});
+            }
+            var entries = fields.iterator();
+            while (entries.next()) |entry|
+                try collectReferences(allocator, into, root, entry.value_ptr.*);
+        },
+        .array => |items| {
+            for (items.items) |item| try collectReferences(allocator, into, root, item);
+        },
+        else => {},
+    }
 }
 
 /// Whether a local JSON pointer of the form `#/a/b/c` names something in `root`.

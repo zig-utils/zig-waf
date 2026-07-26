@@ -3,6 +3,10 @@
  "info": {
   "title": "zig-waf control plane",
   "version": "1.0.0",
+  "license": {
+   "name": "MIT",
+   "identifier": "MIT"
+  },
   "description": "The versioned control-plane API. The path prefix carries the version: a breaking change to any operation takes a new prefix rather than mutating one clients already call.\n\nAuthorization is a property of the operation, not of its handler \u2014 every operation declares the action it requires, and an identity that cannot perform that action is refused before the handler runs. src/api.zig holds the same table, and a test fails the build if this document and that table disagree, because a published contract clients are written against must not describe an API that does not exist."
  },
  "servers": [
@@ -49,6 +53,1055 @@
      "detail": {
       "type": "string",
       "description": "Optional context about what specifically was wrong. Never contains credentials, tokens, or the contents of a rejected secret."
+     }
+    }
+   },
+   "Identity": {
+    "type": "object",
+    "description": "Who the caller is and what they may do.",
+    "required": [
+     "email",
+     "role"
+    ],
+    "properties": {
+     "email": {
+      "type": "string",
+      "description": "The identity the credential resolves to.",
+      "format": "email"
+     },
+     "role": {
+      "type": "string",
+      "description": "The role whose permissions apply to this caller.",
+      "enum": [
+       "viewer",
+       "operator",
+       "admin"
+      ]
+     }
+    }
+   },
+   "SessionRequest": {
+    "type": "object",
+    "description": "Credentials presented to start a session.",
+    "required": [
+     "email",
+     "password"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "email": {
+      "type": "string",
+      "description": "The account to authenticate as.",
+      "format": "email"
+     },
+     "password": {
+      "type": "string",
+      "description": "The account password. Never logged, never echoed back.",
+      "format": "password",
+      "writeOnly": true
+     }
+    }
+   },
+   "Session": {
+    "type": "object",
+    "description": "An established session.",
+    "required": [
+     "email",
+     "role",
+     "expires_at"
+    ],
+    "properties": {
+     "email": {
+      "type": "string",
+      "description": "The authenticated identity.",
+      "format": "email"
+     },
+     "role": {
+      "type": "string",
+      "description": "The role the session carries.",
+      "enum": [
+       "viewer",
+       "operator",
+       "admin"
+      ]
+     },
+     "expires_at": {
+      "type": "string",
+      "description": "When the session stops being accepted.",
+      "format": "date-time"
+     }
+    }
+   },
+   "TokenRequest": {
+    "type": "object",
+    "description": "A request to mint an API token.",
+    "required": [
+     "name",
+     "role",
+     "expires_in_seconds"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "A name unique among the caller's tokens, used to revoke it.",
+      "minLength": 1
+     },
+     "role": {
+      "type": "string",
+      "description": "The role the token carries. It cannot exceed the issuer's own role.",
+      "enum": [
+       "viewer",
+       "operator",
+       "admin"
+      ]
+     },
+     "expires_in_seconds": {
+      "type": "integer",
+      "description": "Lifetime from issuance. A token without an expiry is a credential nobody remembers to revoke, so this is required.",
+      "format": "int64",
+      "minimum": 60
+     }
+    }
+   },
+   "Token": {
+    "type": "object",
+    "description": "A freshly issued token. The secret appears in this response and nowhere else: the control plane stores only a hash, so a lost token is reissued rather than recovered.",
+    "required": [
+     "name",
+     "secret",
+     "role",
+     "expires_at"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The token name, used to revoke it."
+     },
+     "secret": {
+      "type": "string",
+      "description": "The bearer credential. Returned once, at issuance.",
+      "readOnly": true
+     },
+     "role": {
+      "type": "string",
+      "description": "The role the token carries.",
+      "enum": [
+       "viewer",
+       "operator",
+       "admin"
+      ]
+     },
+     "expires_at": {
+      "type": "string",
+      "description": "When the token stops being accepted.",
+      "format": "date-time"
+     }
+    }
+   },
+   "Node": {
+    "type": "object",
+    "description": "An enrolled WAF node.",
+    "required": [
+     "node_id",
+     "hostname",
+     "version",
+     "status"
+    ],
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "description": "The node identifier, assigned at enrollment and stable for its life."
+     },
+     "hostname": {
+      "type": "string",
+      "description": "The host the node reported at its last enrollment."
+     },
+     "version": {
+      "type": "string",
+      "description": "The engine version the node reported."
+     },
+     "status": {
+      "type": "string",
+      "description": "Lifecycle state. A node is active from enrollment until it is retired.",
+      "enum": [
+       "active",
+       "retired"
+      ]
+     },
+     "last_seen_at": {
+      "description": "The last heartbeat, or null if the node has never sent one.",
+      "type": [
+       "string",
+       "null"
+      ],
+      "format": "date-time"
+     }
+    }
+   },
+   "NodeList": {
+    "type": "object",
+    "description": "Enrolled nodes, with the inventory counts behind them.",
+    "required": [
+     "nodes"
+    ],
+    "properties": {
+     "nodes": {
+      "type": "array",
+      "description": "The nodes, ordered by identifier.",
+      "items": {
+       "$ref": "#/components/schemas/Node"
+      }
+     },
+     "active": {
+      "type": "integer",
+      "description": "How many nodes are active.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "retired": {
+      "type": "integer",
+      "description": "How many nodes are retired.",
+      "format": "int64",
+      "minimum": 0
+     }
+    }
+   },
+   "EnrollmentRequest": {
+    "type": "object",
+    "description": "An enrollment. Idempotent: re-enrolling an existing node refreshes its hostname and version rather than failing, so a node that restarts mid-enrollment is not stuck.",
+    "required": [
+     "node_id",
+     "hostname",
+     "version"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "description": "The identifier to enroll under.",
+      "minLength": 1
+     },
+     "hostname": {
+      "type": "string",
+      "description": "The host the node runs on.",
+      "minLength": 1
+     },
+     "version": {
+      "type": "string",
+      "description": "The engine version the node runs.",
+      "minLength": 1
+     }
+    }
+   },
+   "Heartbeat": {
+    "type": "object",
+    "description": "The result of a heartbeat.",
+    "required": [
+     "last_seen_at"
+    ],
+    "properties": {
+     "last_seen_at": {
+      "type": "string",
+      "description": "The heartbeat the control plane recorded.",
+      "format": "date-time"
+     }
+    }
+   },
+   "LabelRequest": {
+    "type": "object",
+    "description": "A label value used to target rollouts.",
+    "required": [
+     "value"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "value": {
+      "type": "string",
+      "description": "The value to set for this label key.",
+      "minLength": 1
+     }
+    }
+   },
+   "Policy": {
+    "type": "object",
+    "description": "A named rule-set bundle.",
+    "required": [
+     "name",
+     "latest_version"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The policy name."
+     },
+     "latest_version": {
+      "type": "integer",
+      "description": "The highest published version.",
+      "format": "int64",
+      "minimum": 1
+     }
+    }
+   },
+   "PolicyList": {
+    "type": "object",
+    "description": "Published policies.",
+    "required": [
+     "policies"
+    ],
+    "properties": {
+     "policies": {
+      "type": "array",
+      "description": "The policies, ordered by name.",
+      "items": {
+       "$ref": "#/components/schemas/Policy"
+      }
+     }
+    }
+   },
+   "PolicyPublication": {
+    "type": "object",
+    "description": "A new policy version. Versions are immutable: republishing an existing (name, version) is a conflict rather than an overwrite, because a node that already applied that version would otherwise be running different rules from one that fetches it later.",
+    "required": [
+     "name",
+     "version",
+     "content"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The policy to publish under.",
+      "minLength": 1
+     },
+     "version": {
+      "type": "integer",
+      "description": "The version number, which must not already exist.",
+      "format": "int64",
+      "minimum": 1
+     },
+     "content": {
+      "type": "string",
+      "description": "The SecLang bundle."
+     },
+     "signature": {
+      "type": "string",
+      "description": "Optional Ed25519 signature over the content, base64. A node verifies it before applying the bundle, so a bundle altered in transit is refused rather than enforced."
+     }
+    }
+   },
+   "PolicyVersion": {
+    "type": "object",
+    "description": "One immutable version of a policy.",
+    "required": [
+     "name",
+     "version",
+     "content"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The policy name."
+     },
+     "version": {
+      "type": "integer",
+      "description": "The version number.",
+      "format": "int64",
+      "minimum": 1
+     },
+     "content": {
+      "type": "string",
+      "description": "The SecLang bundle."
+     },
+     "signature": {
+      "description": "The Ed25519 signature over the content, base64, or null if the version was published unsigned.",
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    }
+   },
+   "Rule": {
+    "type": "object",
+    "description": "One rule within a policy version.",
+    "required": [
+     "id",
+     "phase"
+    ],
+    "properties": {
+     "id": {
+      "type": "integer",
+      "description": "The rule id from its `id:` action.",
+      "format": "int64"
+     },
+     "phase": {
+      "type": "integer",
+      "description": "The phase the rule evaluates in.",
+      "format": "int32",
+      "minimum": 1,
+      "maximum": 5
+     },
+     "message": {
+      "type": "string",
+      "description": "The rule's `msg:` text, empty when it declares none."
+     },
+     "source": {
+      "type": "string",
+      "description": "The rule as written."
+     }
+    }
+   },
+   "RuleList": {
+    "type": "object",
+    "description": "The rules a policy version contains.",
+    "required": [
+     "rules"
+    ],
+    "properties": {
+     "rules": {
+      "type": "array",
+      "description": "The rules, in the order the engine evaluates them.",
+      "items": {
+       "$ref": "#/components/schemas/Rule"
+      }
+     }
+    }
+   },
+   "SignatureVerification": {
+    "type": "object",
+    "description": "Whether a published version's signature verifies against the control plane's key.",
+    "required": [
+     "verified"
+    ],
+    "properties": {
+     "verified": {
+      "type": "boolean",
+      "description": "True only if a signature is present and valid. An unsigned version verifies as false rather than as trusted."
+     },
+     "reason": {
+      "type": "string",
+      "description": "Why verification failed, when it did."
+     }
+    }
+   },
+   "Exclusion": {
+    "type": "object",
+    "description": "A rule exclusion scoped to a policy.",
+    "required": [
+     "rule_id",
+     "target"
+    ],
+    "properties": {
+     "rule_id": {
+      "type": "integer",
+      "description": "The rule the exclusion applies to.",
+      "format": "int64"
+     },
+     "target": {
+      "type": "string",
+      "description": "The variable or argument excluded, e.g. `ARGS:token`."
+     },
+     "reason": {
+      "type": "string",
+      "description": "Why the exclusion exists. Recorded because an exclusion nobody can justify later is one nobody dares remove."
+     }
+    }
+   },
+   "ExclusionRequest": {
+    "type": "object",
+    "description": "An exclusion to add to a policy.",
+    "required": [
+     "rule_id",
+     "target",
+     "reason"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "rule_id": {
+      "type": "integer",
+      "description": "The rule to exclude.",
+      "format": "int64"
+     },
+     "target": {
+      "type": "string",
+      "description": "The variable or argument to exclude.",
+      "minLength": 1
+     },
+     "reason": {
+      "type": "string",
+      "description": "Why this exclusion is being made."
+     }
+    }
+   },
+   "ExclusionList": {
+    "type": "object",
+    "description": "A policy's exclusions.",
+    "required": [
+     "exclusions"
+    ],
+    "properties": {
+     "exclusions": {
+      "type": "array",
+      "description": "The exclusions, ordered by rule id.",
+      "items": {
+       "$ref": "#/components/schemas/Exclusion"
+      }
+     }
+    }
+   },
+   "RolloutState": {
+    "type": "object",
+    "description": "Where a staged rollout stands. The counts are what `advance` is decided on: a version widens only when every node assigned it is responsive and confirmed.",
+    "required": [
+     "name",
+     "version",
+     "assigned",
+     "unresponsive",
+     "unconfirmed",
+     "healthy"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The policy being rolled out."
+     },
+     "version": {
+      "type": "integer",
+      "description": "The version currently assigned to the cohort.",
+      "format": "int64",
+      "minimum": 1
+     },
+     "assigned": {
+      "type": "integer",
+      "description": "Nodes assigned this version.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "unresponsive": {
+      "type": "integer",
+      "description": "Assigned nodes whose last heartbeat is older than the heartbeat window, or that have never sent one.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "unconfirmed": {
+      "type": "integer",
+      "description": "Assigned nodes that have not reported running this version.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "healthy": {
+      "type": "boolean",
+      "description": "Whether the cohort is evidence the version is safe to widen: non-empty, fully responsive, and fully confirmed."
+     }
+    }
+   },
+   "RolloutAssignment": {
+    "type": "object",
+    "description": "The version to assign, and to whom.",
+    "required": [
+     "version",
+     "node_ids"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "version": {
+      "type": "integer",
+      "description": "The policy version to assign.",
+      "format": "int64",
+      "minimum": 1
+     },
+     "node_ids": {
+      "type": "array",
+      "description": "The nodes to assign it to.",
+      "items": {
+       "type": "string"
+      }
+     }
+    }
+   },
+   "Drift": {
+    "type": "object",
+    "description": "A node running something other than what it was assigned.",
+    "required": [
+     "node_id",
+     "assigned_version"
+    ],
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "description": "The node."
+     },
+     "assigned_version": {
+      "type": "integer",
+      "description": "The version it was assigned.",
+      "format": "int64"
+     },
+     "running_version": {
+      "description": "The version it last reported running, or null if it has never reported one.",
+      "type": [
+       "integer",
+       "null"
+      ],
+      "format": "int64"
+     }
+    }
+   },
+   "DriftList": {
+    "type": "object",
+    "description": "Nodes that have drifted from their assignment.",
+    "required": [
+     "drifted",
+     "count"
+    ],
+    "properties": {
+     "drifted": {
+      "type": "array",
+      "description": "The drifted nodes.",
+      "items": {
+       "$ref": "#/components/schemas/Drift"
+      }
+     },
+     "count": {
+      "type": "integer",
+      "description": "How many nodes have drifted.",
+      "format": "int64",
+      "minimum": 0
+     }
+    }
+   },
+   "Event": {
+    "type": "object",
+    "description": "One security event recorded by a node.",
+    "required": [
+     "id",
+     "node_id",
+     "occurred_at",
+     "action",
+     "uri"
+    ],
+    "properties": {
+     "id": {
+      "type": "string",
+      "description": "The event's row identifier, as a string because it exceeds the range a JSON number is guaranteed to carry exactly."
+     },
+     "node_id": {
+      "type": "string",
+      "description": "The node that recorded it."
+     },
+     "occurred_at": {
+      "type": "string",
+      "description": "When the node recorded it.",
+      "format": "date-time"
+     },
+     "action": {
+      "type": "string",
+      "description": "What the engine did, e.g. `deny` or `pass`."
+     },
+     "uri": {
+      "type": "string",
+      "description": "The request URI."
+     },
+     "message": {
+      "type": "string",
+      "description": "The rule message."
+     }
+    }
+   },
+   "EventPage": {
+    "type": "object",
+    "description": "A page of events. Paging is by cursor rather than offset: a page is defined by where the previous one ended, so events arriving between requests neither shift rows into a page already read nor skip rows the reader never saw.",
+    "required": [
+     "events"
+    ],
+    "properties": {
+     "events": {
+      "type": "array",
+      "description": "The events, oldest first.",
+      "items": {
+       "$ref": "#/components/schemas/Event"
+      }
+     },
+     "next_occurred_at": {
+      "description": "Pass as `after_occurred_at` for the next page. Null when the page is the last one.",
+      "type": [
+       "string",
+       "null"
+      ],
+      "format": "date-time"
+     },
+     "next_id": {
+      "description": "Pass as `after_id` for the next page, together with `next_occurred_at`. Null when the page is the last one.",
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    }
+   },
+   "EventSubmission": {
+    "type": "object",
+    "description": "One event a node is submitting.",
+    "required": [
+     "node_id",
+     "occurred_at",
+     "action",
+     "uri"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "node_id": {
+      "type": "string",
+      "description": "The node that recorded it.",
+      "minLength": 1
+     },
+     "occurred_at": {
+      "type": "string",
+      "description": "When the node recorded it.",
+      "format": "date-time"
+     },
+     "action": {
+      "type": "string",
+      "description": "What the engine did.",
+      "minLength": 1
+     },
+     "uri": {
+      "type": "string",
+      "description": "The request URI."
+     },
+     "message": {
+      "type": "string",
+      "description": "The rule message."
+     },
+     "key": {
+      "type": "string",
+      "description": "An idempotency key unique to this event on this node, e.g. its transaction id. Re-submitting the same key at the same `occurred_at` is skipped rather than duplicated, so a node may safely re-send a batch it never saw acknowledged. Omit it and the event is always inserted."
+     }
+    }
+   },
+   "EventBatch": {
+    "type": "object",
+    "description": "A batch of events to ingest, committed all-or-nothing.",
+    "required": [
+     "events"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "events": {
+      "type": "array",
+      "description": "The events. One commit covers the whole batch.",
+      "items": {
+       "$ref": "#/components/schemas/EventSubmission"
+      }
+     }
+    }
+   },
+   "IngestionResult": {
+    "type": "object",
+    "description": "What ingestion did with a batch. `received` minus `inserted` is how many were recognized as already ingested \u2014 the expected outcome of a re-sent batch, not an error.",
+    "required": [
+     "received",
+     "inserted",
+     "deduplicated"
+    ],
+    "properties": {
+     "received": {
+      "type": "integer",
+      "description": "Events in the batch.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "inserted": {
+      "type": "integer",
+      "description": "Events newly recorded.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "deduplicated": {
+      "type": "integer",
+      "description": "Events skipped as already ingested.",
+      "format": "int64",
+      "minimum": 0
+     }
+    }
+   },
+   "SavedSearch": {
+    "type": "object",
+    "description": "A named event search belonging to the caller.",
+    "required": [
+     "name",
+     "query"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The search name, unique per user."
+     },
+     "query": {
+      "type": "object",
+      "description": "The search parameters, as saved.",
+      "additionalProperties": true
+     }
+    }
+   },
+   "SavedSearchRequest": {
+    "type": "object",
+    "description": "A search to save under this name, replacing any existing one.",
+    "required": [
+     "query"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "query": {
+      "type": "object",
+      "description": "The search parameters to save.",
+      "additionalProperties": true
+     }
+    }
+   },
+   "SavedSearchList": {
+    "type": "object",
+    "description": "The caller's saved searches.",
+    "required": [
+     "searches"
+    ],
+    "properties": {
+     "searches": {
+      "type": "array",
+      "description": "The searches, ordered by name.",
+      "items": {
+       "$ref": "#/components/schemas/SavedSearch"
+      }
+     }
+    }
+   },
+   "Alert": {
+    "type": "object",
+    "description": "An alert rule and its delivery target.",
+    "required": [
+     "name",
+     "event_action",
+     "webhook_url",
+     "enabled"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The rule name."
+     },
+     "event_action": {
+      "type": "string",
+      "description": "The event action that fires this rule."
+     },
+     "webhook_url": {
+      "type": "string",
+      "description": "Where a firing alert is delivered.",
+      "format": "uri"
+     },
+     "enabled": {
+      "type": "boolean",
+      "description": "Whether the rule fires."
+     },
+     "signed": {
+      "type": "boolean",
+      "description": "Whether deliveries carry an HMAC-SHA256 signature. The secret itself is never returned."
+     },
+     "silenced_until": {
+      "description": "When the rule resumes firing, or null if it is not silenced.",
+      "type": [
+       "string",
+       "null"
+      ],
+      "format": "date-time"
+     }
+    }
+   },
+   "AlertRequest": {
+    "type": "object",
+    "description": "An alert rule to create.",
+    "required": [
+     "name",
+     "event_action",
+     "webhook_url"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "A name unique among alert rules.",
+      "minLength": 1
+     },
+     "event_action": {
+      "type": "string",
+      "description": "The event action that should fire it.",
+      "minLength": 1
+     },
+     "webhook_url": {
+      "type": "string",
+      "description": "Where to deliver it.",
+      "format": "uri"
+     },
+     "secret": {
+      "type": "string",
+      "description": "Optional signing secret. When set, each delivery carries an HMAC-SHA256 signature over its body so the receiver can tell a real alert from anything else that finds the URL.",
+      "writeOnly": true
+     }
+    }
+   },
+   "AlertList": {
+    "type": "object",
+    "description": "Alert rules.",
+    "required": [
+     "alerts"
+    ],
+    "properties": {
+     "alerts": {
+      "type": "array",
+      "description": "The rules, ordered by name.",
+      "items": {
+       "$ref": "#/components/schemas/Alert"
+      }
+     }
+    }
+   },
+   "SilenceRequest": {
+    "type": "object",
+    "description": "How long to stop a rule from firing.",
+    "required": [
+     "until"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "until": {
+      "type": "string",
+      "description": "When the rule resumes firing. A silence always ends: one without an expiry is an alert quietly deleted.",
+      "format": "date-time"
+     },
+     "reason": {
+      "type": "string",
+      "description": "Why it is being silenced."
+     }
+    }
+   },
+   "FailingChannel": {
+    "type": "object",
+    "description": "A delivery target that is failing.",
+    "required": [
+     "name",
+     "webhook_url",
+     "consecutive_failures"
+    ],
+    "properties": {
+     "name": {
+      "type": "string",
+      "description": "The alert rule."
+     },
+     "webhook_url": {
+      "type": "string",
+      "description": "The target that is failing.",
+      "format": "uri"
+     },
+     "consecutive_failures": {
+      "type": "integer",
+      "description": "Deliveries that have failed in a row.",
+      "format": "int64",
+      "minimum": 1
+     },
+     "last_error": {
+      "type": "string",
+      "description": "The most recent delivery error."
+     }
+    }
+   },
+   "FailingChannelList": {
+    "type": "object",
+    "description": "Alert channels whose deliveries are failing \u2014 the alerts an operator is not receiving, which is the failure mode an alerting system cannot report through itself.",
+    "required": [
+     "channels"
+    ],
+    "properties": {
+     "channels": {
+      "type": "array",
+      "description": "The failing channels.",
+      "items": {
+       "$ref": "#/components/schemas/FailingChannel"
+      }
+     }
+    }
+   },
+   "Setting": {
+    "type": "object",
+    "description": "One control-plane setting.",
+    "required": [
+     "key",
+     "value"
+    ],
+    "properties": {
+     "key": {
+      "type": "string",
+      "description": "The setting key."
+     },
+     "value": {
+      "type": "string",
+      "description": "Its current value."
+     }
+    }
+   },
+   "SettingList": {
+    "type": "object",
+    "description": "Control-plane settings.",
+    "required": [
+     "settings"
+    ],
+    "properties": {
+     "settings": {
+      "type": "array",
+      "description": "The settings, ordered by key.",
+      "items": {
+       "$ref": "#/components/schemas/Setting"
+      }
+     }
+    }
+   },
+   "SettingRequest": {
+    "type": "object",
+    "description": "A value to store under this key.",
+    "required": [
+     "value"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "value": {
+      "type": "string",
+      "description": "The value to set."
+     }
+    }
+   },
+   "Health": {
+    "type": "object",
+    "description": "Whether the control plane can serve. Reports the schema version because a process that connects to a database it cannot use is not healthy, however willing it is to answer.",
+    "required": [
+     "status",
+     "schema_version"
+    ],
+    "properties": {
+     "status": {
+      "type": "string",
+      "description": "Overall state.",
+      "enum": [
+       "ok",
+       "degraded"
+      ]
+     },
+     "schema_version": {
+      "type": "integer",
+      "description": "The highest applied migration.",
+      "format": "int64",
+      "minimum": 0
+     },
+     "detail": {
+      "type": "string",
+      "description": "What is degraded, when something is."
      }
     }
    }
@@ -114,7 +1167,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/AlertList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -136,9 +1196,26 @@
     "description": "Create an alert rule.",
     "x-required-action": "manage_alerts",
     "x-minimum-role": "operator",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/AlertRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Alert"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -164,7 +1241,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/FailingChannelList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -200,9 +1284,19 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SilenceRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -228,7 +1322,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SavedSearchList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -264,9 +1365,19 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SavedSearchRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -288,11 +1399,26 @@
     "operationId": "createSession",
     "summary": "Exchange credentials for a session.",
     "description": "Exchange credentials for a session. Unauthenticated by necessity. Failure is uniform \u2014 unknown user, disabled account, and wrong password are one response, because distinguishing them is what an attacker probing for accounts wants.",
-    "security": [],
-    "x-required-role": "none",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SessionRequest"
+       }
+      }
+     }
+    },
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Session"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -306,7 +1432,9 @@
      "404": {
       "$ref": "#/components/responses/NotFound"
      }
-    }
+    },
+    "security": [],
+    "x-required-role": "none"
    },
    "delete": {
     "operationId": "endSession",
@@ -315,8 +1443,8 @@
     "x-required-action": "view_fleet",
     "x-minimum-role": "viewer",
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -340,9 +1468,26 @@
     "description": "Issue an API token. The secret is returned exactly once; afterwards only its hash exists.",
     "x-required-action": "manage_tokens",
     "x-minimum-role": "admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/TokenRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Token"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -379,8 +1524,8 @@
      }
     ],
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -406,7 +1551,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Identity"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -430,9 +1582,60 @@
     "description": "Search security events, paged by cursor. Paging is by (occurred_at, id) cursor, so a growing stream neither repeats nor skips rows.",
     "x-required-action": "view_events",
     "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "query",
+      "required": true,
+      "description": "Restrict to one node.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     },
+     {
+      "name": "after_occurred_at",
+      "in": "query",
+      "required": false,
+      "description": "Cursor: the `next_occurred_at` of the previous page. Omit for the first page.",
+      "schema": {
+       "type": "string",
+       "format": "date-time"
+      }
+     },
+     {
+      "name": "after_id",
+      "in": "query",
+      "required": false,
+      "description": "Cursor: the `next_id` of the previous page. Required with `after_occurred_at`, since the two together name one position in the ordering.",
+      "schema": {
+       "type": "string"
+      }
+     },
+     {
+      "name": "limit",
+      "in": "query",
+      "required": false,
+      "description": "Maximum events to return. Bounded so a single request cannot ask the database for the whole stream.",
+      "schema": {
+       "type": "integer",
+       "format": "int32",
+       "minimum": 1,
+       "maximum": 1000,
+       "default": 100
+      }
+     }
+    ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EventPage"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -454,9 +1657,26 @@
     "description": "Ingest a batch of security events from a node. Idempotent by event key: a re-sent batch is a no-op rather than a duplicate.",
     "x-required-action": "view_fleet",
     "x-minimum-role": "viewer",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/EventBatch"
+       }
+      }
+     }
+    },
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/IngestionResult"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -480,9 +1700,30 @@
     "description": "Export a node's events as RFC 4180 CSV.",
     "x-required-action": "export_events",
     "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "query",
+      "required": true,
+      "description": "Restrict to one node.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "text/csv": {
+        "schema": {
+         "type": "string",
+         "format": "binary"
+        },
+        "example": "occurred_at,action,uri,message\n"
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -504,11 +1745,16 @@
     "operationId": "getHealth",
     "summary": "Liveness and readiness of the control plane.",
     "description": "Liveness and readiness of the control plane. Unauthenticated: a load balancer has no credentials, and refusing this would make a healthy control plane look down.",
-    "security": [],
-    "x-required-role": "none",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Health"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -522,7 +1768,9 @@
      "404": {
       "$ref": "#/components/responses/NotFound"
      }
-    }
+    },
+    "security": [],
+    "x-required-role": "none"
    }
   },
   "/metrics": {
@@ -534,7 +1782,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "text/plain; version=0.0.4": {
+        "schema": {
+         "type": "string"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -558,9 +1813,31 @@
     "description": "Enrolled nodes with status and heartbeat age.",
     "x-required-action": "view_fleet",
     "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "status",
+      "in": "query",
+      "required": false,
+      "description": "Restrict to nodes in one lifecycle state.",
+      "schema": {
+       "type": "string",
+       "enum": [
+        "active",
+        "retired"
+       ]
+      }
+     }
+    ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/NodeList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -582,9 +1859,26 @@
     "description": "Enroll a node, or refresh an existing one. Idempotent: re-enrolling refreshes hostname and version.",
     "x-required-action": "manage_settings",
     "x-minimum-role": "admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/EnrollmentRequest"
+       }
+      }
+     }
+    },
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Node"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -622,7 +1916,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Node"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -660,7 +1961,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Heartbeat"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -706,9 +2014,19 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/LabelRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -734,7 +2052,14 @@
     "x-minimum-role": "viewer",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/PolicyList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -756,9 +2081,26 @@
     "description": "Publish a new immutable policy version. Versions are never rewritten, so a rollback is a rollout of an earlier version.",
     "x-required-action": "manage_rulesets",
     "x-minimum-role": "operator",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/PolicyPublication"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/PolicyVersion"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -796,7 +2138,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/ExclusionList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -830,9 +2179,26 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/ExclusionRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Exclusion"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -881,7 +2247,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/PolicyVersion"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -930,7 +2303,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RuleList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -979,7 +2359,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SignatureVerification"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1017,7 +2404,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RolloutState"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1055,7 +2449,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RolloutState"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1091,9 +2492,26 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/RolloutAssignment"
+       }
+      }
+     }
+    },
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RolloutState"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1131,7 +2549,14 @@
     ],
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/DriftList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1157,7 +2582,14 @@
     "x-minimum-role": "admin",
     "responses": {
      "200": {
-      "description": "Success"
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/SettingList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
@@ -1193,9 +2625,19 @@
       }
      }
     ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/SettingRequest"
+       }
+      }
+     }
+    },
     "responses": {
-     "200": {
-      "description": "Success"
+     "204": {
+      "description": "No content"
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"
