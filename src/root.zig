@@ -10,6 +10,7 @@ pub const directives = @import("directives.zig");
 pub const engine = @import("engine.zig");
 pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
+pub const metrics = @import("metrics.zig");
 pub const operators = @import("operators.zig");
 pub const rule_eval = @import("rule_eval.zig");
 pub const runtime_operator = @import("runtime_operator.zig");

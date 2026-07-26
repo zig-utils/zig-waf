@@ -6,6 +6,8 @@ const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
 const directives = @import("directives.zig");
 const plugin = @import("plugin.zig");
+const metrics_mod = @import("metrics.zig");
+const waf_metrics = metrics_mod;
 const macros = @import("macros.zig");
 const persistent = @import("persistent.zig");
 const rule_config = @import("rule_config.zig");
@@ -388,6 +390,12 @@ pub const Waf = struct {
     plugins: ?*const plugin.Registry,
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
+    /// Request-path counters (#32), incremented as transactions retire so a scrape
+    /// never has to walk live transactions.
+    rule_matches: std.atomic.Value(u64) = .init(0),
+    interventions: std.atomic.Value(u64) = .init(0),
+    plugin_unavailable: std.atomic.Value(u64) = .init(0),
+    body_processor_errors: std.atomic.Value(u64) = .init(0),
 
     pub const Builder = @import("engine.zig").Builder;
 
@@ -427,6 +435,21 @@ pub const Waf = struct {
 
     pub fn compiledPlan(self: *const Waf) ?*const compiled_plan.Plan {
         return self.plan;
+    }
+
+    /// A coherent snapshot of the engine's request-path counters (#32), for a
+    /// Prometheus scrape. Reading is lock-free and allocation-free, so exposing
+    /// metrics never interferes with request handling.
+    pub fn metrics(self: *const Waf) metrics_mod.Snapshot {
+        const mutable = @constCast(self);
+        return .{
+            .transactions_total = mutable.transaction_sequence.load(.monotonic),
+            .transactions_active = mutable.active_transactions.load(.monotonic),
+            .rule_matches_total = mutable.rule_matches.load(.monotonic),
+            .interventions_total = mutable.interventions.load(.monotonic),
+            .plugin_unavailable_total = mutable.plugin_unavailable.load(.monotonic),
+            .body_processor_errors_total = mutable.body_processor_errors.load(.monotonic),
+        };
     }
 
     pub fn directiveConfiguration(self: *const Waf) ?*const directives.Configuration {
@@ -933,6 +956,8 @@ pub const Transaction = struct {
     request_header_count: usize = 0,
     /// Times a host plugin could not answer this transaction's operators (#23).
     plugin_unavailable_count: usize = 0,
+    /// Bodies this transaction's processors refused (#32).
+    body_processor_error_count: usize = 0,
     request_header_bytes: usize = 0,
     response_header_count: usize = 0,
     response_header_bytes: usize = 0,
@@ -2114,6 +2139,7 @@ pub const Transaction = struct {
     }
 
     fn flagBodyProcessorError(self: *Transaction, target: BodyTarget) TransactionError!void {
+        self.body_processor_error_count += 1;
         switch (target) {
             .request => try self.setScalar(.reqbody_processor_error, "1", .parser, .request_body),
             .response => try self.setScalar(.res_body_processor_error, "1", .parser, .response_body),
@@ -3692,6 +3718,14 @@ pub const Transaction = struct {
 
     pub fn deinit(self: *Transaction) void {
         if (self.lifecycle == .deinitialized) return;
+        // Read the counters before anything is torn down: the lists they come from
+        // are freed below, and reading them afterwards is reading freed memory.
+        const retiring: metrics_mod.Snapshot = .{
+            .rule_matches_total = self.match_intents.items.len,
+            .interventions_total = if (self.pending_intervention != null) 1 else 0,
+            .plugin_unavailable_total = self.plugin_unavailable_count,
+            .body_processor_errors_total = self.body_processor_error_count,
+        };
         if (self.persistent_session) |*session| session.deinit();
         for (self.match_intents.items) |*intent| deinitMatchIntent(self.waf.allocator, intent);
         self.match_intents.deinit(self.waf.allocator);
@@ -3709,7 +3743,14 @@ pub const Transaction = struct {
         self.scalar_variables.deinit();
         self.collection_variables.deinit();
         self.lifecycle = .deinitialized;
-        _ = @constCast(&self.waf.active_transactions).fetchSub(1, .release);
+        // Roll this transaction's counters into the engine's totals as it retires,
+        // so a scrape reads finished work and never has to walk live transactions.
+        const waf = @constCast(self.waf);
+        _ = waf.rule_matches.fetchAdd(retiring.rule_matches_total, .monotonic);
+        _ = waf.interventions.fetchAdd(retiring.interventions_total, .monotonic);
+        _ = waf.plugin_unavailable.fetchAdd(retiring.plugin_unavailable_total, .monotonic);
+        _ = waf.body_processor_errors.fetchAdd(retiring.body_processor_errors_total, .monotonic);
+        _ = waf.active_transactions.fetchSub(1, .release);
     }
 
     fn validateHeader(
@@ -8058,4 +8099,61 @@ test "XML entity expansion cannot read files or blow up the parser" {
         try tx.processRequestBody();
         try std.testing.expect((try tx.scalar(.request_body)) != null);
     }
+}
+
+test "engine metrics count what the WAF actually did" {
+    const input =
+        \\SecRule ARGS:attack "@rx evil" "id:1,phase:1,deny,status:403,t:none"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "metrics.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    // A WAF that has done nothing still reports every series: zero is a measurement,
+    // and a scrape that omitted quiet counters would make an idle WAF look like a
+    // stopped one.
+    {
+        const snapshot = waf.metrics();
+        try std.testing.expectEqual(@as(u64, 0), snapshot.transactions_total);
+        try std.testing.expectEqual(@as(u64, 0), snapshot.interventions_total);
+    }
+
+    // One clean request and one that is blocked.
+    {
+        var tx = waf.newTransaction();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/?attack=harmless", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expect((try tx.intervention()) == null);
+        tx.deinit();
+    }
+    {
+        var tx = waf.newTransaction();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri("/?attack=evil", "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        try std.testing.expectEqual(@as(u16, 403), (try tx.intervention()).?.status);
+        tx.deinit();
+    }
+
+    const snapshot = waf.metrics();
+    try std.testing.expectEqual(@as(u64, 2), snapshot.transactions_total);
+    // Both transactions retired, so none is still in flight.
+    try std.testing.expectEqual(@as(u64, 0), snapshot.transactions_active);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.rule_matches_total);
+    try std.testing.expectEqual(@as(u64, 1), snapshot.interventions_total);
+
+    // And it renders as a scrape.
+    var buffer: [waf_metrics.max_document_bytes]u8 = undefined;
+    const document = waf_metrics.render(snapshot, &buffer);
+    try std.testing.expect(std.mem.indexOf(u8, document, "waf_interventions_total 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, document, "waf_transactions_total 2") != null);
 }
