@@ -124,6 +124,81 @@ has confirmed the version it runs. An empty cohort fails the gate, because rolli
 out on the strength of a canary that was never deployed is the mistake a gate
 exists to prevent. A failed gate changes nothing.
 
+## Node identity
+
+`fleet_nodes.zig` answers the question every other operation depends on: *which
+node is this, and may it still act*. Enrolling by asserting an id is fine for a
+demo and is not an identity, so this layer covers the credential a node enrolls
+with, the certificate it authenticates by, and the ways both can be taken away.
+
+**Enrollment tokens** are single-use and expiring, and only their SHA-256 hash is
+stored. A token that can be replayed is a permanent fleet credential sitting in
+whatever provisioning system carried it, and a stolen database should not yield one
+that still works.
+
+`claim` is a single statement whose WHERE clause carries every condition —
+matching hash, unclaimed, unwithdrawn, unexpired — so the row is consumed by the
+same statement that qualifies it. This is the point: two nodes starting together in
+an autoscaling group is the ordinary case, and a read followed by a write would let
+both pass the read. There is no moment between the check and the consumption for a
+second claim to land in.
+
+Withdrawal is its own column rather than a backdated expiry. "Withdrawn" and "ran
+out" are different facts to whoever reads the trail afterwards, and an expiry moved
+below `created_at` would contradict the check that keeps the window coherent.
+Claimed tokens survive `purgeExpired`, because they are the record of which token
+enrolled which node.
+
+**Certificates** authenticate a node only inside their validity window, only while
+unrevoked, and only while the node itself is active — so retiring a node ends its
+access without touching any certificate. `authenticate` returns the node id or
+null, and null covers unknown, not-yet-valid, expired, and revoked without
+distinguishing them: whoever is holding the certificate does not need to be told
+which.
+
+Fingerprints are accepted only as 64 lowercase hex characters. A value with an
+uppercase digit or a stray colon would be stored happily and then never match what
+a TLS terminator computes, and "a node cannot authenticate with a certificate the
+console shows as valid" is a genuinely hard failure to read.
+
+`rotate` records the replacement and leaves the outgoing certificate valid until it
+expires on its own. Both authenticate during the changeover, so a rotation does not
+depend on the node and the control plane agreeing on an instant — a cutover that is
+instant is how a fleet goes silent mid-request. `needsRotation` asks about the
+*node*, not about one certificate, because an expiring certificate is not a problem
+when a newer one is already in place; asking the other way would issue a new
+certificate on every check. `rotationDue` is the work list a rotation job walks.
+
+`revoke` requires a reason, enforced by the schema. An unexplained revocation is
+indistinguishable from a mistake, and the safe response to a mistake is to
+re-issue — which is exactly wrong after a key compromise. `revokeAllFor` exists
+because revoking the one certificate an operator knows about leaves any others
+working.
+
+Issuing the certificate is not here: signing a CSR needs an X.509 CA, which arrives
+with the TLS work ([#43](https://github.com/zig-utils/zig-waf/issues/43)). What
+this owns is the lifecycle state an mTLS terminator consults on every connection.
+
+**Replay prevention.** `NonceLedger.accept` takes a nonce once per node. The
+primary key enforces it, so two concurrent replays cannot both be accepted the way
+they can between a check and an insert. Nonces are scoped per node — keyed on the
+nonce alone, two nodes independently choosing the same value would lock each other
+out — and they expire, because a table that must be kept forever is one someone
+eventually truncates, silently removing the protection. A purged nonce may be
+reused safely: the request carrying it is itself rejected as stale long before.
+
+**Capabilities and version negotiation.** A node reports what it supports and what
+protocol version it speaks. `negotiate` returns the older of the two versions, so a
+fleet can be upgraded one node at a time, and refuses anything below the supported
+minimum rather than serving it best-effort — a node that cannot be told what to
+enforce is worse than one that knows it is unsupported, because it looks healthy.
+
+An unreported capability counts as unsupported. That default matters: a node sent
+rules it cannot evaluate does not fail loudly, it silently enforces less than the
+operator believes it is enforcing. `lacking` names the nodes a policy needing a
+capability cannot be rolled out to, which is the question worth asking before a
+rollout rather than after.
+
 ## Event ingestion
 
 A node buffers events in an `EventSpool` and a worker drains the queue to
@@ -204,6 +279,23 @@ initdb -D data -U waf --auth=trust
 pg_ctl -D data -o "-p 5456 -k $PWD" -w start
 PG_TEST_DSN="host=$PWD port=5456 user=waf dbname=postgres" zig build pg-test
 ```
+
+libpq is linked as a shared library, so on macOS the loader needs to be told where
+it is: prefix the command with
+`DYLD_LIBRARY_PATH=pantry/postgresql.org/libpq/v18.0.0/lib` (Linux uses
+`LD_LIBRARY_PATH`, which is what the CI job sets).
+
+CI runs this suite against a `postgres:18` service container, so these tests gate
+merges rather than depending on someone remembering to run them.
+
+**One caveat worth knowing.** `zig build pg-test` caches a successful run and
+replays it, and `PG_TEST_DSN` is not part of the cache key. Pointing it at a
+different database and re-running therefore reports `Build Summary: 7/7 steps
+succeeded` with `run test cached` — without opening a connection to it. That is
+indistinguishable from a passing run, which makes it dangerous whenever the *point*
+of the run is which database it talks to, such as verifying a restored backup. Run
+the test binary directly in that case and insist on the `All N tests passed` line;
+[`docs/postgres-operations.md`](postgres-operations.md) records the procedure.
 
 `zig build sqlite-test` covers the embedded backend and needs no server.
 
