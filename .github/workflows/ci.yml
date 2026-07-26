@@ -132,6 +132,9 @@ jobs:
       - name: Deterministic directive validation fuzzing
         working-directory: zig-waf
         run: zig build fuzz-directives -Ddirective-fuzz-iterations=10000
+      - name: Deterministic request-body processor fuzzing
+        working-directory: zig-waf
+        run: zig build fuzz-bodies -Dbody-fuzz-iterations=10000
       - name: Deterministic non-disruptive action fuzzing
         working-directory: zig-waf
         run: zig build fuzz-actions -Daction-fuzz-iterations=10000

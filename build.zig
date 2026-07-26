@@ -367,6 +367,23 @@ pub fn build(b: *std.Build) void {
     const directive_fuzz_step = b.step("fuzz-directives", "Run deterministic typed directive fuzz cases");
     directive_fuzz_step.dependOn(&run_directive_fuzz.step);
 
+    const body_fuzz_module = b.createModule(.{
+        .root_source_file = b.path("tools/body_fuzz.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    body_fuzz_module.addImport("waf", waf);
+    const body_fuzz = b.addExecutable(.{
+        .name = "body-fuzz",
+        .root_module = body_fuzz_module,
+    });
+    const run_body_fuzz = b.addRunArtifact(body_fuzz);
+    const body_fuzz_iterations = b.option(usize, "body-fuzz-iterations", "Deterministic body-processor fuzz case count") orelse 5_000;
+    const body_fuzz_seed = b.option(u64, "body-fuzz-seed", "Deterministic body-processor fuzz seed") orelse 9_151_314_442_816_847_872;
+    run_body_fuzz.addArgs(&.{ b.fmt("{d}", .{body_fuzz_iterations}), b.fmt("{d}", .{body_fuzz_seed}) });
+    const body_fuzz_step = b.step("fuzz-bodies", "Run deterministic request-body processor fuzz cases");
+    body_fuzz_step.dependOn(&run_body_fuzz.step);
+
     const action_fuzz_module = b.createModule(.{
         .root_source_file = b.path("tools/action_fuzz.zig"),
         .target = target,
