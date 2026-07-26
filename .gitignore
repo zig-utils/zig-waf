@@ -5,3 +5,4 @@ console/dist/
 .DS_Store
 zig-pkg/
 sbom.json
+compatibility-matrix.json

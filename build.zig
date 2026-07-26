@@ -384,6 +384,17 @@ pub fn build(b: *std.Build) void {
     const body_fuzz_step = b.step("fuzz-bodies", "Run deterministic request-body processor fuzz cases");
     body_fuzz_step.dependOn(&run_body_fuzz.step);
 
+    const matrix_module = b.createModule(.{
+        .root_source_file = b.path("tools/matrix.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    matrix_module.addImport("waf", waf);
+    const matrix_tool = b.addExecutable(.{ .name = "matrix", .root_module = matrix_module });
+    const run_matrix = b.addRunArtifact(matrix_tool);
+    const matrix_step = b.step("matrix", "Emit the per-item compatibility matrix from the engine registries");
+    matrix_step.dependOn(&run_matrix.step);
+
     const sbom_module = b.createModule(.{
         .root_source_file = b.path("tools/sbom.zig"),
         .target = target,
