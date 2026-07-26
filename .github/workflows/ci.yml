@@ -44,9 +44,13 @@ jobs:
         env:
           PANTRY_VERSION: 0.10.47
         run: curl -fsSL https://pantry.dev | bash
-      - name: Install locked LMDB
+      - name: Install locked dependencies
         working-directory: zig-waf
-        run: ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+        # Install what the manifests declare, rather than naming a package. Naming one
+        # re-adds it — leaving a duplicate key in deps.yaml and rewriting the lock —
+        # which makes the manifests describe the install instead of the install
+        # following the manifests.
+        run: ~/.local/bin/pantry install
       - name: Verify dependency pins are authoritative
         working-directory: zig-waf
         # Installing must not change a manifest. If it does, the lockfile was not
