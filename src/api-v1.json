@@ -1,0 +1,1100 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "zig-waf control plane",
+    "version": "1.0.0",
+    "description": "The versioned control-plane API. The path prefix carries the version: a breaking change to any operation takes a new prefix rather than mutating one clients already call.\n\nAuthorization is a property of the operation, not of its handler \u2014 every operation declares the action it requires, and an identity that cannot perform that action is refused before the handler runs. src/api.zig holds the same table, and a test fails the build if this document and that table disagree, because a published contract clients are written against must not describe an API that does not exist."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "components": {
+    "securitySchemes": {
+      "sessionCookie": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "waf_session"
+      },
+      "apiToken": {
+        "type": "http",
+        "scheme": "bearer"
+      }
+    }
+  },
+  "security": [
+    {
+      "sessionCookie": []
+    },
+    {
+      "apiToken": []
+    }
+  ],
+  "paths": {
+    "/alerts": {
+      "get": {
+        "operationId": "listAlerts",
+        "summary": "Alert rules and their delivery targets.",
+        "description": "Alert rules and their delivery targets.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createAlert",
+        "summary": "Create an alert rule.",
+        "description": "Create an alert rule.",
+        "x-required-action": "manage_alerts",
+        "x-minimum-role": "operator",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/alerts/failing": {
+      "get": {
+        "operationId": "listFailingAlertChannels",
+        "summary": "Alert rules whose last delivery failed.",
+        "description": "Alert rules whose last delivery failed. An alert that cannot be delivered looks exactly like quiet, which is why this is a first-class resource.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/alerts/{name}/silence": {
+      "post": {
+        "operationId": "silenceAlert",
+        "summary": "Silence an alert for a stated reason and period.",
+        "description": "Silence an alert for a stated reason and period. Preferred to disabling a rule: it expires by itself and the reason survives the incident.",
+        "x-required-action": "manage_alerts",
+        "x-minimum-role": "operator",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/audits/searches": {
+      "get": {
+        "operationId": "listSavedSearches",
+        "summary": "The caller's saved event searches.",
+        "description": "The caller's saved event searches.",
+        "x-required-action": "view_events",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/audits/searches/{name}": {
+      "put": {
+        "operationId": "saveSearch",
+        "summary": "Save or replace a named event search.",
+        "description": "Save or replace a named event search. The query is stored as JSON and interpreted by the console; it is never spliced into SQL.",
+        "x-required-action": "view_events",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/auth/session": {
+      "post": {
+        "operationId": "createSession",
+        "summary": "Exchange credentials for a session.",
+        "description": "Exchange credentials for a session. Unauthenticated by necessity. Failure is uniform \u2014 unknown user, disabled account, and wrong password are one response, because distinguishing them is what an attacker probing for accounts wants.",
+        "security": [],
+        "x-required-role": "none",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "endSession",
+        "summary": "End the calling session.",
+        "description": "End the calling session.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/auth/tokens": {
+      "post": {
+        "operationId": "issueToken",
+        "summary": "Issue an API token.",
+        "description": "Issue an API token. The secret is returned exactly once; afterwards only its hash exists.",
+        "x-required-action": "manage_tokens",
+        "x-minimum-role": "admin",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/auth/tokens/{name}": {
+      "delete": {
+        "operationId": "revokeToken",
+        "summary": "Revoke an API token by name.",
+        "description": "Revoke an API token by name. Revocation is recorded rather than deleted, so a token that was used stays accounted for.",
+        "x-required-action": "manage_tokens",
+        "x-minimum-role": "admin",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/auth/whoami": {
+      "get": {
+        "operationId": "getCurrentIdentity",
+        "summary": "The calling identity and its role.",
+        "description": "The calling identity and its role.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "operationId": "searchEvents",
+        "summary": "Search security events, paged by cursor.",
+        "description": "Search security events, paged by cursor. Paging is by (occurred_at, id) cursor, so a growing stream neither repeats nor skips rows.",
+        "x-required-action": "view_events",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "post": {
+        "operationId": "ingestEvents",
+        "summary": "Ingest a batch of security events from a node.",
+        "description": "Ingest a batch of security events from a node. Idempotent by event key: a re-sent batch is a no-op rather than a duplicate.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/events/export": {
+      "get": {
+        "operationId": "exportEvents",
+        "summary": "Export a node's events as RFC 4180 CSV.",
+        "description": "Export a node's events as RFC 4180 CSV.",
+        "x-required-action": "export_events",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "operationId": "getHealth",
+        "summary": "Liveness and readiness of the control plane.",
+        "description": "Liveness and readiness of the control plane. Unauthenticated: a load balancer has no credentials, and refusing this would make a healthy control plane look down.",
+        "security": [],
+        "x-required-role": "none",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "operationId": "getMetrics",
+        "summary": "Prometheus exposition for the control plane.",
+        "description": "Prometheus exposition for the control plane.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/nodes": {
+      "get": {
+        "operationId": "listNodes",
+        "summary": "Enrolled nodes with status and heartbeat age.",
+        "description": "Enrolled nodes with status and heartbeat age.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "post": {
+        "operationId": "enrollNode",
+        "summary": "Enroll a node, or refresh an existing one.",
+        "description": "Enroll a node, or refresh an existing one. Idempotent: re-enrolling refreshes hostname and version.",
+        "x-required-action": "manage_settings",
+        "x-minimum-role": "admin",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/nodes/{node_id}": {
+      "get": {
+        "operationId": "getNode",
+        "summary": "One node's inventory record.",
+        "description": "One node's inventory record.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/nodes/{node_id}/heartbeat": {
+      "post": {
+        "operationId": "recordHeartbeat",
+        "summary": "Record a node heartbeat.",
+        "description": "Record a node heartbeat. Called by the node itself, which is why a viewer-level identity suffices.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/nodes/{node_id}/labels/{key}": {
+      "put": {
+        "operationId": "setNodeLabel",
+        "summary": "Set a label used to target rollouts.",
+        "description": "Set a label used to target rollouts.",
+        "x-required-action": "manage_settings",
+        "x-minimum-role": "admin",
+        "parameters": [
+          {
+            "name": "node_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/policies": {
+      "get": {
+        "operationId": "listPolicies",
+        "summary": "Published policy bundles.",
+        "description": "Published policy bundles.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "post": {
+        "operationId": "publishPolicy",
+        "summary": "Publish a new immutable policy version.",
+        "description": "Publish a new immutable policy version. Versions are never rewritten, so a rollback is a rollout of an earlier version.",
+        "x-required-action": "manage_rulesets",
+        "x-minimum-role": "operator",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/policies/{name}/exclusions": {
+      "get": {
+        "operationId": "listExclusions",
+        "summary": "Rule exclusions applied to a policy.",
+        "description": "Rule exclusions applied to a policy.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createExclusion",
+        "summary": "Add a rule exclusion.",
+        "description": "Add a rule exclusion.",
+        "x-required-action": "manage_rulesets",
+        "x-minimum-role": "operator",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/policies/{name}/versions/{version}": {
+      "get": {
+        "operationId": "getPolicyVersion",
+        "summary": "The content of a specific policy version.",
+        "description": "The content of a specific policy version.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/policies/{name}/versions/{version}/rules": {
+      "get": {
+        "operationId": "listPolicyRules",
+        "summary": "The rules a policy version compiles to.",
+        "description": "The rules a policy version compiles to.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/policies/{name}/versions/{version}/verify": {
+      "post": {
+        "operationId": "verifyPolicySignature",
+        "summary": "Verify a bundle's Ed25519 signature.",
+        "description": "Verify a bundle's Ed25519 signature. Fails closed: another key's signature, an unsigned bundle, and altered content are all 'not verified'.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/rollouts/{name}": {
+      "get": {
+        "operationId": "getRolloutState",
+        "summary": "Which versions the fleet is assigned and running.",
+        "description": "Which versions the fleet is assigned and running.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/rollouts/{name}/advance": {
+      "post": {
+        "operationId": "advanceRollout",
+        "summary": "Widen a rollout if the current cohort is healthy.",
+        "description": "Widen a rollout if the current cohort is healthy. Refuses when the cohort is unresponsive, unconfirmed, or empty \u2014 rolling out on the strength of a canary that was never deployed is the mistake a gate exists to prevent.",
+        "x-required-action": "drive_rollout",
+        "x-minimum-role": "operator",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/rollouts/{name}/assign": {
+      "post": {
+        "operationId": "assignRollout",
+        "summary": "Assign a version to a node, a labeled cohort, or the fleet.",
+        "description": "Assign a version to a node, a labeled cohort, or the fleet.",
+        "x-required-action": "drive_rollout",
+        "x-minimum-role": "operator",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/rollouts/{name}/drift": {
+      "get": {
+        "operationId": "listRolloutDrift",
+        "summary": "Nodes not running the version they were assigned.",
+        "description": "Nodes not running the version they were assigned. A node that has never reported counts as drifted: silence is not compliance.",
+        "x-required-action": "view_fleet",
+        "x-minimum-role": "viewer",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/settings": {
+      "get": {
+        "operationId": "listSettings",
+        "summary": "Control-plane settings.",
+        "description": "Control-plane settings.",
+        "x-required-action": "manage_settings",
+        "x-minimum-role": "admin",
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    },
+    "/settings/{key}": {
+      "put": {
+        "operationId": "setSetting",
+        "summary": "Set a control-plane setting.",
+        "description": "Set a control-plane setting.",
+        "x-required-action": "manage_settings",
+        "x-minimum-role": "admin",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success"
+          },
+          "400": {
+            "description": "The request was malformed"
+          },
+          "401": {
+            "description": "No usable credential was presented"
+          },
+          "403": {
+            "description": "The identity may not perform this operation"
+          },
+          "404": {
+            "description": "No such resource"
+          }
+        }
+      }
+    }
+  }
+}
