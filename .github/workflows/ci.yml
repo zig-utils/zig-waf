@@ -44,9 +44,11 @@ jobs:
         env:
           PANTRY_VERSION: 0.10.47
         run: curl -fsSL https://pantry.dev | bash
-      - name: Install locked LMDB
+      - name: Install locked LMDB and libxml2
         working-directory: zig-waf
-        run: ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+        run: |
+          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+          ~/.local/bin/pantry install gnome.org/libxml2@2.13.9
       - name: Restore manifests after install
         working-directory: zig-waf
         # Pantry rewrites the manifests as a side effect of installing: naming a
@@ -135,6 +137,14 @@ jobs:
       - name: Test
         working-directory: zig-waf
         run: zig build test
+      - name: libxml2 adapter tests
+        working-directory: zig-waf
+        # libxml2 is a shared library, so its directory (and its own transitive ones)
+        # go on the loader path — the same reason the fleet-storage job discovers them
+        # rather than naming them.
+        run: |
+          export LD_LIBRARY_PATH="$(find pantry -maxdepth 4 -type d -name lib | tr '\n' ':')$LD_LIBRARY_PATH"
+          zig build xml2-test
       - name: Compile
         working-directory: zig-waf
         run: zig build check

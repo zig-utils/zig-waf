@@ -1,5 +1,6 @@
 dependencies:
   facebook.com/zstd: ^1.5.7
+  gnome.org/libxml2: ^2.13
   openldap.org/liblmdb: ^0.9.35
   zig: 0.17.0-dev
   postgres: ^18

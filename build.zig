@@ -152,6 +152,40 @@ pub fn build(b: *std.Build) void {
     const zstd_tests = b.addTest(.{ .root_module = zstd_module });
     const run_zstd_tests = b.addRunArtifact(zstd_tests);
 
+    // libxml2, for the XPath/XSD/DTD operators the pure-Zig parser cannot serve
+    // (#28). Kept out of the default `test` step: it links a shared library, so its
+    // tests need that library on the loader path. Run with `zig build xml2-test`.
+    //
+    // One translated header including all of libxml2's, rather than several
+    // translations, because the types are shared and separate translations would make
+    // distinct Zig types for them.
+    const libxml2_prefix = "pantry/gnome.org/libxml2/v2.13.9";
+    const libxml2_library = switch (target.result.os.tag) {
+        .macos, .ios, .tvos, .watchos => libxml2_prefix ++ "/lib/libxml2.dylib",
+        .windows => libxml2_prefix ++ "/lib/libxml2.lib",
+        else => libxml2_prefix ++ "/lib/libxml2.so",
+    };
+    const xml2_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/xml2_includes.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    xml2_translate.addIncludePath(b.path(libxml2_prefix ++ "/include/libxml2"));
+    const xml2_module = b.createModule(.{
+        .root_source_file = b.path("src/xml2.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    xml2_module.addImport("xml2_c", xml2_translate.createModule());
+    xml2_module.addIncludePath(b.path(libxml2_prefix ++ "/include/libxml2"));
+    xml2_module.addObjectFile(b.path(libxml2_library));
+    const xml2_tests = b.addTest(.{ .root_module = xml2_module });
+    const run_xml2_tests = b.addRunArtifact(xml2_tests);
+    const xml2_test_step = b.step("xml2-test", "Run the libxml2 adapter tests (needs libxml2 on the loader path)");
+    xml2_test_step.dependOn(&run_xml2_tests.step);
+
     const pg_module = b.createModule(.{
         .root_source_file = b.path("src/pg.zig"),
         .target = target,
