@@ -643,6 +643,20 @@
         "docs/plugins.md"
       ],
       "notes": "Operators and body processors a host registers, called where the configuration names them. An extension nothing provides fails to compile rather than leaving a rule that never matches or a body nothing reads. An operator plugin reports unavailable distinctly from no-match and the engine counts it, so a data source that failed to load is visible instead of reading as clean traffic. Transformations, actions, and directives are deliberately closed \u2014 their semantics are the compatibility surface \u2014 and the C ABI (#33) is the cross-language boundary rather than an embedded WASM runtime."
+    },
+    {
+      "id": "engine.audit-delivery",
+      "area": "logging",
+      "name": "Audit delivery writers, bounded queue, retry, and accounting",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/31",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": false,
+      "evidence": [
+        "src/audit_writer.zig"
+      ],
+      "notes": "Serial, concurrent (ModSecurity layout), and callback writers over an I/O-free Sink the host owns. A bounded DeliveryQueue sits between production and delivery so the request path never waits on a log destination; it is bounded in records and bytes, stops draining at the first failure rather than reordering or skipping, backs off exponentially with a ceiling, and counts every record as delivered, dropped, or still queued. Rotation and file lifetime stay with the host, which owns the files."
     }
   ]
 }
