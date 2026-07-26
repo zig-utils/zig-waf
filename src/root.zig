@@ -7,6 +7,7 @@ pub const action_evidence = @import("action_evidence.zig");
 pub const action_fuzz = @import("action_fuzz.zig");
 pub const body_fuzz = @import("body_fuzz.zig");
 pub const audit_fuzz = @import("audit_fuzz.zig");
+pub const storage_fuzz = @import("storage_fuzz.zig");
 pub const collections = @import("collections.zig");
 pub const directives = @import("directives.zig");
 pub const engine = @import("engine.zig");
@@ -69,6 +70,9 @@ test {
     _ = action_config;
     _ = action_evidence;
     _ = action_fuzz;
+    _ = body_fuzz;
+    _ = audit_fuzz;
+    _ = storage_fuzz;
     _ = collections;
     _ = directives;
     _ = engine;
