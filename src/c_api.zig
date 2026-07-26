@@ -607,3 +607,40 @@ fn requestBlocked(handle: *WafHandle, uri: []const u8) bool {
     decision.abi_version = abi_version;
     return zig_waf_transaction_intervention(tx, &decision) == .ok and decision.enforced != 0;
 }
+
+test "the ABI's layout is pinned, so a change cannot happen silently" {
+    // A connector compiled against this header links against these exact offsets and
+    // sizes. Changing one without changing ZIG_WAF_ABI_VERSION would let an old
+    // connector call a new library and read the wrong fields — the failure mode that
+    // versioning exists to prevent, and the one nothing else here would catch.
+    //
+    // Adding a field inside `reserved` keeps these numbers the same on purpose: that
+    // is the additive path, and it is why the reserved arrays exist.
+    try std.testing.expectEqual(@as(u32, 0x00010000), abi_version);
+    try std.testing.expectEqual(@as(usize, 120), @sizeOf(Config));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(Features));
+    try std.testing.expectEqual(@as(usize, 56), @sizeOf(CIntervention));
+
+    // Field offsets a header change could shift without changing a size.
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Config, "struct_size"));
+    try std.testing.expectEqual(@as(usize, 4), @offsetOf(Config, "abi_version"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(Features, "struct_size"));
+    try std.testing.expectEqual(@as(usize, 8), @offsetOf(Features, "feature_bits"));
+    try std.testing.expectEqual(@as(usize, 0), @offsetOf(CIntervention, "struct_size"));
+    try std.testing.expectEqual(@as(usize, 12), @offsetOf(CIntervention, "status"));
+
+    // Every struct carries its own size and the version it was built against, which
+    // is what makes the additive path checkable at run time rather than by
+    // convention.
+    var features: Features = .{ .struct_size = @sizeOf(Features), .abi_version = abi_version, .feature_bits = 0, .highest_phase = 0, .reserved0 = 0, .reserved = @splat(0) };
+    try std.testing.expectEqual(Status.ok, zig_waf_query_features(&features));
+    try std.testing.expectEqual(abi_version, features.abi_version);
+
+    // A caller from the future — a larger struct than this library knows — is
+    // accepted, because the fields this library reads are still where it expects
+    // them. A caller from the past, with a struct too small to contain them, is not.
+    features.struct_size = @sizeOf(Features) + 64;
+    try std.testing.expectEqual(Status.ok, zig_waf_query_features(&features));
+    features.struct_size = @sizeOf(Features) - 8;
+    try std.testing.expectEqual(Status.invalid_argument, zig_waf_query_features(&features));
+}
