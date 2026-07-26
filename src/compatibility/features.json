@@ -298,7 +298,7 @@
       "id": "tooling.cli",
       "area": "tooling",
       "name": "Config validate, explain, and version CLI",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/34",
       "modsecurity": false,
       "coraza": true,
@@ -306,7 +306,7 @@
       "evidence": [
         "src/cli.zig"
       ],
-      "notes": "The zig-waf CLI parses, compiles, and directive-validates SecLang configs (validate), lists compiled rules with phase/id/action/location (explain), runs a synthetic request through the engine and reports the block/allow decision (test), and reports the version, exiting non-zero on rejection so rule sets can be gated in CI. The format, replay, and benchmark subcommands remain."
+      "notes": "The zig-waf CLI parses, compiles, and directive-validates SecLang configs (validate), lists compiled rules with phase/id/action/location (explain), runs a synthetic request through the engine and reports the block/allow decision (test), and reports the version, exiting non-zero on rejection so rule sets can be gated in CI. format prints one directive per line from the parse rather than reflowing the source, so the output is by construction what the engine will run; replay runs a recorded request's wire bytes (an audit record's parts B and C, or a proxy capture) through the engine and exits non-zero when blocked, so a reproduction can gate a fix; benchmark reports nanoseconds per request with the blocked count, so a run that measured nothing is visible."
     },
     {
       "id": "engine.immutable-structural-plans",
