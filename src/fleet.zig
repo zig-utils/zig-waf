@@ -294,6 +294,76 @@ pub const migrations = [_]pg.Migration{
         \\CREATE INDEX saved_searches_query_gin_idx ON saved_searches USING gin (query);
         ,
     },
+    .{
+        .version = 12,
+        .name = "node_identity",
+        // Node identity: how a node proves which node it is, and for how long (#50).
+        //
+        // An enrollment token is single-use and expiring, and only its hash is
+        // stored: a token that can be replayed is a permanent fleet credential
+        // published in whatever provisioning system carried it, and a leaked
+        // database should not yield one that still works. `claimed_at` is what makes
+        // it single-use, and it is set by the same statement that reads the token so
+        // two nodes racing on one token cannot both win. Withdrawal is a column of its
+        // own rather than a backdated expiry: "withdrawn" and "ran out" are different
+        // facts to whoever reads the trail later, and an expiry moved below
+        // `created_at` would contradict the check that keeps the window coherent.
+        //
+        // Certificates are recorded rather than trusted implicitly: a fingerprint
+        // authenticates a node only inside its validity window and only while
+        // unrevoked. Keeping the row after expiry — rather than deleting it — is
+        // what lets an operator answer "what was this node using in March", which is
+        // the question an incident actually asks.
+        //
+        // Nonces prevent replay. The primary key is what enforces it: a repeated
+        // nonce is a duplicate-key violation rather than a race between a check and
+        // an insert, so concurrent replays of the same request cannot both be
+        // accepted.
+        .sql =
+        \\CREATE TABLE enrollment_tokens (
+        \\  id          bigserial PRIMARY KEY,
+        \\  token_hash  text NOT NULL UNIQUE,
+        \\  label       text NOT NULL,
+        \\  created_by  text NOT NULL,
+        \\  created_at  timestamptz NOT NULL DEFAULT now(),
+        \\  expires_at  timestamptz NOT NULL,
+        \\  claimed_at  timestamptz,
+        \\  claimed_by  uuid,
+        \\  withdrawn_at timestamptz,
+        \\  CHECK (expires_at > created_at),
+        \\  CHECK ((claimed_at IS NULL) = (claimed_by IS NULL))
+        \\);
+        \\CREATE INDEX enrollment_tokens_unclaimed_idx ON enrollment_tokens (expires_at)
+        \\  WHERE claimed_at IS NULL;
+        \\
+        \\CREATE TABLE node_certificates (
+        \\  id                bigserial PRIMARY KEY,
+        \\  node_id           uuid NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
+        \\  fingerprint       text NOT NULL UNIQUE,
+        \\  serial            text NOT NULL,
+        \\  not_before        timestamptz NOT NULL,
+        \\  not_after         timestamptz NOT NULL,
+        \\  issued_at         timestamptz NOT NULL DEFAULT now(),
+        \\  revoked_at        timestamptz,
+        \\  revocation_reason text,
+        \\  CHECK (not_after > not_before),
+        \\  CHECK ((revoked_at IS NULL) = (revocation_reason IS NULL))
+        \\);
+        \\CREATE INDEX node_certificates_node_idx ON node_certificates (node_id, not_after DESC);
+        \\
+        \\CREATE TABLE node_nonces (
+        \\  node_id     uuid NOT NULL REFERENCES nodes (node_id) ON DELETE CASCADE,
+        \\  nonce       text NOT NULL,
+        \\  seen_at     timestamptz NOT NULL DEFAULT now(),
+        \\  expires_at  timestamptz NOT NULL,
+        \\  PRIMARY KEY (node_id, nonce)
+        \\);
+        \\CREATE INDEX node_nonces_expiry_idx ON node_nonces (expires_at);
+        \\
+        \\ALTER TABLE nodes ADD COLUMN capabilities jsonb NOT NULL DEFAULT '[]';
+        \\ALTER TABLE nodes ADD COLUMN protocol_version integer NOT NULL DEFAULT 0;
+        ,
+    },
 };
 
 /// The hex HMAC-SHA256 signature of `payload` under `secret` (#59). Receivers

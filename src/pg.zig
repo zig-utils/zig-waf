@@ -574,6 +574,7 @@ test {
     // Run the fleet schema's and identity layer's tests under `pg-test` too.
     _ = @import("fleet.zig");
     _ = @import("fleet_auth.zig");
+    _ = @import("fleet_nodes.zig");
     _ = @import("oidc.zig");
     _ = @import("fleet_metrics.zig");
 }
