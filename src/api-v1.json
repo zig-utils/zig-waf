@@ -1104,6 +1104,223 @@
       "description": "What is degraded, when something is."
      }
     }
+   },
+   "EnrollmentTokenRequest": {
+    "type": "object",
+    "description": "A one-time enrollment token to issue.",
+    "required": [
+     "label",
+     "ttl_seconds"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "label": {
+      "type": "string",
+      "description": "What the token was issued for, e.g. a rack or an autoscaling group. Also how it is withdrawn.",
+      "minLength": 1
+     },
+     "ttl_seconds": {
+      "type": "integer",
+      "description": "How long the token may be claimed for. Required: a token without an expiry is a credential nobody remembers to revoke.",
+      "format": "int64",
+      "minimum": 60
+     }
+    }
+   },
+   "EnrollmentToken": {
+    "type": "object",
+    "description": "A freshly issued enrollment token. The secret is returned here and nowhere else \u2014 only its hash is stored \u2014 so a token that is lost is reissued rather than recovered.",
+    "required": [
+     "secret",
+     "label",
+     "expires_at"
+    ],
+    "properties": {
+     "secret": {
+      "type": "string",
+      "description": "The value a node presents once to enroll.",
+      "readOnly": true
+     },
+     "label": {
+      "type": "string",
+      "description": "What it was issued for."
+     },
+     "expires_at": {
+      "type": "string",
+      "description": "After this, the token cannot be claimed.",
+      "format": "date-time"
+     }
+    }
+   },
+   "Certificate": {
+    "type": "object",
+    "description": "A certificate a node authenticates with. The row outlives the certificate deliberately: \"what was this node using in March\" is the question an incident actually asks.",
+    "required": [
+     "fingerprint",
+     "serial",
+     "not_before",
+     "not_after",
+     "issued_at"
+    ],
+    "properties": {
+     "fingerprint": {
+      "type": "string",
+      "description": "SHA-256 of the DER encoding, lowercase hex \u2014 what an mTLS terminator computes from the presented certificate.",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+     },
+     "serial": {
+      "type": "string",
+      "description": "The issuer's serial number."
+     },
+     "not_before": {
+      "type": "string",
+      "description": "Start of the validity window.",
+      "format": "date-time"
+     },
+     "not_after": {
+      "type": "string",
+      "description": "End of the validity window.",
+      "format": "date-time"
+     },
+     "issued_at": {
+      "type": "string",
+      "description": "When the control plane recorded it.",
+      "format": "date-time"
+     },
+     "revoked_at": {
+      "description": "When it was revoked, or null if it has not been.",
+      "type": [
+       "string",
+       "null"
+      ],
+      "format": "date-time"
+     },
+     "revocation_reason": {
+      "description": "Why it was revoked, or null. Always present when revoked_at is: an unexplained revocation reads as a mistake, and the safe reading of a mistake is to re-issue.",
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    }
+   },
+   "CertificateList": {
+    "type": "object",
+    "description": "The certificates recorded for a node, newest expiry first. More than one is active during a rotation, which overlaps on purpose.",
+    "required": [
+     "certificates",
+     "active"
+    ],
+    "properties": {
+     "certificates": {
+      "type": "array",
+      "description": "The certificates.",
+      "items": {
+       "$ref": "#/components/schemas/Certificate"
+      }
+     },
+     "active": {
+      "type": "integer",
+      "description": "How many are unrevoked and unexpired.",
+      "format": "int64",
+      "minimum": 0
+     }
+    }
+   },
+   "CertificateRotation": {
+    "type": "object",
+    "description": "Record a newly issued certificate for a node. The outgoing certificate is left valid until it expires: a rotation that cut over instantly would take away the identity of a request already in flight.",
+    "required": [
+     "fingerprint",
+     "serial",
+     "lifetime_seconds"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "fingerprint": {
+      "type": "string",
+      "description": "SHA-256 of the new certificate's DER encoding, lowercase hex. Rejected in any other form, since a fingerprint that does not match what a terminator computes can never authenticate anything.",
+      "pattern": "^[0-9a-f]{64}$",
+      "minLength": 64,
+      "maxLength": 64
+     },
+     "serial": {
+      "type": "string",
+      "description": "The issuer's serial number.",
+      "minLength": 1
+     },
+     "lifetime_seconds": {
+      "type": "integer",
+      "description": "How long the new certificate is valid. Short is the point: a stolen key that expires tomorrow has to be stolen again.",
+      "format": "int64",
+      "minimum": 60
+     }
+    }
+   },
+   "CapabilityReport": {
+    "type": "object",
+    "description": "What a node can do and what protocol version it speaks.",
+    "required": [
+     "capabilities",
+     "protocol_version"
+    ],
+    "additionalProperties": false,
+    "properties": {
+     "capabilities": {
+      "type": "array",
+      "description": "The features the node supports, by name. Anything absent is treated as unsupported, because sending a node rules it cannot evaluate makes it enforce less than the operator believes without failing.",
+      "items": {
+       "type": "string",
+       "minLength": 1
+      }
+     },
+     "protocol_version": {
+      "type": "integer",
+      "description": "The version the node speaks.",
+      "format": "int32",
+      "minimum": 1
+     }
+    }
+   },
+   "NegotiatedProtocol": {
+    "type": "object",
+    "description": "The version both sides will speak \u2014 the older of the two, so a fleet can be upgraded one node at a time. A node below the supported minimum is refused rather than served on a best-effort basis.",
+    "required": [
+     "protocol_version"
+    ],
+    "properties": {
+     "protocol_version": {
+      "type": "integer",
+      "description": "The negotiated version.",
+      "format": "int32",
+      "minimum": 1
+     }
+    }
+   },
+   "RotationDueList": {
+    "type": "object",
+    "description": "Nodes with no certificate that will still be valid at the horizon \u2014 the work list a rotation job walks.",
+    "required": [
+     "node_ids",
+     "within_seconds"
+    ],
+    "properties": {
+     "node_ids": {
+      "type": "array",
+      "description": "The nodes needing rotation.",
+      "items": {
+       "type": "string"
+      }
+     },
+     "within_seconds": {
+      "type": "integer",
+      "description": "The horizon the list was computed for.",
+      "format": "int64",
+      "minimum": 0
+     }
+    }
    }
   },
   "responses": {
@@ -2638,6 +2855,347 @@
     "responses": {
      "204": {
       "description": "No content"
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/nodes/{node_id}/capabilities": {
+   "post": {
+    "operationId": "reportNodeCapabilities",
+    "summary": "Report a node's capabilities and negotiate the protocol version.",
+    "description": "Report a node's capabilities and negotiate the protocol version.",
+    "x-required-action": "view_fleet",
+    "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "path",
+      "required": true,
+      "description": "The node identifier assigned at enrollment.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CapabilityReport"
+       }
+      }
+     }
+    },
+    "responses": {
+     "200": {
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/NegotiatedProtocol"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/nodes/{node_id}/certificates": {
+   "get": {
+    "operationId": "listNodeCertificates",
+    "summary": "The certificates recorded for a node.",
+    "description": "The certificates recorded for a node.",
+    "x-required-action": "view_fleet",
+    "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "path",
+      "required": true,
+      "description": "The node identifier assigned at enrollment.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/CertificateList"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   },
+   "post": {
+    "operationId": "rotateNodeCertificate",
+    "summary": "Record a newly issued certificate, leaving the outgoing one valid until it expires.",
+    "description": "Record a newly issued certificate, leaving the outgoing one valid until it expires.",
+    "x-required-action": "manage_settings",
+    "x-minimum-role": "admin",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "path",
+      "required": true,
+      "description": "The node identifier assigned at enrollment.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/CertificateRotation"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/Certificate"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/nodes/{node_id}/certificates/{fingerprint}": {
+   "delete": {
+    "operationId": "revokeNodeCertificate",
+    "summary": "Revoke a certificate, with a reason.",
+    "description": "Revoke a certificate, with a reason.",
+    "x-required-action": "manage_settings",
+    "x-minimum-role": "admin",
+    "parameters": [
+     {
+      "name": "node_id",
+      "in": "path",
+      "required": true,
+      "description": "The node identifier assigned at enrollment.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     },
+     {
+      "name": "fingerprint",
+      "in": "path",
+      "required": true,
+      "description": "The certificate's SHA-256 fingerprint, lowercase hex.",
+      "schema": {
+       "type": "string",
+       "pattern": "^[0-9a-f]{64}$",
+       "minLength": 64,
+       "maxLength": 64
+      }
+     },
+     {
+      "name": "reason",
+      "in": "query",
+      "required": true,
+      "description": "Why it is being revoked. Required, because a revocation nobody explained is indistinguishable from a mistake \u2014 and the safe response to a mistake is to re-issue, which is exactly wrong after a key compromise.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "No content"
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/enrollment-tokens": {
+   "post": {
+    "operationId": "issueEnrollmentToken",
+    "summary": "Issue a one-time enrollment token.",
+    "description": "Issue a one-time enrollment token.",
+    "x-required-action": "manage_settings",
+    "x-minimum-role": "admin",
+    "requestBody": {
+     "required": true,
+     "content": {
+      "application/json": {
+       "schema": {
+        "$ref": "#/components/schemas/EnrollmentTokenRequest"
+       }
+      }
+     }
+    },
+    "responses": {
+     "201": {
+      "description": "Created",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/EnrollmentToken"
+        }
+       }
+      }
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/enrollment-tokens/{label}": {
+   "delete": {
+    "operationId": "withdrawEnrollmentToken",
+    "summary": "Withdraw an unclaimed enrollment token. Already-claimed tokens are untouched: the node that used one is enrolled, and pretending otherwise would not un-enroll it.",
+    "description": "Withdraw an unclaimed enrollment token. Already-claimed tokens are untouched: the node that used one is enrolled, and pretending otherwise would not un-enroll it.",
+    "x-required-action": "manage_settings",
+    "x-minimum-role": "admin",
+    "parameters": [
+     {
+      "name": "label",
+      "in": "path",
+      "required": true,
+      "description": "The label the token was issued under.",
+      "schema": {
+       "type": "string",
+       "minLength": 1
+      }
+     }
+    ],
+    "responses": {
+     "204": {
+      "description": "No content"
+     },
+     "400": {
+      "$ref": "#/components/responses/BadRequest"
+     },
+     "401": {
+      "$ref": "#/components/responses/Unauthorized"
+     },
+     "403": {
+      "$ref": "#/components/responses/Forbidden"
+     },
+     "404": {
+      "$ref": "#/components/responses/NotFound"
+     }
+    }
+   }
+  },
+  "/certificates/rotation-due": {
+   "get": {
+    "operationId": "listRotationDue",
+    "summary": "Nodes with no certificate valid at the horizon.",
+    "description": "Nodes with no certificate valid at the horizon.",
+    "x-required-action": "view_fleet",
+    "x-minimum-role": "viewer",
+    "parameters": [
+     {
+      "name": "within_seconds",
+      "in": "query",
+      "required": false,
+      "description": "How far ahead to look. A node whose certificate outlives this is not listed.",
+      "schema": {
+       "type": "integer",
+       "format": "int64",
+       "minimum": 0,
+       "default": 86400
+      }
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "Success",
+      "content": {
+       "application/json": {
+        "schema": {
+         "$ref": "#/components/schemas/RotationDueList"
+        }
+       }
+      }
      },
      "400": {
       "$ref": "#/components/responses/BadRequest"

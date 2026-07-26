@@ -58,6 +58,21 @@ pub const routes = [_]Route{
     .{ .method = .get, .path = "/nodes/{node_id}", .operation = "getNode", .requires = .view_fleet },
     .{ .method = .post, .path = "/nodes/{node_id}/heartbeat", .operation = "recordHeartbeat", .requires = .view_fleet },
     .{ .method = .put, .path = "/nodes/{node_id}/labels/{key}", .operation = "setNodeLabel", .requires = .manage_settings },
+    .{ .method = .post, .path = "/nodes/{node_id}/capabilities", .operation = "reportNodeCapabilities", .requires = .view_fleet },
+    .{ .method = .get, .path = "/nodes/{node_id}/certificates", .operation = "listNodeCertificates", .requires = .view_fleet },
+    .{ .method = .post, .path = "/nodes/{node_id}/certificates", .operation = "rotateNodeCertificate", .requires = .manage_settings },
+    .{ .method = .delete, .path = "/nodes/{node_id}/certificates/{fingerprint}", .operation = "revokeNodeCertificate", .requires = .manage_settings },
+
+    // Enrollment tokens are their own resource rather than a sub-path of /nodes:
+    // a token exists before the node it will become, and `/nodes/enrollment-tokens`
+    // would also be a path that `/nodes/{node_id}` matches — an ambiguity resolved
+    // by declaration order, which is not a thing to rely on.
+    .{ .method = .post, .path = "/enrollment-tokens", .operation = "issueEnrollmentToken", .requires = .manage_settings },
+    .{ .method = .delete, .path = "/enrollment-tokens/{label}", .operation = "withdrawEnrollmentToken", .requires = .manage_settings },
+
+    // The fleet-wide rotation work list, for the same reason: it is about
+    // certificates, not about one node.
+    .{ .method = .get, .path = "/certificates/rotation-due", .operation = "listRotationDue", .requires = .view_fleet },
 
     // Policies (rule-set bundles) and the rules inside them
     .{ .method = .get, .path = "/policies", .operation = "listPolicies", .requires = .view_fleet },
@@ -227,6 +242,38 @@ test "every route is uniquely addressed and carries an operation id" {
                 return error.DuplicateRoute;
             if (std.mem.eql(u8, previous.operation, route.operation))
                 return error.DuplicateOperationId;
+        }
+    }
+}
+
+test "no two routes can match the same path" {
+    // Uniqueness is not enough: `/nodes/{node_id}` and `/nodes/enrollment-tokens`
+    // are different patterns that both match `/api/v1/nodes/enrollment-tokens`, and
+    // which one wins is declaration order. That is how a request to list tokens
+    // becomes a lookup of a node named "enrollment-tokens" — a 404 for a route that
+    // exists, or worse, the wrong operation running.
+    //
+    // Two patterns collide when they have the same method and length and every
+    // segment either matches literally or is a parameter on at least one side.
+    for (&routes, 0..) |route, index| {
+        for (routes[0..index]) |previous| {
+            if (previous.method != route.method) continue;
+            var mine = std.mem.tokenizeScalar(u8, route.path, '/');
+            var theirs = std.mem.tokenizeScalar(u8, previous.path, '/');
+            const collides = while (true) {
+                const a = mine.next();
+                const b = theirs.next();
+                if (a == null and b == null) break true; // same length, all compatible
+                if (a == null or b == null) break false; // different lengths
+                const a_parameter = a.?[0] == '{';
+                const b_parameter = b.?[0] == '{';
+                if (a_parameter or b_parameter) continue; // a parameter matches anything
+                if (!std.mem.eql(u8, a.?, b.?)) break false;
+            } else unreachable;
+            if (collides) {
+                std.debug.print("ambiguous routes: {s} and {s}\n", .{ previous.path, route.path });
+                return error.AmbiguousRoutes;
+            }
         }
     }
 }
