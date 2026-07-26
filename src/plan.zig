@@ -679,6 +679,30 @@ pub const Plan = struct {
         return self.string_bytes[range.start..][0..range.length];
     }
 
+    /// The single argument of the last-declared `name` directive, or null when the
+    /// configuration never set it.
+    ///
+    /// "Last-declared" is the semantics of a singular-replace directive: a later
+    /// `SecDebugLogLevel` overrides an earlier one, including one from an include, and
+    /// returning the first would make the answer depend on file order in the opposite
+    /// direction from how the parser resolved it.
+    ///
+    /// This exists so a setting the parser validates is a setting a host can act on.
+    /// A directive that is checked and then unreadable is one that silently does
+    /// nothing — the operator sets it, sees no effect, and has no way to tell that
+    /// nothing is listening.
+    pub fn settingText(self: *const Plan, name: []const u8) ?[]const u8 {
+        var found: ?[]const u8 = null;
+        for (self.directives) |directive| {
+            const declared = self.string(directive.name) orelse continue;
+            if (!std.ascii.eqlIgnoreCase(declared, name)) continue;
+            if (directive.arguments_count == 0) continue;
+            const argument = self.arguments[directive.arguments_start];
+            found = self.string(argument.raw) orelse continue;
+        }
+        return found;
+    }
+
     pub fn sourceSlice(self: *const Plan, span: seclang.source.Span) CompileError![]const u8 {
         const index: usize = @backingInt(span.source);
         if (index >= self.sources.len) return error.InvalidSourceId;
