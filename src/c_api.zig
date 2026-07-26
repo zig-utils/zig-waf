@@ -644,3 +644,66 @@ test "the ABI's layout is pinned, so a change cannot happen silently" {
     features.struct_size = @sizeOf(Features) - 8;
     try std.testing.expectEqual(Status.invalid_argument, zig_waf_query_features(&features));
 }
+
+test "any call sequence yields a status rather than a crash" {
+    // The rule bytes are already fuzzed above; this fuzzes the *call order*, which
+    // is where a connector actually goes wrong. A data plane that calls
+    // process_request_body before process_uri, evaluates a phase twice, or keeps
+    // using a transaction after processing logging must get a status back — the ABI
+    // is a boundary with untrusted callers on the other side, and lifecycle errors
+    // are the ones a connector hits in production rather than in a unit test.
+    const rules = "SecRule ARGS \"@rx attack\" \"id:1,phase:2,deny,status:403,t:none\"";
+    var waf_handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_create_with_rules(null, rules.ptr, rules.len, &waf_handle));
+    defer _ = zig_waf_destroy(waf_handle);
+
+    var prng = std.Random.DefaultPrng.init(0x5EED_C0DE_ABCD);
+    const random = prng.random();
+
+    var iteration: usize = 0;
+    while (iteration < 2000) : (iteration += 1) {
+        var transaction: *TransactionHandle = undefined;
+        if (zig_waf_transaction_create(waf_handle, &transaction) != .ok) continue;
+        defer zig_waf_transaction_destroy(transaction);
+
+        // A random-length sequence of lifecycle calls in a random order.
+        var step: usize = 0;
+        const steps = random.uintLessThan(usize, 12);
+        while (step < steps) : (step += 1) {
+            const body = "user=attack";
+            const status = switch (random.uintLessThan(u8, 11)) {
+                0 => zig_waf_transaction_process_connection(transaction, "192.0.2.1", 9, 1234, "198.51.100.1", 12, 443),
+                1 => zig_waf_transaction_process_uri(transaction, "/?a=attack", 10, "GET", 3, "HTTP/1.1", 8),
+                2 => zig_waf_transaction_add_request_header(transaction, "Host", 4, "example.com", 11),
+                3 => zig_waf_transaction_process_request_headers(transaction),
+                4 => zig_waf_transaction_write_request_body(transaction, body.ptr, body.len),
+                5 => zig_waf_transaction_process_request_body(transaction),
+                6 => zig_waf_transaction_add_response_header(transaction, "Server", 6, "test", 4),
+                7 => zig_waf_transaction_process_response_headers(transaction, 200, "HTTP/1.1", 8),
+                8 => zig_waf_transaction_process_response_body(transaction),
+                9 => zig_waf_transaction_process_logging(transaction),
+                else => zig_waf_transaction_evaluate_phase(transaction, random.uintLessThan(u32, 7)),
+            };
+            // Every status is one of the defined ones — an out-of-order call is
+            // reported, never undefined behaviour.
+            switch (status) {
+                .ok, .invalid_argument, .unsupported_abi, .out_of_memory, .invalid_config, .invalid_lifecycle, .limit_exceeded, .busy, .not_found, .internal => {},
+            }
+
+            // Interrogating a transaction at any point is safe, whatever state it is
+            // in: a connector reads the decision when it has one, not only when the
+            // library expects the question.
+            var intervention: CIntervention = .{
+                .struct_size = @sizeOf(CIntervention),
+                .abi_version = abi_version,
+                .action = 0,
+                .status = 0,
+                .enforced = 0,
+                .has_rule_id = 0,
+                .rule_id = 0,
+                .reserved = @splat(0),
+            };
+            _ = zig_waf_transaction_intervention(transaction, &intervention);
+        }
+    }
+}
