@@ -277,3 +277,111 @@ test "the OpenAPI document and the route table describe the same API" {
     }
     try testing.expectEqual(routes.len, documented.count());
 }
+
+test "every path parameter is declared, and declares nothing the path does not have" {
+    // A parameter present in the template but absent from the document is invisible
+    // to a generated client, which then cannot address the resource at all; one
+    // declared but not in the template is a value the server will never receive.
+    // Both read as working documentation, so neither is caught by review.
+    const document = @embedFile("api-v1.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, document, .{});
+    defer parsed.deinit();
+
+    const paths = parsed.value.object.get("paths").?.object;
+    var path_entries = paths.iterator();
+    while (path_entries.next()) |path_entry| {
+        const template = path_entry.key_ptr.*;
+        var method_entries = path_entry.value_ptr.object.iterator();
+        while (method_entries.next()) |method_entry| {
+            const operation = method_entry.value_ptr.object;
+            const declared = if (operation.get("parameters")) |value| value.array.items else &.{};
+
+            // Every `{name}` in the template is declared, in order, as a required
+            // path parameter.
+            var index: usize = 0;
+            var rest = template;
+            while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+                const close = std.mem.indexOfScalarPos(u8, rest, open, '}').?;
+                const name = rest[open + 1 .. close];
+                rest = rest[close + 1 ..];
+
+                if (index >= declared.len) {
+                    std.debug.print("undeclared path parameter: {s} in {s}\n", .{ name, template });
+                    return error.PathParameterUndeclared;
+                }
+                const parameter = declared[index].object;
+                try testing.expectEqualStrings(name, parameter.get("name").?.string);
+                try testing.expectEqualStrings("path", parameter.get("in").?.string);
+                // OpenAPI requires `required: true` on a path parameter; a client
+                // generator is entitled to reject the document without it.
+                try testing.expect(parameter.get("required").?.bool);
+                try testing.expect(parameter.get("schema") != null);
+                index += 1;
+            }
+            if (index != declared.len) {
+                std.debug.print("declared parameter not in path: {s}\n", .{template});
+                return error.ParameterNotInPath;
+            }
+        }
+    }
+}
+
+test "every failure is the one documented error shape, and every reference resolves" {
+    // A client writes one error path. That only holds if every operation's failures
+    // point at the same schema, so this checks the pointers rather than trusting
+    // that each of the thirty-four operations was written the same way.
+    const document = @embedFile("api-v1.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, document, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const paths = root.get("paths").?.object;
+    var path_entries = paths.iterator();
+    while (path_entries.next()) |path_entry| {
+        var method_entries = path_entry.value_ptr.object.iterator();
+        while (method_entries.next()) |method_entry| {
+            const responses = method_entry.value_ptr.object.get("responses").?.object;
+            var status_entries = responses.iterator();
+            var failures: usize = 0;
+            while (status_entries.next()) |status_entry| {
+                const status = status_entry.key_ptr.*;
+                if (status[0] != '4' and status[0] != '5') continue;
+                failures += 1;
+                const reference = status_entry.value_ptr.object.get("$ref") orelse {
+                    std.debug.print(
+                        "inline failure body: {s} {s}\n",
+                        .{ status, method_entry.value_ptr.object.get("operationId").?.string },
+                    );
+                    return error.FailureBodyNotShared;
+                };
+                try testing.expect(resolves(root, reference.string));
+            }
+            // An operation that documents no failure at all claims it cannot fail.
+            try testing.expect(failures != 0);
+        }
+    }
+
+    // Each shared response carries the error schema itself, so the indirection ends
+    // somewhere real.
+    var shared = root.get("components").?.object.get("responses").?.object.iterator();
+    while (shared.next()) |entry| {
+        const schema = entry.value_ptr.object.get("content").?.object
+            .get("application/json").?.object.get("schema").?.object;
+        try testing.expectEqualStrings("#/components/schemas/Error", schema.get("$ref").?.string);
+    }
+    try testing.expect(resolves(root, "#/components/schemas/Error"));
+}
+
+/// Whether a local JSON pointer of the form `#/a/b/c` names something in `root`.
+/// Only local references are supported: the document is self-contained by design, so
+/// a reference that leaves it is a defect rather than a case to handle.
+fn resolves(root: std.json.ObjectMap, reference: []const u8) bool {
+    if (!std.mem.startsWith(u8, reference, "#/")) return false;
+    var current = std.json.Value{ .object = root };
+    var segments = std.mem.tokenizeScalar(u8, reference[2..], '/');
+    while (segments.next()) |segment| {
+        if (current != .object) return false;
+        current = current.object.get(segment) orelse return false;
+    }
+    return true;
+}
