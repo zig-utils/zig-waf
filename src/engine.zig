@@ -4,6 +4,7 @@ const std = @import("std");
 const action_config = @import("action_config.zig");
 const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
+const debug_log = @import("debug_log.zig");
 const directives = @import("directives.zig");
 const plugin = @import("plugin.zig");
 const metrics_mod = @import("metrics.zig");
@@ -130,6 +131,17 @@ pub const Config = struct {
     transformation_profile: transformations.Profile = .modsecurity,
     transformation_unicode_map: ?transformations.UnicodeMap = null,
     transformation_cache_enabled: ?bool = null,
+    /// Where to record what the engine did (#32); borrowed, never owned, and null by
+    /// default so a build that wants no diagnostics pays nothing for them.
+    ///
+    /// The recorder is not thread-safe, so a host sharing one across concurrent
+    /// transactions must guard it. Per-transaction is the simpler arrangement and the
+    /// one the tests use.
+    debug_log: ?*debug_log.Recorder = null,
+    /// Whether to measure how long each rule takes. Off by default: reading the clock
+    /// twice per rule is a real cost on a hot path, and a number nobody looks at is
+    /// not worth paying for on every request.
+    rule_timing: bool = false,
 };
 
 pub const InterventionCapabilities = struct {
@@ -209,6 +221,19 @@ pub const Builder = struct {
 
     pub fn setLimits(self: *Builder, limits: Limits) void {
         self.config.limits = limits;
+    }
+
+    /// Attach a debug-log sink (#32). Borrowed: the caller keeps it alive for as long
+    /// as the WAF and its transactions, and guards it if transactions run
+    /// concurrently, since a recorder is not thread-safe.
+    pub fn setDebugLog(self: *Builder, recorder: *debug_log.Recorder) void {
+        self.config.debug_log = recorder;
+    }
+
+    /// Measure how long each rule takes. Off by default because it reads the clock
+    /// twice per rule, which is a cost worth paying only when someone is looking.
+    pub fn setRuleTiming(self: *Builder, enabled: bool) void {
+        self.config.rule_timing = enabled;
     }
 
     pub fn setMacroMissingPolicy(self: *Builder, policy: macros.MissingPolicy) void {
@@ -994,6 +1019,14 @@ pub const Transaction = struct {
     transaction_terminated: bool = false,
     started_real_nanoseconds: i96,
     started_awake_nanoseconds: i96,
+    /// Time spent inside rule evaluation, when `rule_timing` is on. Zero otherwise,
+    /// which is distinguishable from "measured as zero" because the flag says which.
+    rule_time_nanoseconds: u64 = 0,
+    /// The single slowest rule and its cost. One rule is usually responsible for a
+    /// latency regression, and a total tells an operator that something is slow while
+    /// this tells them what to look at.
+    slowest_rule_nanoseconds: u64 = 0,
+    slowest_rule_id: ?u32 = null,
     sequence: u64,
     highest_severity: u8 = 255,
     args_combined_size: usize = 0,
@@ -2608,6 +2641,27 @@ pub const Transaction = struct {
         return list.toOwnedSlice(arena);
     }
 
+    /// How long rule evaluation took, and which rule was worst (#32).
+    ///
+    /// `measured` is false when `rule_timing` was off, so a caller can tell "nothing
+    /// was slow" from "nobody was timing" — reporting an unmeasured zero as a
+    /// measurement is how a dashboard comes to show a WAF that costs nothing.
+    pub const RuleTiming = struct {
+        measured: bool,
+        total_nanoseconds: u64,
+        slowest_nanoseconds: u64,
+        slowest_rule_id: ?u32,
+    };
+
+    pub fn ruleTiming(self: *const Transaction) RuleTiming {
+        return .{
+            .measured = self.waf.config.rule_timing,
+            .total_nanoseconds = self.rule_time_nanoseconds,
+            .slowest_nanoseconds = self.slowest_rule_nanoseconds,
+            .slowest_rule_id = self.slowest_rule_id,
+        };
+    }
+
     pub fn intervention(self: *const Transaction) TransactionError!?Intervention {
         if (self.lifecycle == .deinitialized) return error.Deinitialized;
         return self.pending_intervention;
@@ -2768,6 +2822,16 @@ pub const Transaction = struct {
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
 
+        // The enum's values are the phase numbers themselves (1-5), so the number is
+        // read directly and the table index is one less. Getting this the other way
+        // round is an out-of-bounds read that only the last phase reaches — exactly
+        // what the C API's call-sequence fuzz test exists to catch, and did.
+        const phase_number: u3 = @intCast(@backingInt(phase));
+        self.debugPrint(.info, phase_number, null, "phase {d} evaluating {d} rule(s)", .{
+            phase_number,
+            plan.phase_rules[phase_number - 1].len,
+        });
+
         var cursor = try PhaseCursor.init(self, phase);
         while (try cursor.next()) |head_id| {
             _ = arena.reset(.retain_capacity);
@@ -2777,19 +2841,86 @@ pub const Transaction = struct {
             var member: ?compiled_plan.RuleId = head_id;
             var chain_matched = true;
             while (member) |rule_id| {
-                const context = (try self.evaluateRule(scratch, rule_id)) orelse {
+                const started = self.timingStart();
+                const context = try self.evaluateRule(scratch, rule_id);
+                self.recordRuleTiming(rule_id, phase_number, started, context != null);
+                if (context == null) {
                     chain_matched = false;
                     break;
-                };
-                try matches.append(scratch, .{ .rule = rule_id, .context = context });
+                }
+                try matches.append(scratch, .{ .rule = rule_id, .context = context.? });
                 member = plan.rules[@backingInt(rule_id)].chain_next;
             }
 
             if (chain_matched and matches.items.len != 0) {
                 _ = try self.applyMatchedChain(matches.items);
-                if (self.isPhaseInterrupted()) break;
+                if (self.isPhaseInterrupted()) {
+                    self.debugPrint(.notice, phase_number, self.externalRuleId(head_id), "phase {d} interrupted", .{phase_number});
+                    break;
+                }
             }
         }
+    }
+
+    /// The rule's `id:` as configured, for a diagnostic that an operator can match
+    /// against their rule file. The internal index would be meaningless to them.
+    fn externalRuleId(self: *const Transaction, rule_id: compiled_plan.RuleId) ?u32 {
+        const plan = self.compiledPlan() orelse return null;
+        const index: usize = @backingInt(rule_id);
+        if (index >= plan.rules.len) return null;
+        const external = plan.rules[index].external_id orelse return null;
+        return std.math.cast(u32, external);
+    }
+
+    /// Read the clock only when someone asked for timings. Two clock reads per rule is
+    /// a measurable cost across a full rule set, and paying it to compute a number no
+    /// one consumes is the kind of overhead a WAF cannot justify.
+    fn timingStart(self: *const Transaction) ?i96 {
+        if (!self.waf.config.rule_timing) return null;
+        return std.Io.Clock.now(.awake, self.waf.io).nanoseconds;
+    }
+
+    fn recordRuleTiming(
+        self: *Transaction,
+        rule_id: compiled_plan.RuleId,
+        phase_number: u3,
+        started: ?i96,
+        matched: bool,
+    ) void {
+        const start = started orelse {
+            // Timing is off, but a matched rule is still worth a record at detail: it
+            // is the single most useful line in a debug log — which rules fired.
+            if (matched) self.debugPrint(.detail, phase_number, self.externalRuleId(rule_id), "matched", .{});
+            return;
+        };
+        const elapsed = std.Io.Clock.now(.awake, self.waf.io).nanoseconds - start;
+        const nanoseconds: u64 = if (elapsed < 0) 0 else @intCast(elapsed);
+        self.rule_time_nanoseconds += nanoseconds;
+        if (nanoseconds > self.slowest_rule_nanoseconds) {
+            self.slowest_rule_nanoseconds = nanoseconds;
+            self.slowest_rule_id = self.externalRuleId(rule_id);
+        }
+        self.debugPrint(
+            .detail,
+            phase_number,
+            self.externalRuleId(rule_id),
+            "{s} in {d}ns",
+            .{ if (matched) "matched" else "no match", nanoseconds },
+        );
+    }
+
+    /// Record a formatted debug message, if a recorder is configured and its level
+    /// permits it. Cheap when it is not: a null check and a comparison.
+    fn debugPrint(
+        self: *const Transaction,
+        level: debug_log.Level,
+        phase: ?u3,
+        rule_id: ?u32,
+        comptime format: []const u8,
+        arguments: anytype,
+    ) void {
+        const recorder = self.waf.config.debug_log orelse return;
+        recorder.print(level, phase, rule_id, format, arguments);
     }
 
     /// Evaluate one rule against the current transaction state, returning a
@@ -8156,4 +8287,121 @@ test "engine metrics count what the WAF actually did" {
     const document = waf_metrics.render(snapshot, &buffer);
     try std.testing.expect(std.mem.indexOf(u8, document, "waf_interventions_total 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, document, "waf_transactions_total 2") != null);
+}
+
+test "the debug log records what the engine did, at the configured level" {
+    const input =
+        \\SecRule ARGS "@rx attack" "id:942100,phase:1,deny,status:403,msg:'sqli'"
+        \\SecRule ARGS "@rx benign-never-matches" "id:942101,phase:1,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "debug.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+
+    var recorder = debug_log.Recorder.init(std.testing.allocator, .detail, .{});
+    defer recorder.deinit();
+
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setDebugLog(&recorder);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/search?q=attack", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+
+    var buffer: [4096]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try recorder.render(&writer);
+    const text = writer.buffered();
+
+    // The phase is announced with how much work it has to do, and the rule that
+    // matched is named by its configured id — the id an operator can find in their
+    // rule file, not an internal index.
+    try std.testing.expect(std.mem.indexOf(u8, text, "[4] [phase 1] phase 1 evaluating 2 rule(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "[id 942100] matched") != null);
+    // And the interruption is recorded, because "which rule stopped the request" is
+    // the first thing anyone asks about a block.
+    try std.testing.expect(std.mem.indexOf(u8, text, "interrupted") != null);
+    // Nothing was dropped, so the log does not claim to be incomplete.
+    try std.testing.expect(std.mem.indexOf(u8, text, "incomplete") == null);
+
+    // Timing was not requested, so nothing pretends to have measured it. A zero
+    // reported as a measurement is how a dashboard comes to show a free WAF.
+    const timing = tx.ruleTiming();
+    try std.testing.expect(!timing.measured);
+    try std.testing.expectEqual(@as(u64, 0), timing.total_nanoseconds);
+    try std.testing.expect(timing.slowest_rule_id == null);
+}
+
+test "rule timing attributes cost to a rule, and costs nothing when off" {
+    const input =
+        \\SecRule ARGS "@rx attack" "id:942100,phase:1,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "timing.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+
+    var recorder = debug_log.Recorder.init(std.testing.allocator, .detail, .{});
+    defer recorder.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    builder.setDebugLog(&recorder);
+    builder.setRuleTiming(true);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/search?q=attack", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+
+    const timing = tx.ruleTiming();
+    try std.testing.expect(timing.measured);
+    // The slowest rule is attributed, which is what makes a timing useful: a total
+    // says something is slow, an attribution says what to look at.
+    try std.testing.expectEqual(@as(?u32, 942100), timing.slowest_rule_id);
+    try std.testing.expect(timing.slowest_nanoseconds <= timing.total_nanoseconds);
+
+    // The record carries the duration.
+    var buffer: [2048]u8 = undefined;
+    var writer = std.Io.Writer.fixed(&buffer);
+    try recorder.render(&writer);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "matched in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, writer.buffered(), "ns") != null);
+}
+
+test "a transaction with no debug log configured records nothing and still runs" {
+    // The sink is optional, and the engine must not depend on it: this is the
+    // configuration every production deployment runs in.
+    const input =
+        \\SecRule ARGS "@rx attack" "id:1,phase:1,deny,status:403"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "none.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/search?q=attack", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    try std.testing.expect((try tx.intervention()) != null);
 }
