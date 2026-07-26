@@ -282,7 +282,7 @@
       "id": "api.c-connector",
       "area": "connectors",
       "name": "Versioned C connector ABI",
-      "status": "partial",
+      "status": "implemented",
       "issue": "https://github.com/zig-utils/zig-waf/issues/33",
       "modsecurity": true,
       "coraza": true,
@@ -292,7 +292,7 @@
         "src/c_api.zig",
         "tests/c_api_smoke.c"
       ],
-      "notes": "Opaque ownership, sized structs, rule-set loading (zig_waf_create_with_rules compiles a SecLang config), the full transaction lifecycle, autonomous phase evaluation (zig_waf_transaction_evaluate_phase), feature discovery, errors, intervention retrieval, and audit-log serialization (zig_waf_transaction_serialize_audit_log + zig_waf_free) are implemented \u2014 the complete seam a native data plane (e.g. the rpx dataplane) links against to run traffic through the engine. The C smoke test drives the full flow (rules -> request -> evaluate -> 403). Callbacks and the ABI compatibility matrix remain."
+      "notes": "Opaque ownership, sized structs, rule-set loading (zig_waf_create_with_rules compiles a SecLang config), the full transaction lifecycle, autonomous phase evaluation (zig_waf_transaction_evaluate_phase), feature discovery, errors, intervention retrieval, and audit-log serialization (zig_waf_transaction_serialize_audit_log + zig_waf_free) are implemented \u2014 the complete seam a native data plane (e.g. the rpx dataplane) links against to run traffic through the engine. The C smoke test drives the full flow (rules -> request -> evaluate -> 403). The compatibility rules are documented in docs/c-abi.md (version comparison, additive-only growth from the reserved arrays, struct_size negotiation in both directions, capability bits, ownership) and pinned by a test over the sizes and offsets, so a layout change fails the build rather than being found by a connector in production. Audit records are pulled through serialize_audit_log rather than pushed through a callback, keeping the ABI free of anything that would run library code on a connector's thread unasked."
     },
     {
       "id": "tooling.cli",
