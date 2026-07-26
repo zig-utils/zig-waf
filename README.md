@@ -52,6 +52,9 @@ failover, and the operator drills that verify each one — is documented in
 The control-plane API's resources, authorization, and versioning are defined in
 [`src/api-v1.json`](src/api-v1.json) (OpenAPI 3.1), held in step with the route table
 in `src/api.zig` by a test.
+What the engine reports about itself — metrics, the debug log and its levels, rule
+timing, and W3C trace correlation — is documented in
+[`docs/observability.md`](docs/observability.md).
 The C connector ABI's versioning, struct-size negotiation, capability discovery, and
 ownership rules are documented in [`docs/c-abi.md`](docs/c-abi.md).
 The host extension contracts — what can be registered, what deliberately cannot,
