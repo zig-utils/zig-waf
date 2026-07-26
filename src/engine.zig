@@ -5,6 +5,7 @@ const action_config = @import("action_config.zig");
 const collections = @import("collections.zig");
 const compiled_plan = @import("plan.zig");
 const debug_log = @import("debug_log.zig");
+const trace = @import("trace.zig");
 const directives = @import("directives.zig");
 const plugin = @import("plugin.zig");
 const metrics_mod = @import("metrics.zig");
@@ -587,6 +588,10 @@ pub const RetiredGeneration = struct {
 
 pub const TransactionError = error{
     InvalidLifecycle,
+    /// No secure random source, so no trace identifier can be generated. Reported
+    /// rather than substituted with something predictable, which would let one
+    /// request's trace be attributed to another.
+    RandomUnavailable,
     Deinitialized,
     InvalidConnectionAddress,
     InvalidMethod,
@@ -1027,6 +1032,9 @@ pub const Transaction = struct {
     /// this tells them what to look at.
     slowest_rule_nanoseconds: u64 = 0,
     slowest_rule_id: ?u32 = null,
+    /// Cached on first request so one transaction reports one span. Null until asked,
+    /// so a deployment that never traces generates no identifiers.
+    trace_resolution: ?trace.Resolution = null,
     sequence: u64,
     highest_severity: u8 = 255,
     args_combined_size: usize = 0,
@@ -2733,6 +2741,32 @@ pub const Transaction = struct {
         const availability = self.currentAvailability() orelse return null;
         if (@backingInt(availability) < @backingInt(name.minimumAvailability())) return null;
         return self.collection_variables.select(name, selector);
+    }
+
+    /// The trace this transaction belongs to (#32): the incoming W3C trace context
+    /// continued with a span of the WAF's own, or a fresh trace when the request
+    /// carries no usable one.
+    ///
+    /// Resolved on demand rather than at transaction start, because most deployments
+    /// do not trace and generating identifiers nobody reads is per-request work for
+    /// nothing. The result is cached, so asking twice gives the same span — a WAF that
+    /// reported two different spans for one decision would correlate to neither.
+    ///
+    /// The header comes from the client, so it is parsed strictly and discarded when
+    /// malformed; `inherited` says which happened, since a span whose parent was
+    /// discarded is a root span and must not claim a parent that will never arrive.
+    pub fn traceContext(self: *Transaction) TransactionError!trace.Resolution {
+        if (self.trace_resolution) |cached| return cached;
+        const header = if (try self.collectionFirst(.request_headers, "traceparent")) |view| view.value else null;
+        const resolved = trace.resolve(header, self.waf.io) catch |err| switch (err) {
+            // Without a random source there are no identifiers to correlate by. That
+            // is worth reporting rather than inventing a predictable id, which would
+            // let one request's trace be attributed to another.
+            error.RandomFailed => return error.RandomUnavailable,
+            error.MalformedTraceparent => unreachable, // `resolve` never surfaces this
+        };
+        self.trace_resolution = resolved;
+        return resolved;
     }
 
     pub fn collectionFirst(self: *const Transaction, name: collections.Name, key: []const u8) TransactionError!?collections.View {
@@ -8404,4 +8438,53 @@ test "a transaction with no debug log configured records nothing and still runs"
     try tx.processRequestHeaders();
     try tx.evaluatePhase(std.testing.allocator, .request_headers);
     try std.testing.expect((try tx.intervention()) != null);
+}
+
+test "a transaction correlates with the incoming trace, and refuses a poisoned one" {
+    var builder = Builder.init(std.testing.allocator);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/checkout", "POST", "HTTP/1.1");
+    try tx.addRequestHeader("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    try tx.processRequestHeaders();
+
+    const resolved = try tx.traceContext();
+    try std.testing.expect(resolved.inherited);
+    const expected = try trace.parseTraceparent("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01");
+    try std.testing.expectEqualSlices(u8, &expected.trace_id, &resolved.context.trace_id);
+    // The WAF's span is its own, so its record is a child of the caller's rather than
+    // a second report of the same span.
+    try std.testing.expect(!std.mem.eql(u8, &expected.span_id, &resolved.context.span_id));
+
+    // Asked twice, the same span: a WAF reporting two spans for one decision would
+    // correlate to neither.
+    const again = try tx.traceContext();
+    try std.testing.expectEqualSlices(u8, &resolved.context.span_id, &again.context.span_id);
+
+    // A client-supplied header that is not a valid traceparent is discarded, and the
+    // transaction gets a trace of its own rather than one the client chose.
+    var poisoned = waf.newTransaction();
+    defer poisoned.deinit();
+    try poisoned.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try poisoned.processUri("/checkout", "POST", "HTTP/1.1");
+    try poisoned.addRequestHeader("traceparent", "00-00000000000000000000000000000000-0000000000000000-01");
+    try poisoned.processRequestHeaders();
+    const started = try poisoned.traceContext();
+    try std.testing.expect(!started.inherited);
+    try std.testing.expect(!std.mem.eql(u8, &expected.trace_id, &started.context.trace_id));
+
+    // A request with no traceparent at all still gets a trace, so a WAF decision is
+    // always addressable.
+    var untraced = waf.newTransaction();
+    defer untraced.deinit();
+    try untraced.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try untraced.processUri("/", "GET", "HTTP/1.1");
+    try untraced.processRequestHeaders();
+    const fresh = try untraced.traceContext();
+    try std.testing.expect(!fresh.inherited);
+    try std.testing.expect(fresh.context.sampled());
 }

@@ -13,6 +13,7 @@ pub const storage_fuzz = @import("storage_fuzz.zig");
 pub const collections = @import("collections.zig");
 pub const debug_log = @import("debug_log.zig");
 pub const directives = @import("directives.zig");
+pub const trace = @import("trace.zig");
 pub const engine = @import("engine.zig");
 pub const flow_evidence = @import("flow_evidence.zig");
 pub const macros = @import("macros.zig");
