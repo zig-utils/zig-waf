@@ -52,6 +52,16 @@ The host extension contracts — what can be registered, what deliberately canno
 and why an unavailable plugin is not the same as a clean request — are documented in
 [`docs/plugins.md`](docs/plugins.md).
 
+## Community
+
+For help, discussion about best practices, or any other conversation that would benefit from being searchable:
+
+[Discussions on GitHub](https://github.com/zig-utils/zig-waf/discussions)
+
+For casual chit-chat with others using this package:
+
+[Join the Stacks Discord Server](https://stacksjs.com/discord)
+
 ## License
 
 MIT. Imported compatibility fixtures retain their upstream licenses and
