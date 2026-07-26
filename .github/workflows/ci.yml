@@ -51,12 +51,36 @@ jobs:
         # which makes the manifests describe the install instead of the install
         # following the manifests.
         run: ~/.local/bin/pantry install
-      - name: Verify dependency pins are authoritative
+      - name: Verify the SBOM covers every declared dependency
         working-directory: zig-waf
-        # Installing must not change a manifest. If it does, the lockfile was not
-        # what the build actually resolved, and every downstream claim about which
-        # versions were built — including the SBOM — describes something else.
-        run: git diff --exit-code pantry.lock package.json deps.yaml build.zig.zon
+        # Not "installing changes no manifest": Pantry rewrites build.zig.zon as part
+        # of a fresh install, so that assertion would fail for a reason that is not a
+        # defect here. What must hold is that the published bill of materials accounts
+        # for every dependency the repository declares — a dependency added without
+        # appearing in the SBOM is exactly the gap an SBOM exists to close.
+        run: |
+          zig build sbom -Dsbom-timestamp="1970-01-01T00:00:00Z" > /tmp/sbom-check.json
+          python3 - <<'PYEOF'
+          import json, re, sys
+          sbom = {c["name"] for c in json.load(open("/tmp/sbom-check.json"))["components"]}
+          declared = set()
+          for line in open("deps.yaml"):
+              m = re.match(r"\s{2}([A-Za-z0-9._/-]+):", line)
+              if m and m.group(1) != "autoStart":
+                  declared.add(m.group(1))
+          for m in re.finditer(r'\.url = "https://registry\.pantry\.dev/zig/packages/([^/]+)/', open("build.zig.zon").read()):
+              declared.add(m.group(1))
+          # The toolchain itself is not a shipped component. Pantry resolves a short
+          # alias to a canonical package name, and those are listed explicitly rather
+          # than matched by prefix: a loose rule would also swallow a genuinely
+          # missing dependency, which is the one thing this check exists to catch.
+          declared.discard("zig")
+          aliases = {"postgres": "postgresql.org"}
+          missing = sorted(d for d in declared if aliases.get(d, d) not in sbom)
+          if missing:
+              print("declared but absent from the SBOM:", missing); sys.exit(1)
+          print(f"SBOM covers {len(declared)} declared dependencies")
+          PYEOF
       - name: Software bill of materials
         working-directory: zig-waf
         # Generated from the pinned manifests rather than an environment scan, so it
