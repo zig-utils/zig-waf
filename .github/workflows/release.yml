@@ -30,7 +30,7 @@ jobs:
             target: x86_64-linux
           - runner: ubuntu-24.04-arm
             target: aarch64-linux
-          - runner: macos-13
+          - runner: macos-15-intel
             target: x86_64-macos
           - runner: macos-latest
             target: aarch64-macos
@@ -83,6 +83,7 @@ jobs:
   # once, with whatever the matrix produced.
   release:
     needs: build
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -95,7 +96,14 @@ jobs:
           merge-multiple: true
 
       - name: Show what will be attached
-        run: ls -l dist
+        # Fails loudly when the matrix produced nothing at all, rather than
+        # cutting an empty release.
+        run: |
+          ls -l dist
+          test -n "$(find dist -name '*.tar.gz' -print -quit)" || {
+            echo "No archives were built; every matrix target failed." >&2
+            exit 1
+          }
 
       - uses: home-lang/pantry/packages/action@main
         with:
