@@ -10,8 +10,31 @@ permissions:
   id-token: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  # One job per target, each on a runner of that architecture.
+  #
+  # These are native builds, not cross-compiles, and that is deliberate.
+  # build.zig links the native archives by their host pantry paths (liblmdb,
+  # libxml2, zstd, libpq), so passing -Dtarget hands an archive built for the
+  # runner to a linker targeting something else. That does not fail the build:
+  # lld warns the archive members are "neither ET_REL nor LLVM bitcode", skips
+  # them, and `zig build` still exits 0 with an executable installed. Shipping
+  # those would mean shipping binaries missing the code they were linked
+  # against. Building on a matching runner lets pantry install the right
+  # architecture's libraries and keeps the link honest.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux
+          - runner: macos-13
+            target: x86_64-macos
+          - runner: macos-latest
+            target: aarch64-macos
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -21,8 +44,6 @@ jobs:
         with:
           version: 0.17.0-dev.1441+d5181a9c9
 
-      # The native libraries this links are not vendored, so they are installed
-      # the same way ci.yml installs them, at the same pinned versions.
       - name: Install Pantry 0.10.47
         env:
           PANTRY_VERSION: 0.10.47
@@ -40,25 +61,41 @@ jobs:
         # source of truth for what this build uses.
         run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
 
-      # One target, deliberately. build.zig links the native archives by their
-      # host pantry paths (liblmdb, libxml2, zstd, libpq), so a cross-compile
-      # hands an archive built for this runner to a linker targeting something
-      # else. That does not fail the build: lld warns that the archive members
-      # are "neither ET_REL nor LLVM bitcode", skips them, and still writes an
-      # executable. Publishing binaries produced that way would ship something
-      # that looks right and is missing the code it was linked against. An
-      # aarch64 build, which is what a Raspberry Pi needs, has to wait until the
-      # native dependencies are provided per target rather than per host.
       - name: Build
         run: zig build -Doptimize=ReleaseFast -p zig-out/release
 
-      - name: Package release archive
-        # Named here rather than by the action's `auto` mode, whose output has
-        # changed shape between releases of the action in the sibling repos.
+      - name: Package
+        # Named here rather than by the release action's `auto` mode, whose
+        # output changed shape between two releases of a sibling repository and
+        # renamed every asset.
         run: |
           mkdir -p dist
-          tar -C zig-out/release -czf "dist/zig-waf-x86_64-linux.tar.gz" .
+          tar -C zig-out/release -czf "dist/zig-waf-${{ matrix.target }}.tar.gz" .
           ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zig-waf-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  # Publishes the Zig package to the registry and creates the GitHub release
+  # once, with whatever the matrix produced.
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Show what will be attached
+        run: ls -l dist
 
       - uses: home-lang/pantry/packages/action@main
         with:
@@ -69,4 +106,6 @@ jobs:
           release-changelog: auto
           release-checksums: true
           token: ${{ secrets.PANTRY_TOKEN }}
+          # The action falls back to GITHUB_TOKEN in the environment, which
+          # GitHub does not set on its own.
           release-token: ${{ secrets.GITHUB_TOKEN }}
