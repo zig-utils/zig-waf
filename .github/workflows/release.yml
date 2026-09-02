@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0-dev.1441+d5181a9c9
+
+      # The native libraries this links are not vendored, so they are installed
+      # the same way ci.yml installs them, at the same pinned versions.
+      - name: Install Pantry 0.10.47
+        env:
+          PANTRY_VERSION: 0.10.47
+        run: curl -fsSL https://pantry.dev | bash
+
+      - name: Install locked LMDB and libxml2
+        run: |
+          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
+          ~/.local/bin/pantry install gnome.org/libxml2@2.13.9
+
+      - name: Restore manifests after install
+        # Installing rewrites the manifests as a side effect: naming a package
+        # re-adds it to deps.yaml, and a bare install strips the Zig
+        # dependencies out of build.zig.zon. The committed manifests are the
+        # source of truth for what this build uses.
+        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
+
+      # One target, deliberately. build.zig links the native archives by their
+      # host pantry paths (liblmdb, libxml2, zstd, libpq), so a cross-compile
+      # hands an archive built for this runner to a linker targeting something
+      # else. That does not fail the build: lld warns that the archive members
+      # are "neither ET_REL nor LLVM bitcode", skips them, and still writes an
+      # executable. Publishing binaries produced that way would ship something
+      # that looks right and is missing the code it was linked against. An
+      # aarch64 build, which is what a Raspberry Pi needs, has to wait until the
+      # native dependencies are provided per target rather than per host.
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast -p zig-out/release
+
+      - name: Package release archive
+        # Named here rather than by the action's `auto` mode, whose output has
+        # changed shape between releases of the action in the sibling repos.
+        run: |
+          mkdir -p dist
+          tar -C zig-out/release -czf "dist/zig-waf-x86_64-linux.tar.gz" .
+          ls -l dist
+
+      - uses: home-lang/pantry/packages/action@main
+        with:
+          publish: zig
+          install: false
+          release: true
+          release-files: dist/*.tar.gz
+          release-changelog: auto
+          release-checksums: true
+          token: ${{ secrets.PANTRY_TOKEN }}
+          release-token: ${{ secrets.GITHUB_TOKEN }}
