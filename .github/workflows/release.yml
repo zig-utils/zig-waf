@@ -44,22 +44,15 @@ jobs:
         with:
           version: 0.17.0-dev.1441+d5181a9c9
 
-      - name: Install Pantry 0.10.47
+      - name: Install Pantry 0.11.212
         env:
-          PANTRY_VERSION: 0.10.47
+          PANTRY_VERSION: 0.11.212
         run: curl -fsSL https://pantry.dev | bash
 
       - name: Install locked LMDB and libxml2
         run: |
-          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
-          ~/.local/bin/pantry install gnome.org/libxml2@2.13.9
-
-      - name: Restore manifests after install
-        # Installing rewrites the manifests as a side effect: naming a package
-        # re-adds it to deps.yaml, and a bare install strips the Zig
-        # dependencies out of build.zig.zon. The committed manifests are the
-        # source of truth for what this build uses.
-        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
+          ~/.local/bin/pantry install --no-save openldap.org/liblmdb@0.9.35
+          ~/.local/bin/pantry install --no-save gnome.org/libxml2@2.13.9
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast -p zig-out/release

@@ -40,31 +40,27 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0-dev.1441+d5181a9c9
-      - name: Install Pantry 0.10.47
+      - name: Install Pantry 0.11.212
         env:
-          PANTRY_VERSION: 0.10.47
+          PANTRY_VERSION: 0.11.212
         run: curl -fsSL https://pantry.dev | bash
       - name: Install locked LMDB and libxml2
         working-directory: zig-waf
         run: |
-          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
-          ~/.local/bin/pantry install gnome.org/libxml2@2.13.9
-      - name: Restore manifests after install
+          ~/.local/bin/pantry install --no-save openldap.org/liblmdb@0.9.35
+          ~/.local/bin/pantry install --no-save gnome.org/libxml2@2.13.9
+      - name: Installing changes no manifest
         working-directory: zig-waf
-        # Pantry rewrites the manifests as a side effect of installing: naming a
-        # package re-adds it to deps.yaml, and a bare install strips the Zig
-        # dependencies out of build.zig.zon entirely (which breaks configure). The
-        # committed manifests are the source of truth for what this build uses, so
-        # they are restored before anything reads them — in particular the SBOM,
-        # which must describe the repository rather than the runner.
-        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
+        # The committed manifests are what this build uses. `--no-save` keeps a named
+        # install out of deps.yaml and the lockfile, and Pantry 0.11.212 no longer
+        # strips the Zig dependencies from build.zig.zon, so any change here is a
+        # Pantry regression, not something to restore and move past.
+        run: git diff --exit-code -- deps.yaml pantry.lock package.json build.zig.zon
       - name: Verify the SBOM covers every declared dependency
         working-directory: zig-waf
-        # Not "installing changes no manifest": Pantry rewrites build.zig.zon as part
-        # of a fresh install, so that assertion would fail for a reason that is not a
-        # defect here. What must hold is that the published bill of materials accounts
-        # for every dependency the repository declares — a dependency added without
-        # appearing in the SBOM is exactly the gap an SBOM exists to close.
+        # The published bill of materials accounts for every dependency the
+        # repository declares: a dependency added without appearing in the SBOM is
+        # exactly the gap an SBOM exists to close.
         run: |
           zig build sbom -Dsbom-timestamp="1970-01-01T00:00:00Z" > /tmp/sbom-check.json
           python3 - <<'PYEOF'
@@ -309,21 +305,16 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.17.0-dev.1441+d5181a9c9
-      - name: Install Pantry 0.10.47
+      - name: Install Pantry 0.11.212
         env:
-          PANTRY_VERSION: 0.10.47
+          PANTRY_VERSION: 0.11.212
         run: curl -fsSL https://pantry.dev | bash
       - name: Install the locked libraries this suite links
         working-directory: zig-waf
         run: |
-          ~/.local/bin/pantry install postgresql.org/libpq@18
-          ~/.local/bin/pantry install facebook.com/zstd@1.5.7
-          ~/.local/bin/pantry install openldap.org/liblmdb@0.9.35
-      - name: Restore manifests after install
-        working-directory: zig-waf
-        # Same reason as the test job: installing by name rewrites deps.yaml, and the
-        # committed manifests are the source of truth for what this build uses.
-        run: git checkout -- deps.yaml pantry.lock package.json build.zig.zon
+          ~/.local/bin/pantry install --no-save postgresql.org/libpq@18
+          ~/.local/bin/pantry install --no-save facebook.com/zstd@1.5.7
+          ~/.local/bin/pantry install --no-save openldap.org/liblmdb@0.9.35
       - name: Fleet storage integration tests
         working-directory: zig-waf
         env:
