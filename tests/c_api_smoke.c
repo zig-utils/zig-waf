@@ -13,6 +13,10 @@ int main(void) {
     assert((features.feature_bits & ZIG_WAF_FEATURE_TRANSACTION_LIFECYCLE) != 0);
     assert((features.feature_bits & ZIG_WAF_FEATURE_SCALAR_VARIABLES) != 0);
     assert((features.feature_bits & ZIG_WAF_FEATURE_ATOMIC_HOT_RELOAD) != 0);
+    /* The header names every bit the library reports, and reports every bit the
+     * header names: a bit published at the wrong position would otherwise test a
+     * different feature than the one its name promises. */
+    assert(features.feature_bits == ZIG_WAF_FEATURE_KNOWN_BITS);
     assert(features.highest_phase == ZIG_WAF_PHASE_LOGGING);
 
     zig_waf_config_t config = {0};

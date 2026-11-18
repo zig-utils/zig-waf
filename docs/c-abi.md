@@ -50,14 +50,30 @@ function's signature is a **major** bump.
 asks rather than assumes: a build without a feature returns a clear bit rather than
 a stub that silently does nothing.
 
-| Bit | Meaning |
-| --- | --- |
-| `TRANSACTION_LIFECYCLE` | The five inspection phases plus logging |
-| `BOUNDED_STREAMING_BODIES` | Request and response bodies may be streamed in chunks under a limit |
-| `DETECTION_ONLY` | Interventions can be reported without being enforced |
-| `NATIVE_SQLI` | libinjection-backed `@detectSQLi`/`@detectXSS` |
-| `SCALAR_VARIABLES` | Bounded scalar transaction variables |
-| `ATOMIC_HOT_RELOAD` | A rule set can be replaced while transactions are in flight |
+| Bit | Name | Meaning |
+| --- | --- | --- |
+| 0 | `TRANSACTION_LIFECYCLE` | The five inspection phases plus logging |
+| 1 | `BOUNDED_STREAMING_BODIES` | Request and response bodies may be streamed in chunks under a limit |
+| 2 | `DETECTION_ONLY` | Interventions can be reported without being enforced |
+| 3 | `NATIVE_SQLI` | libinjection-backed `@detectSQLi`/`@detectXSS` |
+| 4 | `SCALAR_VARIABLES` | Bounded scalar transaction variables |
+| 5 | `COLLECTION_VARIABLES` | Collection variables, with selectors |
+| 6 | `RUNTIME_MACROS` | `%{...}` macro expansion at evaluation time |
+| 7 | `PERSISTENT_COLLECTIONS` | `initcol` collections through a storage backend |
+| 8 | `ATOMIC_HOT_RELOAD` | A rule set can be replaced while transactions are in flight |
+| 9 | `COMPILED_EXECUTION_PLAN` | Rules run from a compiled, validated plan |
+| 10 | `TRANSFORMATION_EXECUTION` | The pinned transformation set runs on rule inputs |
+
+`ZIG_WAF_FEATURE_KNOWN_BITS` is every bit the header names. A bit outside it is one
+the header predates, and a connector ignores it rather than guessing what it means.
+
+The numbers are fixed. The engine derives each one from the order of `waf.Feature`;
+`src/c_api.zig` pins that order against this table, and the C smoke test checks that
+the library reports exactly the bits the header names. Through 0.0.3 the header
+published `ATOMIC_HOT_RELOAD` at bit 5, which the library has always used for
+collection variables, so a connector built against that header was testing a
+different feature than the one it named. Rebuild such a connector against the
+corrected header.
 
 ## Ownership
 

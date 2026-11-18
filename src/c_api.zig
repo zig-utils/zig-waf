@@ -484,6 +484,35 @@ test "abi_version and feature query validate their struct contract" {
     try testing.expectEqual(Status.ok, zig_waf_query_features(&features));
 }
 
+test "feature bits sit where the header publishes them" {
+    // `include/zig_waf.h` names each bit by number. The engine derives the number
+    // from the order of `waf.Feature`, so reordering that enum would move a bit
+    // under a connector that tests the header's constant, and the connector would
+    // be asking about a different feature than the one it named. The C smoke test
+    // checks the header from its side; this checks the engine from this one.
+    const published = [_]struct { waf.Feature, u6 }{
+        .{ .transaction_lifecycle, 0 },
+        .{ .bounded_streaming_bodies, 1 },
+        .{ .detection_only, 2 },
+        .{ .native_sqli, 3 },
+        .{ .scalar_variables, 4 },
+        .{ .collection_variables, 5 },
+        .{ .runtime_macros, 6 },
+        .{ .persistent_collections, 7 },
+        .{ .atomic_hot_reload, 8 },
+        .{ .compiled_execution_plan, 9 },
+        .{ .transformation_execution, 10 },
+    };
+    var known: u64 = 0;
+    for (published) |entry| {
+        try testing.expectEqual(entry[1], @backingInt(entry[0]));
+        known |= @as(u64, 1) << entry[1];
+    }
+    // A feature added to the engine without a published bit fails here, so the
+    // header cannot fall behind what the library reports.
+    try testing.expectEqual(known, feature_bits);
+}
+
 test "create rejects malformed config and a null output" {
     var handle: *WafHandle = undefined;
     try testing.expectEqual(Status.invalid_argument, zig_waf_create(null, null));
