@@ -42,6 +42,8 @@ pub const Feature = enum(u6) {
     atomic_hot_reload,
     compiled_execution_plan,
     transformation_execution,
+    /// Host-provided operators (`plugin.Registry`), registrable through the C ABI.
+    plugin_operators,
 };
 
 pub const FeatureSet = struct {

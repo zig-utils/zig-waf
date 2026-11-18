@@ -85,3 +85,22 @@ builder.setPluginRegistry(&registry);
 network round trip is expected to answer from a cache it maintains elsewhere and
 report `unavailable` on a miss — which is a truthful answer, where a guess would
 not be.
+
+## Writing a plugin in C
+
+A connector that embeds zig-waf through `include/zig_waf.h` registers operators the
+same way, with the same two properties (ABI 1.1, feature bit `PLUGIN_OPERATORS`):
+
+```c
+zig_waf_plugins_t *plugins = NULL;
+zig_waf_plugins_create(&plugins);
+zig_waf_register_operator(plugins, (const uint8_t *)"geoLookup", 9, &lookup, geo_evaluate);
+config.plugins = plugins;
+zig_waf_create_with_rules(&config, rules, rules_len, &waf);
+```
+
+The callback returns `ZIG_WAF_OPERATOR_MATCH`, `ZIG_WAF_OPERATOR_NO_MATCH` or
+`ZIG_WAF_OPERATOR_UNAVAILABLE`, mirroring `Outcome`, and the unanswered count is read
+with `zig_waf_transaction_plugin_unavailable_count`. The names reach the compiler
+before the rules do, so an operator nothing registered is still a compile error. The
+details, including ownership, are in [`docs/c-abi.md`](c-abi.md#host-operators).

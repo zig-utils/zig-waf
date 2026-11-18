@@ -8,10 +8,13 @@
 extern "C" {
 #endif
 
-#define ZIG_WAF_ABI_VERSION 0x00010000u
+/* 1.1: host operator registration, zig_waf_config_t.plugins, and
+ * zig_waf_transaction_plugin_unavailable_count. */
+#define ZIG_WAF_ABI_VERSION 0x00010001u
 
 typedef struct zig_waf zig_waf_t;
 typedef struct zig_waf_transaction zig_waf_transaction_t;
+typedef struct zig_waf_plugins zig_waf_plugins_t;
 
 typedef enum zig_waf_status {
     ZIG_WAF_OK = 0,
@@ -57,7 +60,8 @@ enum zig_waf_feature_bit {
     ZIG_WAF_FEATURE_PERSISTENT_COLLECTIONS = UINT64_C(1) << 7,
     ZIG_WAF_FEATURE_ATOMIC_HOT_RELOAD = UINT64_C(1) << 8,
     ZIG_WAF_FEATURE_COMPILED_EXECUTION_PLAN = UINT64_C(1) << 9,
-    ZIG_WAF_FEATURE_TRANSFORMATION_EXECUTION = UINT64_C(1) << 10
+    ZIG_WAF_FEATURE_TRANSFORMATION_EXECUTION = UINT64_C(1) << 10,
+    ZIG_WAF_FEATURE_PLUGIN_OPERATORS = UINT64_C(1) << 11
 };
 
 /* Every bit the library can report. A bit outside this mask is one this header
@@ -68,7 +72,7 @@ enum zig_waf_feature_bit {
     ZIG_WAF_FEATURE_SCALAR_VARIABLES | ZIG_WAF_FEATURE_COLLECTION_VARIABLES | \
     ZIG_WAF_FEATURE_RUNTIME_MACROS | ZIG_WAF_FEATURE_PERSISTENT_COLLECTIONS | \
     ZIG_WAF_FEATURE_ATOMIC_HOT_RELOAD | ZIG_WAF_FEATURE_COMPILED_EXECUTION_PLAN | \
-    ZIG_WAF_FEATURE_TRANSFORMATION_EXECUTION)
+    ZIG_WAF_FEATURE_TRANSFORMATION_EXECUTION | ZIG_WAF_FEATURE_PLUGIN_OPERATORS)
 
 typedef struct zig_waf_config {
     uint32_t struct_size;
@@ -80,7 +84,10 @@ typedef struct zig_waf_config {
     size_t max_header_bytes;
     size_t max_request_body_bytes;
     size_t max_response_body_bytes;
-    uint64_t reserved[8];
+    /* ABI 1.1: host operators the rule compiler may resolve, or NULL. Read only
+     * when abi_version is 1.1 or later; it occupies what was reserved[0]. */
+    const zig_waf_plugins_t *plugins;
+    uint64_t reserved[7];
 } zig_waf_config_t;
 
 typedef struct zig_waf_features {
@@ -102,6 +109,30 @@ typedef struct zig_waf_intervention {
     uint32_t rule_id;
     uint64_t reserved[4];
 } zig_waf_intervention_t;
+
+/* What a host operator answers. Any other value is treated as UNAVAILABLE. */
+typedef enum zig_waf_operator_outcome {
+    ZIG_WAF_OPERATOR_NO_MATCH = 0,
+    ZIG_WAF_OPERATOR_MATCH = 1,
+    ZIG_WAF_OPERATOR_UNAVAILABLE = 2
+} zig_waf_operator_outcome_t;
+
+/* A host operator. parameter is the rule's operator argument after macro
+ * expansion, input the transformed value under inspection; both are borrowed
+ * for the call only, and a pointer whose length is 0 must not be read.
+ *
+ * It runs on the request path and must not block: no file, socket or process
+ * work. Answer from state maintained elsewhere, and return UNAVAILABLE when that
+ * state cannot answer. UNAVAILABLE does not match but is counted (see
+ * zig_waf_transaction_plugin_unavailable_count), because an operator that could
+ * not run is not an input found clean. It may run concurrently on several
+ * threads. */
+typedef zig_waf_operator_outcome_t (*zig_waf_operator_fn)(
+    void *context,
+    const uint8_t *parameter,
+    size_t parameter_len,
+    const uint8_t *input,
+    size_t input_len);
 
 uint32_t zig_waf_abi_version(void);
 zig_waf_status_t zig_waf_query_features(zig_waf_features_t *out_features);
@@ -125,6 +156,26 @@ zig_waf_status_t zig_waf_create_with_rules_at(
     size_t data_dir_len,
     zig_waf_t **out_waf);
 zig_waf_status_t zig_waf_destroy(zig_waf_t *waf);
+
+/* Host operators (ABI 1.1). Register into a plugins set, point
+ * zig_waf_config_t.plugins at it, and create the WAF: a rule naming a registered
+ * operator compiles, and one naming an operator nothing provides still fails
+ * with ZIG_WAF_ERROR_INVALID_CONFIG. Each WAF copies the registrations it was
+ * created with, so the set may be destroyed or extended afterwards; context and
+ * callback must stay valid until every WAF created with them is destroyed.
+ *
+ * name is letters, digits and underscores, with or without a leading '@', and
+ * matched case-insensitively. An invalid name, a NULL callback, or a name
+ * already registered returns ZIG_WAF_ERROR_INVALID_ARGUMENT. A plugins set is
+ * not thread-safe; build it before sharing the config. */
+zig_waf_status_t zig_waf_plugins_create(zig_waf_plugins_t **out_plugins);
+void zig_waf_plugins_destroy(zig_waf_plugins_t *plugins);
+zig_waf_status_t zig_waf_register_operator(
+    zig_waf_plugins_t *plugins,
+    const uint8_t *name,
+    size_t name_len,
+    void *context,
+    zig_waf_operator_fn callback);
 
 zig_waf_status_t zig_waf_transaction_create(zig_waf_t *waf, zig_waf_transaction_t **out_transaction);
 void zig_waf_transaction_destroy(zig_waf_transaction_t *transaction);
@@ -183,6 +234,11 @@ zig_waf_status_t zig_waf_transaction_evaluate_phase(
 zig_waf_status_t zig_waf_transaction_intervention(
     const zig_waf_transaction_t *transaction,
     zig_waf_intervention_t *out_intervention);
+
+/* How many times a host operator answered UNAVAILABLE in this transaction. */
+zig_waf_status_t zig_waf_transaction_plugin_unavailable_count(
+    const zig_waf_transaction_t *transaction,
+    uint64_t *out_count);
 
 /* Serialize the audit record. format: 0 serial, 1 JSON, 2 legacy JSON, 3 OCSF,
  * or ZIG_WAF_AUDIT_FORMAT_CONFIGURED to use the SecAuditLogFormat directive

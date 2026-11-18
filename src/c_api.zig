@@ -1,7 +1,23 @@
 const std = @import("std");
 const waf = @import("waf");
 
-pub const abi_version: u32 = 0x0001_0000;
+/// 1.1 added host operator registration (`zig_waf_register_operator`), the
+/// `plugins` field of the config, and the plugin-unavailable counter.
+pub const abi_version: u32 = 0x0001_0001;
+const abi_major: u32 = abi_version >> 16;
+const abi_minor: u32 = abi_version & 0xFFFF;
+
+/// The minor version that gave `Config.plugins` its meaning. A caller stamped with
+/// an older minor may have anything in that slot, which used to be reserved, so the
+/// library reads it only from callers that know it exists.
+const plugins_minor: u32 = 1;
+
+/// Whether a struct stamped with `caller` can be served: the same major, and a minor
+/// no newer than this library's (docs/c-abi.md). A newer minor names fields this
+/// library does not know, so it is refused rather than half-honoured.
+fn abiSupported(caller: u32) bool {
+    return caller >> 16 == abi_major and caller & 0xFFFF <= abi_minor;
+}
 
 const Status = enum(c_int) {
     ok = 0,
@@ -18,6 +34,7 @@ const Status = enum(c_int) {
 
 const WafHandle = opaque {};
 const TransactionHandle = opaque {};
+const PluginsHandle = opaque {};
 
 const Config = extern struct {
     struct_size: u32,
@@ -29,8 +46,16 @@ const Config = extern struct {
     max_header_bytes: usize,
     max_request_body_bytes: usize,
     max_response_body_bytes: usize,
-    reserved: [8]u64,
+    /// Host operators to offer the rule compiler (ABI 1.1). Taken from the first
+    /// reserved slot, so the struct keeps its size and every other offset.
+    plugins: ?*const PluginsHandle,
+    reserved: [7]u64,
 };
+
+comptime {
+    // The pointer must fill exactly the u64 it replaced, or `reserved` moves.
+    std.debug.assert(@sizeOf(?*const PluginsHandle) == @sizeOf(u64));
+}
 
 const Features = extern struct {
     struct_size: u32,
@@ -54,6 +79,115 @@ const CIntervention = extern struct {
 
 const feature_bits: u64 = waf.FeatureSet.allCompiled().bits;
 
+/// What a host operator callback answers. Mirrors `waf.plugin.Outcome`.
+const operator_no_match: c_int = 0;
+const operator_match: c_int = 1;
+const operator_unavailable: c_int = 2;
+
+/// A host operator as C sees it. `parameter` is the rule's operator argument after
+/// macro expansion and `input` the transformed value under inspection; neither is
+/// retained by the callee after it returns.
+const OperatorCallback = *const fn (
+    context: ?*anyopaque,
+    parameter: [*]const u8,
+    parameter_len: usize,
+    input: [*]const u8,
+    input_len: usize,
+) callconv(.c) c_int;
+
+const HostOperator = struct {
+    context: ?*anyopaque,
+    callback: OperatorCallback,
+
+    /// The `plugin.Operator` adapter: call into C and translate the answer. Any
+    /// value other than match or no-match counts as unavailable, because a callback
+    /// that answered something this library does not understand did not say the
+    /// input was clean.
+    fn evaluate(context: *anyopaque, parameter: []const u8, input: []const u8) waf.plugin.Outcome {
+        const self: *const HostOperator = @ptrCast(@alignCast(context));
+        return switch (self.callback(self.context, parameter.ptr, parameter.len, input.ptr, input.len)) {
+            operator_no_match => .{ .matched = false },
+            operator_match => .{ .matched = true },
+            else => .unavailable,
+        };
+    }
+};
+
+/// The operators a host has registered, before any WAF is built from them. A WAF
+/// copies what it needs when it is created, so this object can be destroyed, or
+/// added to for the next WAF, without affecting one already built.
+const Plugins = struct {
+    entries: std.ArrayList(Entry) = .empty,
+
+    const Entry = struct { name: []u8, host: HostOperator };
+
+    fn deinit(self: *Plugins) void {
+        for (self.entries.items) |entry| std.heap.page_allocator.free(entry.name);
+        self.entries.deinit(std.heap.page_allocator);
+    }
+
+    fn provides(self: *const Plugins, name: []const u8) bool {
+        for (self.entries.items) |entry| {
+            if (std.ascii.eqlIgnoreCase(entry.name, name)) return true;
+        }
+        return false;
+    }
+};
+
+/// A WAF's own copy of the registered operators, kept alive for as long as the WAF:
+/// the engine borrows the registry, and transactions call through it.
+const PluginSnapshot = struct {
+    hosts: []HostOperator,
+    names: [][]u8,
+    operators: []waf.plugin.Operator,
+    registry: waf.plugin.Registry,
+
+    fn create(source: *const Plugins) error{OutOfMemory}!*PluginSnapshot {
+        const gpa = std.heap.page_allocator;
+        const count = source.entries.items.len;
+        const self = try gpa.create(PluginSnapshot);
+        errdefer gpa.destroy(self);
+        const hosts = try gpa.alloc(HostOperator, count);
+        errdefer gpa.free(hosts);
+        const operators = try gpa.alloc(waf.plugin.Operator, count);
+        errdefer gpa.free(operators);
+        const names = try gpa.alloc([]u8, count);
+        errdefer gpa.free(names);
+
+        var copied: usize = 0;
+        errdefer for (names[0..copied]) |name| gpa.free(name);
+        for (source.entries.items, 0..) |entry, index| {
+            names[index] = try gpa.dupe(u8, entry.name);
+            copied += 1;
+            hosts[index] = entry.host;
+            operators[index] = .{ .name = names[index], .context = &hosts[index], .evaluateFn = HostOperator.evaluate };
+        }
+        self.* = .{
+            .hosts = hosts,
+            .names = names,
+            .operators = operators,
+            .registry = .{ .operators = operators },
+        };
+        return self;
+    }
+
+    fn destroy(self: *PluginSnapshot) void {
+        const gpa = std.heap.page_allocator;
+        for (self.names) |name| gpa.free(name);
+        gpa.free(self.names);
+        gpa.free(self.operators);
+        gpa.free(self.hosts);
+        gpa.destroy(self);
+    }
+};
+
+/// What a `zig_waf_t` points at: the engine, plus whatever it borrows that this
+/// layer had to allocate on the connector's behalf.
+const Instance = struct {
+    engine: *waf.Waf,
+    plugins: ?*PluginSnapshot,
+};
+
 export fn zig_waf_abi_version() callconv(.c) u32 {
     return abi_version;
 }
@@ -61,7 +195,7 @@ export fn zig_waf_abi_version() callconv(.c) u32 {
 export fn zig_waf_query_features(out_features: ?*Features) callconv(.c) Status {
     const output = out_features orelse return .invalid_argument;
     if (output.struct_size < @sizeOf(Features)) return .invalid_argument;
-    if (output.abi_version != abi_version) return .unsupported_abi;
+    if (!abiSupported(output.abi_version)) return .unsupported_abi;
     output.feature_bits = feature_bits;
     output.highest_phase = @backingInt(waf.Phase.logging);
     output.reserved0 = 0;
@@ -74,7 +208,7 @@ export fn zig_waf_query_features(out_features: ?*Features) callconv(.c) Status {
 fn configureBuilder(builder: *waf.Waf.Builder, config: ?*const Config) Status {
     const input = config orelse return .ok;
     if (input.struct_size < @sizeOf(Config)) return .invalid_argument;
-    if (input.abi_version != abi_version) return .unsupported_abi;
+    if (!abiSupported(input.abi_version)) return .unsupported_abi;
     builder.setMode(switch (input.mode) {
         0 => .enabled,
         1 => .detection_only,
@@ -90,6 +224,39 @@ fn configureBuilder(builder: *waf.Waf.Builder, config: ?*const Config) Status {
     return .ok;
 }
 
+/// The host operators a validated config offers, or null. Only a caller stamped
+/// with ABI 1.1 or later is asked: to an older one the slot was reserved.
+fn configuredPlugins(config: ?*const Config) ?*const Plugins {
+    const input = config orelse return null;
+    if (input.abi_version & 0xFFFF < plugins_minor) return null;
+    const handle = input.plugins orelse return null;
+    return @ptrCast(@alignCast(handle));
+}
+
+/// Build the engine, and wrap it with the plugin snapshot it borrows. On failure
+/// the snapshot is released here, so callers hand it over unconditionally.
+fn publish(builder: *waf.Waf.Builder, plugins: ?*PluginSnapshot, output: **WafHandle) Status {
+    const gpa = std.heap.page_allocator;
+    if (plugins) |snapshot| builder.setPluginRegistry(&snapshot.registry);
+    const engine = builder.build() catch |err| {
+        if (plugins) |snapshot| snapshot.destroy();
+        return mapError(err);
+    };
+    const instance = gpa.create(Instance) catch {
+        engine.deinit() catch {};
+        if (plugins) |snapshot| snapshot.destroy();
+        return .out_of_memory;
+    };
+    instance.* = .{ .engine = engine, .plugins = plugins };
+    output.* = @ptrCast(instance);
+    return .ok;
+}
+
+fn snapshotPlugins(config: ?*const Config) error{OutOfMemory}!?*PluginSnapshot {
+    const source = configuredPlugins(config) orelse return null;
+    return try PluginSnapshot.create(source);
+}
+
 export fn zig_waf_create(config: ?*const Config, out_waf: ?**WafHandle) callconv(.c) Status {
     const output = out_waf orelse return .invalid_argument;
     output.* = undefined;
@@ -97,9 +264,8 @@ export fn zig_waf_create(config: ?*const Config, out_waf: ?**WafHandle) callconv
     var builder = waf.Waf.Builder.init(std.heap.page_allocator);
     const configured = configureBuilder(&builder, config);
     if (configured != .ok) return configured;
-    const instance = builder.build() catch |err| return mapError(err);
-    output.* = @ptrCast(instance);
-    return .ok;
+    const plugins = snapshotPlugins(config) catch return .out_of_memory;
+    return publish(&builder, plugins, output);
 }
 
 /// Create a WAF whose rule set is compiled from a SecLang configuration. On a
@@ -162,8 +328,18 @@ const DataDirProvider = struct {
 };
 
 /// Shared compile-and-build for the rule-set create paths.
+///
+/// The registered operator names go to the compiler, so a rule naming one compiles
+/// and a rule naming an operator nothing provides still does not.
 fn compileRules(config: ?*const Config, rules: []const u8, provider: ?waf.plan.DataProvider, output: **WafHandle) Status {
     const gpa = std.heap.page_allocator;
+    var builder = waf.Waf.Builder.init(gpa);
+    const configured = configureBuilder(&builder, config);
+    if (configured != .ok) return configured;
+    const plugins = snapshotPlugins(config) catch return .out_of_memory;
+    var handed_over = false;
+    defer if (!handed_over) if (plugins) |snapshot| snapshot.destroy();
+
     var parsed = waf.seclang.parser.parseBytesOutcome(gpa, "c-abi-rules", rules, .{}, .{}) catch return .out_of_memory;
     defer parsed.deinit();
     const document = switch (parsed.outcome) {
@@ -171,33 +347,99 @@ fn compileRules(config: ?*const Config, rules: []const u8, provider: ?waf.plan.D
         .diagnostic => return .invalid_config,
     };
     var documents = [_]waf.seclang.parser.Document{document};
-    const plan = waf.plan.compileWithProvider(gpa, &parsed.registry, &documents, .{}, provider) catch return .invalid_config;
+    const names: []const []const u8 = if (plugins) |snapshot| snapshot.names else &.{};
+    const plan = waf.plan.compileWithPlugins(gpa, &parsed.registry, &documents, .{}, provider, .{ .operators = names }) catch return .invalid_config;
     defer plan.deinit();
 
-    var builder = waf.Waf.Builder.init(gpa);
-    const configured = configureBuilder(&builder, config);
-    if (configured != .ok) return configured;
     builder.setRetainedPlan(plan);
-    const instance = builder.build() catch |err| return mapError(err);
-    output.* = @ptrCast(instance);
-    return .ok;
+    handed_over = true;
+    return publish(&builder, plugins, output);
 }
 
 export fn zig_waf_destroy(handle: ?*WafHandle) callconv(.c) Status {
-    const instance = wafFromHandle(handle orelse return .invalid_argument);
-    instance.deinit() catch |err| return mapError(err);
+    const instance = instanceFromHandle(handle orelse return .invalid_argument);
+    // Refused while transactions are alive, and then nothing is released: they
+    // still call through the plugin snapshot.
+    instance.engine.deinit() catch |err| return mapError(err);
+    if (instance.plugins) |snapshot| snapshot.destroy();
+    std.heap.page_allocator.destroy(instance);
     return .ok;
+}
+
+/// Create an empty set of host operators. Register into it, point
+/// `zig_waf_config_t.plugins` at it, and create WAFs from that config; each WAF
+/// copies the registrations, so the set may be destroyed once they are created.
+export fn zig_waf_plugins_create(out_plugins: ?**PluginsHandle) callconv(.c) Status {
+    const output = out_plugins orelse return .invalid_argument;
+    output.* = undefined;
+    const plugins = std.heap.page_allocator.create(Plugins) catch return .out_of_memory;
+    plugins.* = .{};
+    output.* = @ptrCast(plugins);
+    return .ok;
+}
+
+export fn zig_waf_plugins_destroy(handle: ?*PluginsHandle) callconv(.c) void {
+    const plugins = pluginsFromHandle(handle orelse return);
+    plugins.deinit();
+    std.heap.page_allocator.destroy(plugins);
+}
+
+/// Register a host operator under `name` (with or without the leading `@`), so a
+/// rule may name it and the engine calls `callback` exactly where the rule does.
+///
+/// The callback runs on the request path and must not block: a host that needs a
+/// file, a socket or a process answers from state it maintains elsewhere, and
+/// returns UNAVAILABLE when that state cannot answer. UNAVAILABLE does not match,
+/// but it is counted per transaction, because an operator that could not run is
+/// not an input that was found clean. It may be called from several transactions
+/// on different threads at once. `context` and `callback` must stay valid until
+/// every WAF created with them is destroyed.
+///
+/// A name is letters, digits and underscores, and is matched case-insensitively,
+/// so two registrations that differ only in case are refused as a duplicate.
+export fn zig_waf_register_operator(
+    handle: ?*PluginsHandle,
+    name_pointer: ?[*]const u8,
+    name_len: usize,
+    context: ?*anyopaque,
+    callback: ?OperatorCallback,
+) callconv(.c) Status {
+    const plugins = pluginsFromHandle(handle orelse return .invalid_argument);
+    const function = callback orelse return .invalid_argument;
+    const raw = bytes(name_pointer, name_len) orelse return .invalid_argument;
+    const name = if (raw.len != 0 and raw[0] == '@') raw[1..] else raw;
+    if (!validOperatorName(name)) return .invalid_argument;
+    if (plugins.provides(name)) return .invalid_argument;
+
+    const gpa = std.heap.page_allocator;
+    const owned = gpa.dupe(u8, name) catch return .out_of_memory;
+    plugins.entries.append(gpa, .{ .name = owned, .host = .{ .context = context, .callback = function } }) catch {
+        gpa.free(owned);
+        return .out_of_memory;
+    };
+    return .ok;
+}
+
+/// An operator name a rule can actually spell: the SecLang operator token is a run
+/// of identifier characters, so a name with anything else in it could be
+/// registered and never named, which is a registration that only looks effective.
+fn validOperatorName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    for (name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_') return false;
+    }
+    return true;
 }
 
 export fn zig_waf_transaction_create(
     handle: ?*WafHandle,
     out_transaction: ?**TransactionHandle,
 ) callconv(.c) Status {
-    const instance = wafFromHandle(handle orelse return .invalid_argument);
+    const instance = instanceFromHandle(handle orelse return .invalid_argument);
     const output = out_transaction orelse return .invalid_argument;
     output.* = undefined;
     const transaction = std.heap.page_allocator.create(waf.Transaction) catch return .out_of_memory;
-    transaction.* = instance.newTransaction();
+    transaction.* = instance.engine.newTransaction();
     output.* = @ptrCast(transaction);
     return .ok;
 }
@@ -345,7 +587,7 @@ export fn zig_waf_transaction_intervention(
     const transaction = transactionFromConstHandle(handle orelse return .invalid_argument);
     const output = out_intervention orelse return .invalid_argument;
     if (output.struct_size < @sizeOf(CIntervention)) return .invalid_argument;
-    if (output.abi_version != abi_version) return .unsupported_abi;
+    if (!abiSupported(output.abi_version)) return .unsupported_abi;
     const pending = (transaction.intervention() catch |err| return mapError(err)) orelse return .not_found;
     output.action = @backingInt(pending.action);
     output.status = pending.status;
@@ -353,6 +595,19 @@ export fn zig_waf_transaction_intervention(
     output.has_rule_id = @intFromBool(pending.rule_id != null);
     output.rule_id = pending.rule_id orelse 0;
     output.reserved = @splat(0);
+    return .ok;
+}
+
+/// How many times a host operator answered UNAVAILABLE during this transaction. A
+/// rule whose operator could not run did not match, and this is where a connector
+/// sees that the question went unanswered rather than reading silence as clean.
+export fn zig_waf_transaction_plugin_unavailable_count(
+    handle: ?*const TransactionHandle,
+    out_count: ?*u64,
+) callconv(.c) Status {
+    const transaction = transactionFromConstHandle(handle orelse return .invalid_argument);
+    const output = out_count orelse return .invalid_argument;
+    output.* = transaction.pluginUnavailableCount();
     return .ok;
 }
 
@@ -395,7 +650,11 @@ export fn zig_waf_free(pointer: ?[*]u8, len: usize) callconv(.c) void {
     std.heap.page_allocator.free(start[0..len]);
 }
 
-fn wafFromHandle(handle: *WafHandle) *waf.Waf {
+fn instanceFromHandle(handle: *WafHandle) *Instance {
+    return @ptrCast(@alignCast(handle));
+}
+
+fn pluginsFromHandle(handle: *PluginsHandle) *Plugins {
     return @ptrCast(@alignCast(handle));
 }
 
@@ -464,6 +723,7 @@ fn validConfig() Config {
         .max_header_bytes = 16384,
         .max_request_body_bytes = 1 << 20,
         .max_response_body_bytes = 1 << 20,
+        .plugins = null,
         .reserved = @splat(0),
     };
 }
@@ -502,6 +762,7 @@ test "feature bits sit where the header publishes them" {
         .{ .atomic_hot_reload, 8 },
         .{ .compiled_execution_plan, 9 },
         .{ .transformation_execution, 10 },
+        .{ .plugin_operators, 11 },
     };
     var known: u64 = 0;
     for (published) |entry| {
@@ -645,7 +906,7 @@ test "the ABI's layout is pinned, so a change cannot happen silently" {
     //
     // Adding a field inside `reserved` keeps these numbers the same on purpose: that
     // is the additive path, and it is why the reserved arrays exist.
-    try std.testing.expectEqual(@as(u32, 0x00010000), abi_version);
+    try std.testing.expectEqual(@as(u32, 0x00010001), abi_version);
     try std.testing.expectEqual(@as(usize, 120), @sizeOf(Config));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(Features));
     try std.testing.expectEqual(@as(usize, 56), @sizeOf(CIntervention));
@@ -653,6 +914,9 @@ test "the ABI's layout is pinned, so a change cannot happen silently" {
     // Field offsets a header change could shift without changing a size.
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Config, "struct_size"));
     try std.testing.expectEqual(@as(usize, 4), @offsetOf(Config, "abi_version"));
+    // 1.1 took `plugins` from the front of `reserved`, which stays where it ended.
+    try std.testing.expectEqual(@as(usize, 56), @offsetOf(Config, "plugins"));
+    try std.testing.expectEqual(@as(usize, 64), @offsetOf(Config, "reserved"));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(Features, "struct_size"));
     try std.testing.expectEqual(@as(usize, 8), @offsetOf(Features, "feature_bits"));
     try std.testing.expectEqual(@as(usize, 0), @offsetOf(CIntervention, "struct_size"));
@@ -672,6 +936,162 @@ test "the ABI's layout is pinned, so a change cannot happen silently" {
     try std.testing.expectEqual(Status.ok, zig_waf_query_features(&features));
     features.struct_size = @sizeOf(Features) - 8;
     try std.testing.expectEqual(Status.invalid_argument, zig_waf_query_features(&features));
+}
+
+test "a struct from an older minor is served, one from a newer minor is not" {
+    // docs/c-abi.md: same major and a library minor at least the caller's is
+    // compatible. A 1.0 connector keeps working against this 1.1 library.
+    var features = std.mem.zeroes(Features);
+    features.struct_size = @sizeOf(Features);
+    features.abi_version = 0x0001_0000;
+    try testing.expectEqual(Status.ok, zig_waf_query_features(&features));
+    features.abi_version = abi_version + 1;
+    try testing.expectEqual(Status.unsupported_abi, zig_waf_query_features(&features));
+    features.abi_version = 0x0002_0000;
+    try testing.expectEqual(Status.unsupported_abi, zig_waf_query_features(&features));
+
+    var config = validConfig();
+    config.abi_version = 0x0001_0000;
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_create(&config, &handle));
+    try testing.expectEqual(Status.ok, zig_waf_destroy(handle));
+}
+
+/// A host operator for the tests: it records what it was asked and answers
+/// whatever `answer` says, standing in for a scanner or a lookup a host runs.
+const RecordingOperator = struct {
+    answer: c_int = operator_no_match,
+    calls: usize = 0,
+    parameter: [64]u8 = undefined,
+    parameter_len: usize = 0,
+    input: [64]u8 = undefined,
+    input_len: usize = 0,
+
+    fn callback(context: ?*anyopaque, parameter: [*]const u8, parameter_len: usize, input: [*]const u8, input_len: usize) callconv(.c) c_int {
+        const self: *RecordingOperator = @ptrCast(@alignCast(context.?));
+        self.calls += 1;
+        self.parameter_len = @min(parameter_len, self.parameter.len);
+        @memcpy(self.parameter[0..self.parameter_len], parameter[0..self.parameter_len]);
+        self.input_len = @min(input_len, self.input.len);
+        @memcpy(self.input[0..self.input_len], input[0..self.input_len]);
+        return self.answer;
+    }
+};
+
+fn createPlugins() !*PluginsHandle {
+    var plugins: *PluginsHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_plugins_create(&plugins));
+    return plugins;
+}
+
+test "register_operator refuses names a rule could not use and duplicates" {
+    var recorder = RecordingOperator{};
+    const plugins = try createPlugins();
+    defer zig_waf_plugins_destroy(plugins);
+
+    const name = "inspectFile";
+    try testing.expectEqual(Status.invalid_argument, zig_waf_plugins_create(null));
+    try testing.expectEqual(Status.invalid_argument, zig_waf_register_operator(null, name.ptr, name.len, &recorder, RecordingOperator.callback));
+    try testing.expectEqual(Status.invalid_argument, zig_waf_register_operator(plugins, name.ptr, name.len, &recorder, null));
+    try testing.expectEqual(Status.invalid_argument, zig_waf_register_operator(plugins, null, 4, &recorder, RecordingOperator.callback));
+    for ([_][]const u8{ "", "@", "inspect file", "inspect-file", "@@x", "x\x00" }) |bad| {
+        try testing.expectEqual(Status.invalid_argument, zig_waf_register_operator(plugins, bad.ptr, bad.len, &recorder, RecordingOperator.callback));
+    }
+
+    // The sigil is optional and names are case-insensitive, as in a rule, so the
+    // second spelling is the same operator and is refused as a duplicate.
+    const sigiled = "@inspectFile";
+    try testing.expectEqual(Status.ok, zig_waf_register_operator(plugins, sigiled.ptr, sigiled.len, &recorder, RecordingOperator.callback));
+    const cased = "INSPECTFILE";
+    try testing.expectEqual(Status.invalid_argument, zig_waf_register_operator(plugins, cased.ptr, cased.len, &recorder, RecordingOperator.callback));
+    try testing.expectEqualStrings("inspectFile", pluginsFromHandle(plugins).entries.items[0].name);
+
+    // A null context is the host's business; the callback simply receives it.
+    const other = "geoLookup";
+    try testing.expectEqual(Status.ok, zig_waf_register_operator(plugins, other.ptr, other.len, null, RecordingOperator.callback));
+}
+
+test "a registered operator is called with the rule's parameter and the input" {
+    var recorder = RecordingOperator{ .answer = operator_match };
+    const plugins = try createPlugins();
+    const name = "inspectFile";
+    try testing.expectEqual(Status.ok, zig_waf_register_operator(plugins, name.ptr, name.len, &recorder, RecordingOperator.callback));
+
+    const rules = "SecRule ARGS:file \"@inspectFile scan-profile\" \"id:9,phase:1,deny,status:403,t:lowercase\"";
+    var config = validConfig();
+
+    // Without the plugins set the operator is unknown, and the rule set is refused
+    // rather than compiled into a rule that never matches.
+    var refused: *WafHandle = undefined;
+    try testing.expectEqual(Status.invalid_config, zig_waf_create_with_rules(&config, rules.ptr, rules.len, &refused));
+
+    config.plugins = plugins;
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_create_with_rules(&config, rules.ptr, rules.len, &handle));
+    defer _ = zig_waf_destroy(handle);
+    // The WAF copied the registration, so the set can go once the WAF exists.
+    zig_waf_plugins_destroy(plugins);
+
+    try testing.expect(requestBlocked(handle, "/upload?file=EICAR.COM"));
+    try testing.expectEqual(@as(usize, 1), recorder.calls);
+    try testing.expectEqualStrings("scan-profile", recorder.parameter[0..recorder.parameter_len]);
+    // The input is the value after the rule's transformations.
+    try testing.expectEqualStrings("eicar.com", recorder.input[0..recorder.input_len]);
+
+    recorder.answer = operator_no_match;
+    try testing.expect(!requestBlocked(handle, "/upload?file=clean.txt"));
+    try testing.expectEqual(@as(usize, 2), recorder.calls);
+}
+
+test "an unavailable answer does not match and is counted" {
+    var recorder = RecordingOperator{ .answer = operator_unavailable };
+    const plugins = try createPlugins();
+    defer zig_waf_plugins_destroy(plugins);
+    const name = "inspectFile";
+    try testing.expectEqual(Status.ok, zig_waf_register_operator(plugins, name.ptr, name.len, &recorder, RecordingOperator.callback));
+
+    const rules = "SecRule ARGS \"@inspectFile x\" \"id:9,phase:1,deny,status:403,t:none\"";
+    var config = validConfig();
+    config.plugins = plugins;
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.ok, zig_waf_create_with_rules(&config, rules.ptr, rules.len, &handle));
+    defer _ = zig_waf_destroy(handle);
+
+    // An answer this library does not understand is not "clean" either.
+    for ([_]c_int{ operator_unavailable, 7, -1 }) |answer| {
+        recorder.answer = answer;
+        var tx: *TransactionHandle = undefined;
+        try testing.expectEqual(Status.ok, zig_waf_transaction_create(handle, &tx));
+        defer zig_waf_transaction_destroy(tx);
+        const ip = "127.0.0.1";
+        try testing.expectEqual(Status.ok, zig_waf_transaction_process_connection(tx, ip.ptr, ip.len, 1, ip.ptr, ip.len, 80));
+        try testing.expectEqual(Status.ok, zig_waf_transaction_process_uri(tx, "/?a=1&b=2", 9, "GET", 3, "HTTP/1.1", 8));
+        try testing.expectEqual(Status.ok, zig_waf_transaction_process_request_headers(tx));
+        try testing.expectEqual(Status.ok, zig_waf_transaction_evaluate_phase(tx, 1));
+
+        var decision = std.mem.zeroes(CIntervention);
+        decision.struct_size = @sizeOf(CIntervention);
+        decision.abi_version = abi_version;
+        try testing.expectEqual(Status.not_found, zig_waf_transaction_intervention(tx, &decision));
+        var unanswered: u64 = 0;
+        try testing.expectEqual(Status.ok, zig_waf_transaction_plugin_unavailable_count(tx, &unanswered));
+        try testing.expectEqual(@as(u64, 2), unanswered); // one per argument inspected
+    }
+    try testing.expectEqual(Status.invalid_argument, zig_waf_transaction_plugin_unavailable_count(null, null));
+}
+
+test "a 1.0 caller's reserved slot is never read as a plugins pointer" {
+    // To a connector built against 1.0 the slot is reserved and may hold anything.
+    // Reading it would dereference whatever is there, so it is ignored, and a rule
+    // naming a host operator fails to compile exactly as it did under 1.0.
+    var config = validConfig();
+    config.abi_version = 0x0001_0000;
+    config.plugins = @ptrFromInt(0xDEAD_BEE0);
+    const rules = "SecRule ARGS \"@inspectFile x\" \"id:9,phase:1,deny,status:403\"";
+    var handle: *WafHandle = undefined;
+    try testing.expectEqual(Status.invalid_config, zig_waf_create_with_rules(&config, rules.ptr, rules.len, &handle));
+    try testing.expectEqual(Status.ok, zig_waf_create(&config, &handle));
+    try testing.expectEqual(Status.ok, zig_waf_destroy(handle));
 }
 
 test "any call sequence yields a status rather than a crash" {
