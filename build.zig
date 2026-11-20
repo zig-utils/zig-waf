@@ -68,6 +68,17 @@ pub fn build(b: *std.Build) void {
     c_api.installHeader(b.path("include/zig_waf.h"), "zig_waf.h");
     b.installArtifact(c_api);
 
+    // The same ABI as a shared library, for a host that loads the engine at
+    // runtime instead of linking it: Bun's FFI (`@stacksjs/waf`), Python's
+    // ctypes, anything with dlopen. liblmdb is linked in as an archive, so the
+    // library needs nothing else on the loader path.
+    const c_api_shared = b.addLibrary(.{
+        .name = "zig-waf",
+        .linkage = .dynamic,
+        .root_module = c_api_module,
+    });
+    b.installArtifact(c_api_shared);
+
     const c_smoke = b.addExecutable(.{
         .name = "c-api-smoke",
         .root_module = b.createModule(.{
@@ -80,6 +91,22 @@ pub fn build(b: *std.Build) void {
     c_smoke.root_module.addIncludePath(b.path("include"));
     c_smoke.root_module.linkLibrary(c_api);
     const run_c_smoke = b.addRunArtifact(c_smoke);
+
+    // The same smoke test against the shared library, so `zig build test`
+    // proves the dynamic build exports the whole ABI and runs, not only that
+    // it links.
+    const c_smoke_shared = b.addExecutable(.{
+        .name = "c-api-smoke-shared",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    c_smoke_shared.root_module.addCSourceFile(.{ .file = b.path("tests/c_api_smoke.c") });
+    c_smoke_shared.root_module.addIncludePath(b.path("include"));
+    c_smoke_shared.root_module.linkLibrary(c_api_shared);
+    const run_c_smoke_shared = b.addRunArtifact(c_smoke_shared);
 
     const tests = b.addTest(.{ .root_module = waf });
     const run_tests = b.addRunArtifact(tests);
@@ -257,6 +284,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_c_smoke.step);
+    test_step.dependOn(&run_c_smoke_shared.step);
     test_step.dependOn(&run_transformation_evidence_tests.step);
     test_step.dependOn(&run_transformation_differential_tests.step);
     test_step.dependOn(&run_operator_evidence_tests.step);
@@ -265,6 +293,7 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&cli.step);
     check_step.dependOn(&daemon.step);
     check_step.dependOn(&c_api.step);
+    check_step.dependOn(&c_api_shared.step);
     check_step.dependOn(&tests.step);
     check_step.dependOn(&transformation_evidence_tests.step);
     check_step.dependOn(&transformation_differential_tests.step);

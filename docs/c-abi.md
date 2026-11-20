@@ -5,6 +5,19 @@ Caddy, Envoy, and HAProxy connectors, and anything else that wants to run traffi
 through the engine without writing Zig. It is the supported cross-language surface;
 there is no embedded script runtime (see [`docs/plugins.md`](plugins.md)).
 
+## Linking
+
+`zig build` installs the ABI twice, from the same code:
+
+- `lib/libzig-waf.a`, a static archive for a connector that links the engine in
+  (the Nginx, Caddy, Envoy and HAProxy connectors, rpx's dataplane);
+- `lib/libzig-waf.dylib` (`.so` on Linux), a shared library for a host that
+  loads it at runtime through a foreign-function interface, such as Bun's
+  `bun:ffi` (`@stacksjs/waf`) or Python's `ctypes`. liblmdb is linked into it as
+  an archive, so it needs nothing else on the loader path.
+
+`zig build test` runs the C smoke test against both.
+
 ## What the version means
 
 `ZIG_WAF_ABI_VERSION` is `0xMMMMmmmm` — major in the high 16 bits, minor in the low
