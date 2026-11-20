@@ -484,6 +484,30 @@ pub fn build(b: *std.Build) void {
     const gate_step = b.step("gate-request-path", "Enforce request-path throughput, p99, and RSS thresholds");
     gate_step.dependOn(&run_request_path_gate.step);
 
+    // The C ABI picks its own allocator, which no Zig-API benchmark sees (#82), so
+    // the cost of a fired rule is measured through the ABI a connector calls.
+    const c_abi_benchmark = b.addExecutable(.{
+        .name = "c-abi-benchmark",
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    c_abi_benchmark.root_module.addCSourceFile(.{ .file = b.path("benchmarks/c_abi.c") });
+    c_abi_benchmark.root_module.addIncludePath(b.path("include"));
+    c_abi_benchmark.root_module.linkLibrary(c_api);
+    const run_c_abi_benchmark = b.addRunArtifact(c_abi_benchmark);
+    const c_abi_iterations = b.option(usize, "c-abi-iterations", "C ABI benchmark transaction count") orelse 5_000;
+    // Zero measures without enforcing, like the request-path gate.
+    const c_abi_max_rule_ns = b.option(u64, "c-abi-max-fired-rule-ns", "Fail when a fired rule costs more than this through the C ABI") orelse 0;
+    run_c_abi_benchmark.addArgs(&.{
+        b.fmt("{d}", .{c_abi_iterations}),
+        b.fmt("{d}", .{c_abi_max_rule_ns}),
+    });
+    const c_abi_benchmark_step = b.step("bench-c-abi", "Benchmark the cost of a fired rule through the C ABI");
+    c_abi_benchmark_step.dependOn(&run_c_abi_benchmark.step);
+
     const matrix_module = b.createModule(.{
         .root_source_file = b.path("tools/matrix.zig"),
         .target = target,

@@ -376,7 +376,11 @@ pub const Store = struct {
                 .source = value.source,
             };
         }
+        // Superseded entries stay in the list, and every fired rule supersedes the
+        // RULE collection, so most entries are inactive by the end of a phase. Skip
+        // them before the key comparison: there is nothing left to deactivate.
         for (self.entries.items) |*entry| {
+            if (!entry.active) continue;
             if (containsGroupedKey(keys, entry.collection, entry.key)) entry.active = false;
         }
         for (staged) |entry| self.entries.appendAssumeCapacity(entry);

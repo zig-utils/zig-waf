@@ -246,6 +246,15 @@ jobs:
           -Dgate-max-p99-ns=200000
           -Dgate-min-throughput=5000
           -Dgate-max-rss-bytes=268435456
+      - name: C ABI fired-rule gate
+        working-directory: zig-waf
+        # About 1us per fired rule on a developer machine. The regression this guards
+        # (#82, the ABI allocating through the page allocator) cost 50-150us, so 20us
+        # leaves a slow runner room and still fails on that kind of regression.
+        run: >-
+          zig build bench-c-abi -Doptimize=ReleaseFast
+          -Dc-abi-iterations=5000
+          -Dc-abi-max-fired-rule-ns=20000
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
