@@ -1,6 +1,15 @@
 const std = @import("std");
 const waf = @import("waf");
 
+/// Every allocation the ABI makes, and the allocator the engine it builds uses for
+/// its own: transactions, shadow batches, collection values, per-phase scratch.
+/// It must be a general-purpose allocator. A fired rule makes dozens of small
+/// allocations, and `page_allocator` turns each into an mmap/munmap pair plus a
+/// page fault, which cost about 100 us per fired rule (zig-utils/zig-waf#82).
+/// libc is linked already, and malloc is thread-safe, which the ABI needs because
+/// transactions run on whichever threads the host calls from.
+const abi_allocator = std.heap.c_allocator;
+
 /// 1.1 added host operator registration (`zig_waf_register_operator`), the
 /// `plugins` field of the config, and the plugin-unavailable counter.
 pub const abi_version: u32 = 0x0001_0001;
@@ -122,8 +131,8 @@ const Plugins = struct {
     const Entry = struct { name: []u8, host: HostOperator };
 
     fn deinit(self: *Plugins) void {
-        for (self.entries.items) |entry| std.heap.page_allocator.free(entry.name);
-        self.entries.deinit(std.heap.page_allocator);
+        for (self.entries.items) |entry| abi_allocator.free(entry.name);
+        self.entries.deinit(abi_allocator);
     }
 
     fn provides(self: *const Plugins, name: []const u8) bool {
@@ -143,7 +152,7 @@ const PluginSnapshot = struct {
     registry: waf.plugin.Registry,
 
     fn create(source: *const Plugins) error{OutOfMemory}!*PluginSnapshot {
-        const gpa = std.heap.page_allocator;
+        const gpa = abi_allocator;
         const count = source.entries.items.len;
         const self = try gpa.create(PluginSnapshot);
         errdefer gpa.destroy(self);
@@ -172,7 +181,7 @@ const PluginSnapshot = struct {
     }
 
     fn destroy(self: *PluginSnapshot) void {
-        const gpa = std.heap.page_allocator;
+        const gpa = abi_allocator;
         for (self.names) |name| gpa.free(name);
         gpa.free(self.names);
         gpa.free(self.operators);
@@ -236,7 +245,7 @@ fn configuredPlugins(config: ?*const Config) ?*const Plugins {
 /// Build the engine, and wrap it with the plugin snapshot it borrows. On failure
 /// the snapshot is released here, so callers hand it over unconditionally.
 fn publish(builder: *waf.Waf.Builder, plugins: ?*PluginSnapshot, output: **WafHandle) Status {
-    const gpa = std.heap.page_allocator;
+    const gpa = abi_allocator;
     if (plugins) |snapshot| builder.setPluginRegistry(&snapshot.registry);
     const engine = builder.build() catch |err| {
         if (plugins) |snapshot| snapshot.destroy();
@@ -261,7 +270,7 @@ export fn zig_waf_create(config: ?*const Config, out_waf: ?**WafHandle) callconv
     const output = out_waf orelse return .invalid_argument;
     output.* = undefined;
 
-    var builder = waf.Waf.Builder.init(std.heap.page_allocator);
+    var builder = waf.Waf.Builder.init(abi_allocator);
     const configured = configureBuilder(&builder, config);
     if (configured != .ok) return configured;
     const plugins = snapshotPlugins(config) catch return .out_of_memory;
@@ -332,7 +341,7 @@ const DataDirProvider = struct {
 /// The registered operator names go to the compiler, so a rule naming one compiles
 /// and a rule naming an operator nothing provides still does not.
 fn compileRules(config: ?*const Config, rules: []const u8, provider: ?waf.plan.DataProvider, output: **WafHandle) Status {
-    const gpa = std.heap.page_allocator;
+    const gpa = abi_allocator;
     var builder = waf.Waf.Builder.init(gpa);
     const configured = configureBuilder(&builder, config);
     if (configured != .ok) return configured;
@@ -362,7 +371,7 @@ export fn zig_waf_destroy(handle: ?*WafHandle) callconv(.c) Status {
     // still call through the plugin snapshot.
     instance.engine.deinit() catch |err| return mapError(err);
     if (instance.plugins) |snapshot| snapshot.destroy();
-    std.heap.page_allocator.destroy(instance);
+    abi_allocator.destroy(instance);
     return .ok;
 }
 
@@ -372,7 +381,7 @@ export fn zig_waf_destroy(handle: ?*WafHandle) callconv(.c) Status {
 export fn zig_waf_plugins_create(out_plugins: ?**PluginsHandle) callconv(.c) Status {
     const output = out_plugins orelse return .invalid_argument;
     output.* = undefined;
-    const plugins = std.heap.page_allocator.create(Plugins) catch return .out_of_memory;
+    const plugins = abi_allocator.create(Plugins) catch return .out_of_memory;
     plugins.* = .{};
     output.* = @ptrCast(plugins);
     return .ok;
@@ -381,7 +390,7 @@ export fn zig_waf_plugins_create(out_plugins: ?**PluginsHandle) callconv(.c) Sta
 export fn zig_waf_plugins_destroy(handle: ?*PluginsHandle) callconv(.c) void {
     const plugins = pluginsFromHandle(handle orelse return);
     plugins.deinit();
-    std.heap.page_allocator.destroy(plugins);
+    abi_allocator.destroy(plugins);
 }
 
 /// Register a host operator under `name` (with or without the leading `@`), so a
@@ -411,7 +420,7 @@ export fn zig_waf_register_operator(
     if (!validOperatorName(name)) return .invalid_argument;
     if (plugins.provides(name)) return .invalid_argument;
 
-    const gpa = std.heap.page_allocator;
+    const gpa = abi_allocator;
     const owned = gpa.dupe(u8, name) catch return .out_of_memory;
     plugins.entries.append(gpa, .{ .name = owned, .host = .{ .context = context, .callback = function } }) catch {
         gpa.free(owned);
@@ -438,7 +447,7 @@ export fn zig_waf_transaction_create(
     const instance = instanceFromHandle(handle orelse return .invalid_argument);
     const output = out_transaction orelse return .invalid_argument;
     output.* = undefined;
-    const transaction = std.heap.page_allocator.create(waf.Transaction) catch return .out_of_memory;
+    const transaction = abi_allocator.create(waf.Transaction) catch return .out_of_memory;
     transaction.* = instance.engine.newTransaction();
     output.* = @ptrCast(transaction);
     return .ok;
@@ -447,7 +456,7 @@ export fn zig_waf_transaction_create(
 export fn zig_waf_transaction_destroy(handle: ?*TransactionHandle) callconv(.c) void {
     const transaction = transactionFromHandle(handle orelse return);
     transaction.deinit();
-    std.heap.page_allocator.destroy(transaction);
+    abi_allocator.destroy(transaction);
 }
 
 export fn zig_waf_transaction_process_connection(
@@ -576,7 +585,7 @@ export fn zig_waf_transaction_evaluate_phase(handle: ?*TransactionHandle, phase:
     const transaction = getTransaction(handle) orelse return .invalid_argument;
     if (phase < 1 or phase > 5) return .invalid_argument;
     const resolved: waf.engine.Phase = @fromBackingInt(@intCast(@as(u8, @intCast(phase))));
-    transaction.evaluatePhase(std.heap.page_allocator, resolved) catch |err| return mapError(err);
+    transaction.evaluatePhase(abi_allocator, resolved) catch |err| return mapError(err);
     return .ok;
 }
 
@@ -637,7 +646,7 @@ export fn zig_waf_transaction_serialize_audit_log(
         audit_format_configured => transaction.configuredAuditFormat(),
         else => return .invalid_argument,
     };
-    const rendered = transaction.serializeAuditLog(std.heap.page_allocator, fmt) catch |err| return mapError(err);
+    const rendered = transaction.serializeAuditLog(abi_allocator, fmt) catch |err| return mapError(err);
     buffer_out.* = rendered.ptr;
     len_out.* = rendered.len;
     return .ok;
@@ -647,7 +656,7 @@ export fn zig_waf_transaction_serialize_audit_log(
 export fn zig_waf_free(pointer: ?[*]u8, len: usize) callconv(.c) void {
     const start = pointer orelse return;
     if (len == 0) return;
-    std.heap.page_allocator.free(start[0..len]);
+    abi_allocator.free(start[0..len]);
 }
 
 fn instanceFromHandle(handle: *WafHandle) *Instance {
