@@ -251,10 +251,10 @@ jobs:
         # About 1us per fired rule on a developer machine. The regression this guards
         # (#82, the ABI allocating through the page allocator) cost 50-150us, so 20us
         # leaves a slow runner room and still fails on that kind of regression.
-        # A non-matching @rx/@pm rule costs about 0.3us with operators compiled once
-        # per WAF and about 2.7us when they were compiled on every evaluation (#83).
-        # That gap is narrower, so 1.5us is the bound: several times the cached cost,
-        # and below the uncached cost even on a fast machine.
+        # A non-matching @rx/@pm rule the WAF can share costs about 0.4us with
+        # operators compiled once per WAF and 4.6-7.3us when they were compiled on
+        # every evaluation (#83). 1.5us is several times the cached cost and below
+        # the uncached cost even on a fast machine.
         run: >-
           zig build bench-c-abi -Doptimize=ReleaseFast
           -Dc-abi-iterations=5000

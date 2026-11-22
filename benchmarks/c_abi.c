@@ -111,12 +111,16 @@ int main(int argc, char **argv) {
     /* Patterns sized like CRS's: alternations, classes and quantifiers that take
      * the regex compiler real work, and phrase lists that build an automaton. The
      * URI they inspect matches none of them, so every rule runs its operator once
-     * and fires nothing. */
+     * and fires nothing. Each stays on zig-regex's Thompson engine: no `(?i)`,
+     * lazy quantifier, repeated group or lookaround, any of which moves a pattern
+     * to the backtracking engine. That engine keeps its match state in the
+     * compiled regex, so the WAF compiles such a pattern per evaluation rather
+     * than share it; this gate guards the patterns it does share. */
     static const char *patterns[] = {
-        "(?i)(?:union[\\s/*]+(?:all[\\s/*]+)?select|select[\\s/*]+.+?[\\s/*]+from)",
-        "(?i)<script[^>]*>[\\s\\S]*?</script>",
-        "(?:\\.\\./|\\.\\.\\\\)+(?:etc|windows|boot)[/\\\\]",
-        "(?i)(?:;|\\||`|\\$\\()\\s*(?:cat|wget|curl|nc|bash|sh)\\b",
+        "(?:union|select|insert|update|delete)[\\s/*]+(?:all[\\s/*]+)?(?:select|from|into)",
+        "<script[^>]*>",
+        "\\.\\./(?:etc|windows|boot)/",
+        "[;|`]\\s*(?:cat|wget|curl|nc|bash|sh)\\b",
     };
     static const char *phrases =
         "passwd shadow htaccess web.config wp-config.php id_rsa authorized_keys .git/config .env phpinfo";
