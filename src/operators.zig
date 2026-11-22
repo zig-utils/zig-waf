@@ -412,7 +412,7 @@ pub const RegexOperator = struct {
             const matcher = &self.matcher.?;
             const matches = matcher.findAll(allocator, input) catch |err| return regexRuntimeFailure(err);
             defer {
-                for (matches) |*match| match.deinit(matcher.re.allocator);
+                for (matches) |*match| match.deinit(allocator);
                 allocator.free(matches);
             }
             if (matches.len == 0) return .{};
@@ -872,7 +872,9 @@ pub const IdentityOperator = struct {
         defer matcher.deinit();
         const matches = matcher.findAll(allocator, input) catch return .{};
         defer {
-            for (matches) |*match| match.deinit(compiled.allocator);
+            // The captures came from `allocator`, so they go back to it. Freeing them
+            // through the regex's own allocator only worked while that was an arena.
+            for (matches) |*match| match.deinit(allocator);
             allocator.free(matches);
         }
         for (matches) |match| {

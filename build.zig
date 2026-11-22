@@ -501,9 +501,11 @@ pub fn build(b: *std.Build) void {
     const c_abi_iterations = b.option(usize, "c-abi-iterations", "C ABI benchmark transaction count") orelse 5_000;
     // Zero measures without enforcing, like the request-path gate.
     const c_abi_max_rule_ns = b.option(u64, "c-abi-max-fired-rule-ns", "Fail when a fired rule costs more than this through the C ABI") orelse 0;
+    const c_abi_max_inspecting_ns = b.option(u64, "c-abi-max-inspecting-rule-ns", "Fail when a non-matching @rx/@pm rule costs more than this through the C ABI") orelse 0;
     run_c_abi_benchmark.addArgs(&.{
         b.fmt("{d}", .{c_abi_iterations}),
         b.fmt("{d}", .{c_abi_max_rule_ns}),
+        b.fmt("{d}", .{c_abi_max_inspecting_ns}),
     });
     const c_abi_benchmark_step = b.step("bench-c-abi", "Benchmark the cost of a fired rule through the C ABI");
     c_abi_benchmark_step.dependOn(&run_c_abi_benchmark.step);

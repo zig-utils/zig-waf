@@ -13,7 +13,13 @@
  * rule, and fails when the per-rule cost exceeds the threshold it is given (0
  * measures without enforcing).
  *
- * Usage: c-abi-benchmark [iterations] [max-ns-per-fired-rule] */
+ * A second phase holds rules that inspect and do not match: `@rx` patterns and
+ * `@pm` phrase lists over REQUEST_URI, the shape of most of CRS. Their cost is
+ * dominated by the operator, and compiling that operator on every evaluation
+ * instead of once per WAF made full CRS cost milliseconds per request
+ * (zig-utils/zig-waf#83). That cost is gated separately.
+ *
+ * Usage: c-abi-benchmark [iterations] [max-ns-per-fired-rule] [max-ns-per-inspecting-rule] */
 
 #include "zig_waf.h"
 
@@ -23,6 +29,7 @@
 #include <time.h>
 
 #define FIRED_RULES 32
+#define INSPECTING_RULES 32
 #define WARMUP 200
 
 static uint64_t now_ns(void) {
@@ -81,6 +88,7 @@ static double phase_one_ns(zig_waf_t *waf, size_t iterations) {
 int main(int argc, char **argv) {
     size_t iterations = argc > 1 ? (size_t)strtoull(argv[1], NULL, 10) : 5000;
     double max_ns_per_rule = argc > 2 ? strtod(argv[2], NULL) : 0;
+    double max_ns_per_inspecting_rule = argc > 3 ? strtod(argv[3], NULL) : 0;
     if (iterations == 0) iterations = 1;
 
     /* The baseline has no phase-1 rule, so it measures the loop and nothing else. */
@@ -100,19 +108,55 @@ int main(int argc, char **argv) {
     }
     zig_waf_t *fired = create(rules);
 
+    /* Patterns sized like CRS's: alternations, classes and quantifiers that take
+     * the regex compiler real work, and phrase lists that build an automaton. The
+     * URI they inspect matches none of them, so every rule runs its operator once
+     * and fires nothing. */
+    static const char *patterns[] = {
+        "(?i)(?:union[\\s/*]+(?:all[\\s/*]+)?select|select[\\s/*]+.+?[\\s/*]+from)",
+        "(?i)<script[^>]*>[\\s\\S]*?</script>",
+        "(?:\\.\\./|\\.\\.\\\\)+(?:etc|windows|boot)[/\\\\]",
+        "(?i)(?:;|\\||`|\\$\\()\\s*(?:cat|wget|curl|nc|bash|sh)\\b",
+    };
+    static const char *phrases =
+        "passwd shadow htaccess web.config wp-config.php id_rsa authorized_keys .git/config .env phpinfo";
+    char inspecting[INSPECTING_RULES * 192];
+    used = 0;
+    for (int i = 0; i < INSPECTING_RULES; i++) {
+        if (i % 2 == 0)
+            used += (size_t)snprintf(inspecting + used, sizeof(inspecting) - used,
+                "SecRule REQUEST_URI \"@rx %s\" \"id:%d,phase:1,pass,nolog\"\n",
+                patterns[(i / 2) % 4], 200 + i);
+        else
+            used += (size_t)snprintf(inspecting + used, sizeof(inspecting) - used,
+                "SecRule REQUEST_URI \"@pm %s\" \"id:%d,phase:1,pass,nolog\"\n", phrases, 200 + i);
+    }
+    zig_waf_t *inspected = create(inspecting);
+
     double empty = phase_one_ns(baseline, iterations);
     double full = phase_one_ns(fired, iterations);
+    double inspecting_ns = phase_one_ns(inspected, iterations);
     double per_rule = (full - empty) / FIRED_RULES;
-    printf("c-abi phase 1, no rules:            %10.0f ns/transaction\n", empty);
-    printf("c-abi phase 1, %d fired SecActions: %10.0f ns/transaction\n", FIRED_RULES, full);
-    printf("c-abi cost per fired rule:          %10.0f ns\n", per_rule);
+    double per_inspecting_rule = (inspecting_ns - empty) / INSPECTING_RULES;
+    printf("c-abi phase 1, no rules:              %10.0f ns/transaction\n", empty);
+    printf("c-abi phase 1, %d fired SecActions:   %10.0f ns/transaction\n", FIRED_RULES, full);
+    printf("c-abi cost per fired rule:            %10.0f ns\n", per_rule);
+    printf("c-abi phase 1, %d @rx/@pm, no match:  %10.0f ns/transaction\n", INSPECTING_RULES, inspecting_ns);
+    printf("c-abi cost per inspecting rule:       %10.0f ns\n", per_inspecting_rule);
 
+    zig_waf_destroy(inspected);
     zig_waf_destroy(fired);
     zig_waf_destroy(baseline);
 
+    int failed = 0;
     if (max_ns_per_rule > 0 && per_rule > max_ns_per_rule) {
         fprintf(stderr, "c-abi-benchmark: %.0f ns per fired rule exceeds the %.0f ns gate\n", per_rule, max_ns_per_rule);
-        return 1;
+        failed = 1;
     }
-    return 0;
+    if (max_ns_per_inspecting_rule > 0 && per_inspecting_rule > max_ns_per_inspecting_rule) {
+        fprintf(stderr, "c-abi-benchmark: %.0f ns per inspecting rule exceeds the %.0f ns gate\n",
+            per_inspecting_rule, max_ns_per_inspecting_rule);
+        failed = 1;
+    }
+    return failed;
 }

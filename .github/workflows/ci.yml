@@ -246,15 +246,20 @@ jobs:
           -Dgate-max-p99-ns=200000
           -Dgate-min-throughput=5000
           -Dgate-max-rss-bytes=268435456
-      - name: C ABI fired-rule gate
+      - name: C ABI fired-rule and inspecting-rule gates
         working-directory: zig-waf
         # About 1us per fired rule on a developer machine. The regression this guards
         # (#82, the ABI allocating through the page allocator) cost 50-150us, so 20us
         # leaves a slow runner room and still fails on that kind of regression.
+        # A non-matching @rx/@pm rule costs about 0.3us with operators compiled once
+        # per WAF and about 2.7us when they were compiled on every evaluation (#83).
+        # That gap is narrower, so 1.5us is the bound: several times the cached cost,
+        # and below the uncached cost even on a fast machine.
         run: >-
           zig build bench-c-abi -Doptimize=ReleaseFast
           -Dc-abi-iterations=5000
           -Dc-abi-max-fired-rule-ns=20000
+          -Dc-abi-max-inspecting-rule-ns=1500
       - name: Ownership benchmark
         working-directory: zig-waf
         run: zig build bench-ownership -Doptimize=ReleaseFast
