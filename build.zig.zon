@@ -12,6 +12,13 @@
             .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.1.tar.gz",
             .hash = "zig_regex-0.5.1-omky0eRfJgD3H36kQj4jlWdvdzdTQTTUCAnJrursdkTg",
         },
+        // Only the benchmark lab (`zig build lab`) uses it, for its process
+        // memory sampler, so nothing else fetches it.
+        .bench = .{
+            .url = "https://registry.pantry.dev/zig/packages/zig-bench/0.2.2/tarball",
+            .hash = "zig_bench-0.2.2-FoCM-1bIAwB0KZkJao6Y2lkFFK82_jQbtZ7uGRSYewHC",
+            .lazy = true,
+        },
         .xml = .{
             .url = "https://registry.pantry.dev/zig/packages/zig-xml/0.1.0/tarball",
             .hash = "zig_xml-0.1.0-Lvy3xf5LAgCC-kxuVD2lwx7TBkfZiXvjUODcwSPLcVf-",

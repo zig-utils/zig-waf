@@ -510,6 +510,73 @@ pub fn build(b: *std.Build) void {
     const c_abi_benchmark_step = b.step("bench-c-abi", "Benchmark the cost of a fired rule through the C ABI");
     c_abi_benchmark_step.dependOn(&run_c_abi_benchmark.step);
 
+    // The comparative lab (#6): zig-waf, ModSecurity and Coraza on the same rules
+    // and requests, each driven by its own program in benchmarks/lab. It needs a
+    // CRS checkout, libmodsecurity built and installed under a prefix, and Go on
+    // PATH. zig-bench samples each driver's memory; it is a lazy dependency
+    // fetched only when the lab's options are given, so no other step needs it
+    // (or the newer Zig it requires).
+    const lab_step = b.step("lab", "Benchmark zig-waf against ModSecurity and Coraza (see docs/benchmark-lab.md)");
+    const lab_crs = b.option([]const u8, "lab-crs", "OWASP CRS checkout the lab loads");
+    const lab_modsecurity = b.option([]const u8, "lab-modsecurity", "Install prefix of a built libmodsecurity (with include/ and lib/)");
+    const lab_iterations = b.option(u32, "lab-iterations", "Timed requests per lab run") orelse 2_000;
+    const lab_output = b.option([]const u8, "lab-output", "Directory the lab writes its rule files and results to") orelse "zig-out/lab";
+    const lab_version = b.option([]const u8, "lab-zig-waf-version", "Label for zig-waf in the lab results, such as a commit") orelse "dev";
+    if (lab_crs == null or lab_modsecurity == null) {
+        lab_step.dependOn(&b.addFail("lab: pass -Dlab-crs=<CRS checkout> and -Dlab-modsecurity=<libmodsecurity prefix>").step);
+    } else if (b.lazyDependency("bench", .{ .target = target, .optimize = optimize })) |bench| {
+        const lab_driver_module = struct {
+            fn create(owner: *std.Build, t: std.Build.ResolvedTarget, o: std.builtin.OptimizeMode, source: []const u8) *std.Build.Module {
+                const module = owner.createModule(.{ .target = t, .optimize = o, .link_libc = true });
+                module.addCSourceFile(.{ .file = owner.path(source), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+                module.addIncludePath(owner.path("benchmarks/lab"));
+                return module;
+            }
+        }.create;
+
+        const zig_waf_driver_module = lab_driver_module(b, target, optimize, "benchmarks/lab/zig_waf_driver.c");
+        zig_waf_driver_module.addIncludePath(b.path("include"));
+        zig_waf_driver_module.addCMacro("ZIG_WAF_LAB_VERSION", b.fmt("\"{s}\"", .{lab_version}));
+        zig_waf_driver_module.linkLibrary(c_api);
+        const zig_waf_driver = b.addExecutable(.{ .name = "lab-zig-waf", .root_module = zig_waf_driver_module });
+
+        const modsecurity_driver_module = lab_driver_module(b, target, optimize, "benchmarks/lab/modsecurity_driver.c");
+        const modsecurity_lib = b.pathJoin(&.{ lab_modsecurity.?, "lib" });
+        modsecurity_driver_module.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ lab_modsecurity.?, "include" }) });
+        modsecurity_driver_module.addLibraryPath(.{ .cwd_relative = modsecurity_lib });
+        modsecurity_driver_module.addRPath(.{ .cwd_relative = modsecurity_lib });
+        modsecurity_driver_module.linkSystemLibrary("modsecurity", .{});
+        const modsecurity_driver = b.addExecutable(.{ .name = "lab-modsecurity", .root_module = modsecurity_driver_module });
+
+        const alloc_counter_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+        alloc_counter_module.addCSourceFile(.{ .file = b.path("benchmarks/lab/alloc_count.c"), .flags = &.{ "-Wall", "-Wextra", "-Werror" } });
+        const alloc_counter = b.addLibrary(.{ .name = "lab_alloc_count", .linkage = .dynamic, .root_module = alloc_counter_module });
+
+        // Go builds Coraza and its driver from the module pinned in go.sum.
+        const coraza_build = b.addSystemCommand(&.{ "go", "build", "-trimpath", "-o" });
+        coraza_build.setCwd(b.path("benchmarks/lab/coraza"));
+        const coraza_driver = coraza_build.addOutputFileArg("lab-coraza");
+        coraza_build.addArg(".");
+        for ([_][]const u8{ "main.go", "go.mod", "go.sum" }) |input|
+            coraza_build.addFileInput(b.path(b.fmt("benchmarks/lab/coraza/{s}", .{input})));
+
+        const lab_module = b.createModule(.{
+            .root_source_file = b.path("tools/lab.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        lab_module.addImport("process", bench.module("process"));
+        const lab = b.addExecutable(.{ .name = "lab", .root_module = lab_module });
+        const run_lab = b.addRunArtifact(lab);
+        run_lab.has_side_effects = true;
+        run_lab.addArgs(&.{ lab_crs.?, "benchmarks/lab", lab_output, b.fmt("{d}", .{lab_iterations}), @tagName(optimize) });
+        run_lab.addArtifactArg(zig_waf_driver);
+        run_lab.addArtifactArg(modsecurity_driver);
+        run_lab.addFileArg(coraza_driver);
+        run_lab.addArtifactArg(alloc_counter);
+        lab_step.dependOn(&run_lab.step);
+    }
+
     const matrix_module = b.createModule(.{
         .root_source_file = b.path("tools/matrix.zig"),
         .target = target,
