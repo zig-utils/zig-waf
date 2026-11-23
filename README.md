@@ -60,6 +60,9 @@ ownership rules are documented in [`docs/c-abi.md`](docs/c-abi.md).
 The host extension contracts — what can be registered, what deliberately cannot,
 and why an unavailable plugin is not the same as a clean request — are documented in
 [`docs/plugins.md`](docs/plugins.md).
+How zig-waf compares with ModSecurity and Coraza on the same rules and requests —
+latency, throughput, allocations and memory — and how to rerun that comparison is
+documented in [`docs/benchmark-lab.md`](docs/benchmark-lab.md).
 
 ## Community
 

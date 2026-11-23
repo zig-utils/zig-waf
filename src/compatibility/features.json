@@ -309,6 +309,27 @@
       "notes": "The zig-waf CLI parses, compiles, and directive-validates SecLang configs (validate), lists compiled rules with phase/id/action/location (explain), runs a synthetic request through the engine and reports the block/allow decision (test), and reports the version, exiting non-zero on rejection so rule sets can be gated in CI. format prints one directive per line from the parse rather than reflowing the source, so the output is by construction what the engine will run; replay runs a recorded request's wire bytes (an audit record's parts B and C, or a proxy capture) through the engine and exits non-zero when blocked, so a reproduction can gate a fix; benchmark reports nanoseconds per request with the blocked count, so a run that measured nothing is visible."
     },
     {
+      "id": "tooling.benchmark-lab",
+      "area": "tooling",
+      "name": "ModSecurity, Coraza, and zig-waf benchmark laboratory",
+      "status": "implemented",
+      "issue": "https://github.com/zig-utils/zig-waf/issues/6",
+      "modsecurity": true,
+      "coraza": true,
+      "crs_required": true,
+      "evidence": [
+        "tools/lab.zig",
+        "benchmarks/lab/lab.h",
+        "benchmarks/lab/zig_waf_driver.c",
+        "benchmarks/lab/modsecurity_driver.c",
+        "benchmarks/lab/coraza/main.go",
+        "benchmarks/lab/alloc_count.c",
+        "benchmarks/lab/scenarios",
+        "docs/benchmark-lab.md"
+      ],
+      "notes": "zig build lab drives zig-waf (C ABI), ModSecurity 3.0.16 (libmodsecurity C API) and Coraza 3.7.0 (Go API) with one assembled rule file and the same scenarios: no rules, clean CRS GETs over HTTP/1.1 and HTTP/2.0, attacks, urlencoded and JSON bodies, and a mixed load on 1 and 4 threads. Each engine runs in its own process under zig-bench's sampler and reports p50/p99/p99.9, throughput, rule-load time, allocations per request (a malloc interposer for the C engines, the Go runtime for Coraza), and peak RSS and private dirty memory. Every decision is checked against the scenario, and the run fails on any disagreement. Transport and HTTP framing are out of scope: an embedded engine sees only the protocol string."
+    },
+    {
       "id": "engine.immutable-structural-plans",
       "area": "engine",
       "name": "Immutable cache-efficient structural execution plans",
