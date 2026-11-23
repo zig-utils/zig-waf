@@ -351,6 +351,12 @@ pub const Builder = struct {
 
     fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
         const waf = try self.allocator.create(Waf);
+        errdefer self.allocator.destroy(waf);
+        const compiled_operators = if (owned_plan) |value|
+            try compileOperators(self.allocator, value, self.config.plugins)
+        else
+            @as([]CachedOperator, &.{});
+        errdefer deinitOperators(self.allocator, compiled_operators);
         const directive_configuration = if (owned_plan) |value| switch (directives.Configuration.init(value, self.directive_capabilities)) {
             .configuration => |configuration| configuration,
             .diagnostic => unreachable,
@@ -378,6 +384,7 @@ pub const Builder = struct {
         };
         waf.* = .{
             .plugins = self.config.plugins,
+            .operators = compiled_operators,
             .json_depth_limit = json_depth_limit,
             .allocator = self.allocator,
             .config = self.config,
@@ -399,6 +406,74 @@ pub const Builder = struct {
     }
 };
 
+/// One rule's operator as the WAF holds it for its whole lifetime (#83).
+///
+/// Compiling an operator is the expensive part of evaluating a rule: an `@rx`
+/// pattern goes through the regex parser, optimizer and compiler, and an `@pm`
+/// list builds an Aho-Corasick automaton. Doing that on every evaluation made full
+/// CRS cost milliseconds per request before a single value was inspected, so a rule
+/// whose parameter is literal compiles once here, and every transaction of this
+/// generation matches against the same operator. Matching only reads it: a regex
+/// match runs in a per-call worker (the compiled `Regex` is documented as
+/// immutable and concurrently shareable), and the phrase and IP matchers keep their
+/// state in the call. The regex worker allocates its lazy DFA through the
+/// allocator that compiled the pattern, which is the WAF's, and that is already
+/// required to be thread-safe because transactions allocate through it.
+///
+/// Patterns on zig-regex's backtracking engine are shared too. Before zig-regex
+/// 0.5.1 that engine wrote its input, captures and step count into the compiled
+/// `Regex` on every match, so two transactions matching one rule on different
+/// threads corrupted each other's match and missed attacks. Since 0.5.1 each
+/// search runs on its own copy of that state (zig-utils/zig-regex#54), and the
+/// concurrency test below fails if a dependency change brings the race back.
+const CachedOperator = union(enum) {
+    /// Nothing compiled ahead of time: an unconditional rule, an operator a host
+    /// plugin provides, or a parameter that needs a transaction's macro
+    /// expansion. The last two are compiled per evaluation, once a target has
+    /// produced a value.
+    none,
+    compiled: runtime_operator.RuntimeOperator,
+    /// The parameter does not compile. Such a rule never matches, as it did when
+    /// the compile was retried, and failed, on every evaluation.
+    invalid,
+};
+
+fn compileOperators(
+    allocator: std.mem.Allocator,
+    plan: *const compiled_plan.Plan,
+    plugins: ?*const plugin.Registry,
+) std.mem.Allocator.Error![]CachedOperator {
+    const compiled = try allocator.alloc(CachedOperator, plan.rules.len);
+    @memset(compiled, .none);
+    errdefer deinitOperators(allocator, compiled);
+    for (plan.rules, compiled) |rule, *slot| {
+        if (rule.unconditional or rule.operator.macro != null) continue;
+        const name = plan.string(rule.operator.name) orelse continue;
+        if (plugins) |registry| if (registry.findOperator(name) != null) continue;
+        const parameter = plan.string(rule.operator.parameter) orelse continue;
+        // Name and parameter are borrowed from the plan's string table, which this
+        // WAF owns for as long as it owns the operators.
+        const operator = runtime_operator.RuntimeOperator.compile(allocator, name, parameter) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                slot.* = .invalid;
+                continue;
+            },
+        };
+        slot.* = .{ .compiled = operator };
+    }
+    return compiled;
+}
+
+fn deinitOperators(allocator: std.mem.Allocator, compiled: []CachedOperator) void {
+    if (compiled.len == 0) return;
+    for (compiled) |*slot| switch (slot.*) {
+        .compiled => |*operator| operator.deinit(),
+        .none, .invalid => {},
+    };
+    allocator.free(compiled);
+}
+
 /// Immutable, thread-safe compiled WAF state.
 ///
 /// Keep the pointer stable until every child transaction is deinitialized.
@@ -416,6 +491,9 @@ pub const Waf = struct {
     json_depth_limit: usize,
     /// Host-provided operators (#23), borrowed for this WAF's lifetime.
     plugins: ?*const plugin.Registry,
+    /// Every rule's operator, compiled once for this generation and indexed like
+    /// `plan.rules` (#83). Empty without a plan.
+    operators: []CachedOperator = &.{},
     active_transactions: std.atomic.Value(usize),
     transaction_sequence: std.atomic.Value(u64),
     /// Request-path counters (#32), incremented as transactions retire so a scrape
@@ -495,6 +573,7 @@ pub const Waf = struct {
     pub fn deinit(self: *Waf) DeinitError!void {
         if (self.active_transactions.load(.acquire) != 0) return error.TransactionsActive;
         const allocator = self.allocator;
+        deinitOperators(allocator, self.operators);
         if (self.plan) |value| value.deinit();
         allocator.destroy(self);
     }
@@ -2984,17 +3063,29 @@ pub const Transaction = struct {
         };
 
         const op_name = plan.string(rule.operator.name) orelse return null;
+        // The operator this WAF compiled when it was built (#83), when the parameter
+        // is literal. Otherwise it is compiled below, and only once a target has
+        // produced a value to match, so a rule with nothing to inspect pays nothing.
+        const shared: ?*const runtime_operator.RuntimeOperator = if (rule_index < self.waf.operators.len)
+            switch (self.waf.operators[rule_index]) {
+                .compiled => |*operator| operator,
+                .invalid => return null,
+                .none => null,
+            }
+        else
+            null;
         // Macro-expand the operator argument (e.g. `@rx %{TX.pattern}`); a
-        // macro-free argument expands to its literal bytes.
-        const op_param = self.expandEffectText(
+        // macro-free argument expands to its literal bytes. A shared operator was
+        // compiled from those bytes already.
+        const op_param = if (shared != null) "" else self.expandEffectText(
             .{ .value = rule.operator.parameter, .macro = rule.operator.macro },
             arena,
         ) catch return null;
         // A host plugin owns this operator name: the engine has no built-in for it,
         // and the rule only compiled because the plugin was registered.
         const plugin_operator = if (self.waf.plugins) |registry| registry.findOperator(op_name) else null;
-        var operator = runtime_operator.RuntimeOperator.compile(arena, op_name, op_param) catch return null;
-        defer operator.deinit();
+        var per_evaluation: ?runtime_operator.RuntimeOperator = null;
+        defer if (per_evaluation) |*operator| operator.deinit();
 
         const transforms = plan.transformations[rule.transformations_start..][0..rule.transformations_count];
         const targets = plan.targets[rule.targets_start..][0..rule.targets_count];
@@ -3008,6 +3099,7 @@ pub const Transaction = struct {
             const values = try self.resolveTarget(arena, variable_name, selector, count);
             for (values) |resolved| {
                 if (transforms.len != 0 and multi) {
+                    const operator = operatorFor(shared, &per_evaluation, arena, op_name, op_param) orelse return null;
                     // multiMatch: evaluate the operator after every transformation
                     // stage (including the original), matching the first hit.
                     const result = self.transformation_executor.applyPipeline(transforms, resolved.value, true) catch {
@@ -3035,13 +3127,30 @@ pub const Transaction = struct {
                     const hit = if (plugin_operator) |provider|
                         self.matchThroughPlugin(provider, op_param, transformed)
                     else
-                        operator.match(transformed, .modsecurity);
+                        (operatorFor(shared, &per_evaluation, arena, op_name, op_param) orelse return null)
+                            .match(transformed, .modsecurity);
                     if (hit.matched != negated)
                         return try matchContext(arena, resolved.name, transformed, hit.regex, hit.sqli, hit.identity);
                 }
             }
         }
         return null;
+    }
+
+    /// The operator a rule matches with: the WAF's shared one, or one compiled into
+    /// the rule's scratch on first use. Null when the parameter does not compile,
+    /// which leaves the rule unmatched.
+    fn operatorFor(
+        shared: ?*const runtime_operator.RuntimeOperator,
+        per_evaluation: *?runtime_operator.RuntimeOperator,
+        arena: std.mem.Allocator,
+        name: []const u8,
+        parameter: []const u8,
+    ) ?*const runtime_operator.RuntimeOperator {
+        if (shared) |operator| return operator;
+        if (per_evaluation.* == null)
+            per_evaluation.* = runtime_operator.RuntimeOperator.compile(arena, name, parameter) catch return null;
+        return &per_evaluation.*.?;
     }
 
     /// Evaluate a host-provided operator, counting the times it could not answer.
@@ -8489,4 +8598,117 @@ test "a transaction correlates with the incoming trace, and refuses a poisoned o
     const fresh = try untraced.traceContext();
     try std.testing.expect(!fresh.inherited);
     try std.testing.expect(fresh.context.sampled());
+}
+
+test "a WAF compiles every literal operator once" {
+    // Rule 2 runs on zig-regex's backtracking engine (the lookahead selects it),
+    // which zig-waf only shares since zig-regex 0.5.1 made its searches
+    // thread-safe. The test after this one runs it concurrently.
+    const input =
+        \\SecRule REQUEST_URI "@rx ^/plain" "id:1,phase:1,pass,nolog"
+        \\SecRule REQUEST_URI "@rx (?=[a-z/]*union)[a-z/]+select" "id:2,phase:1,deny,status:403"
+        \\SecRule REQUEST_URI "@pm evil attack" "id:3,phase:1,pass,nolog"
+        \\SecRule REQUEST_URI "@rx %{tx.pattern}" "id:4,phase:1,pass,nolog"
+        \\SecAction "id:5,phase:1,pass,nolog"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "operator-cache.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+
+    const Expected = enum { compiled, none };
+    const expectations = [_]struct { id: u64, cached: Expected }{
+        .{ .id = 1, .cached = .compiled },
+        .{ .id = 2, .cached = .compiled }, // backtracking, shared since zig-regex 0.5.1
+        .{ .id = 3, .cached = .compiled },
+        .{ .id = 4, .cached = .none }, // macro: expanded per transaction
+        .{ .id = 5, .cached = .none }, // unconditional: no operator
+    };
+    const compiled = waf.compiledPlan().?;
+    try std.testing.expectEqual(compiled.rules.len, waf.operators.len);
+    for (expectations) |expected| {
+        const index = for (compiled.rules, 0..) |rule, i| {
+            if (rule.external_id == expected.id) break i;
+        } else return error.TestUnexpectedResult;
+        const actual: Expected = switch (waf.operators[index]) {
+            .compiled => .compiled,
+            .none => .none,
+            .invalid => return error.TestUnexpectedResult,
+        };
+        try std.testing.expectEqual(expected.cached, actual);
+    }
+
+    var tx = waf.newTransaction();
+    defer tx.deinit();
+    try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+    try tx.processUri("/aa/union/select", "GET", "HTTP/1.1");
+    try tx.processRequestHeaders();
+    try tx.evaluatePhase(std.testing.allocator, .request_headers);
+    const decision = (try tx.intervention()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(?u32, 2), decision.rule_id);
+}
+
+const SharedBacktrackWorker = struct {
+    waf: *const Waf,
+    wrong: *std.atomic.Value(usize),
+    errors: *std.atomic.Value(usize),
+
+    const rounds = 500;
+
+    fn run(self: *const SharedBacktrackWorker) void {
+        for (0..rounds) |round| {
+            const attack = round % 2 == 0;
+            const blocked = self.isBlocked(if (attack) "/aaaaaaaa/union/select" else "/bbbbbbbb/select-union") catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            if (blocked != attack) _ = self.wrong.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn isBlocked(self: *const SharedBacktrackWorker, uri: []const u8) !bool {
+        var tx = self.waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri(uri, "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        return (try tx.intervention()) != null;
+    }
+};
+
+test "transactions on several threads share one backtracking regex correctly" {
+    // Before zig-regex 0.5.1, sharing a backtracking pattern let concurrent
+    // matches overwrite each other's state: in a C ABI race test, about one attack
+    // in seven passed and most clean requests were blocked. The clean URI
+    // contains both literals the pattern requires, so zig-regex's literal
+    // prefilter cannot reject it and skip the engine that used to race.
+    const input =
+        \\SecRule REQUEST_URI "@rx (?=[a-z/]*union)[a-z/]+select" "id:1,phase:1,deny,status:403"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "shared-backtrack.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    try std.testing.expect(waf.operators[0] == .compiled);
+
+    var wrong = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+    const worker: SharedBacktrackWorker = .{ .waf = waf, .wrong = &wrong, .errors = &errors };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, SharedBacktrackWorker.run, .{&worker});
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), errors.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), wrong.load(.acquire));
 }
