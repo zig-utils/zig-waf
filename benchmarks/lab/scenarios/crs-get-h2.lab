@@ -1,0 +1,49 @@
+# The same clean GETs presented as HTTP/2.0. An embedded engine sees only the
+# protocol string; transport costs are outside this lab.
+rules crs
+
+request pass GET / HTTP/2.0
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+request pass GET /products?category=books&page=2 HTTP/2.0
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+request pass GET /search?q=distributed+systems&sort=relevance HTTP/2.0
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+request pass GET /static/app.3f9a.js HTTP/2.0
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+request pass GET /api/v1/cart?currency=EUR HTTP/2.0
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end

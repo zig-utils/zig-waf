@@ -1,0 +1,53 @@
+# Attacks CRS blocks at paranoia level 1, one per attack family.
+rules crs
+
+# sql injection in a query
+request block GET /search?q=1%27%20UNION%20SELECT%20username,password%20FROM%20users-- HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+# cross-site scripting in a query
+request block GET /search?q=%3Cscript%3Ealert(document.cookie)%3C/script%3E HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+# path traversal
+request block GET /download?file=../../../../etc/passwd HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+# command injection
+request block GET /ping?host=127.0.0.1;cat%20/etc/passwd HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end
+# php code injection
+request block GET /index.php?page=php://filter/convert.base64-encode/resource=index HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+end

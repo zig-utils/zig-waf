@@ -1,0 +1,15 @@
+# A clean 741-byte JSON POST, parsed by the JSON body processor.
+rules crs
+
+request pass POST /api/v1/orders HTTP/1.1
+header Host: shop.example
+header User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15
+header Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8
+header Accept-Language: en-US,en;q=0.9
+header Accept-Encoding: gzip, deflate, br
+header Cookie: session=7f3c9a1e2b4d6f80; theme=dark
+header Connection: keep-alive
+header Content-Type: application/json
+header Content-Length: 741
+body {"order":{"id":48213,"currency":"EUR","items":[{"sku":"BK-0000","qty":1,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0001","qty":2,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0002","qty":3,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0003","qty":1,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0004","qty":2,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0005","qty":3,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0006","qty":1,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0007","qty":2,"title":"Designing Data-Intensive Applications"},{"sku":"BK-0008","qty":3,"title":"Designing Data-Intensive Applications"}],"note":"Please gift wrap"}}
+end
