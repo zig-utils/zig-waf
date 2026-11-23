@@ -420,17 +420,17 @@ pub const Builder = struct {
 /// allocator that compiled the pattern, which is the WAF's, and that is already
 /// required to be thread-safe because transactions allocate through it.
 ///
-/// A pattern that runs on zig-regex's backtracking engine is the exception, and is
-/// never shared. That engine lives inside the compiled `Regex` and every match
-/// writes its input, captures and step count there, so two transactions matching
-/// the same rule on different threads corrupt each other's match. Shared, such a
-/// rule missed attacks under concurrent load. Those patterns compile per
-/// evaluation, as every pattern used to.
+/// Patterns on zig-regex's backtracking engine are shared too. Before zig-regex
+/// 0.5.1 that engine wrote its input, captures and step count into the compiled
+/// `Regex` on every match, so two transactions matching one rule on different
+/// threads corrupted each other's match and missed attacks. Since 0.5.1 each
+/// search runs on its own copy of that state (zig-utils/zig-regex#54), and the
+/// concurrency test below fails if a dependency change brings the race back.
 const CachedOperator = union(enum) {
     /// Nothing compiled ahead of time: an unconditional rule, an operator a host
-    /// plugin provides, a parameter that needs a transaction's macro expansion, or
-    /// an operator that is unsafe to share (see above). All but the first are
-    /// compiled per evaluation, once a target has produced a value.
+    /// plugin provides, or a parameter that needs a transaction's macro
+    /// expansion. The last two are compiled per evaluation, once a target has
+    /// produced a value.
     none,
     compiled: runtime_operator.RuntimeOperator,
     /// The parameter does not compile. Such a rule never matches, as it did when
@@ -453,36 +453,16 @@ fn compileOperators(
         const parameter = plan.string(rule.operator.parameter) orelse continue;
         // Name and parameter are borrowed from the plan's string table, which this
         // WAF owns for as long as it owns the operators.
-        var operator = runtime_operator.RuntimeOperator.compile(allocator, name, parameter) catch |err| switch (err) {
+        const operator = runtime_operator.RuntimeOperator.compile(allocator, name, parameter) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
                 slot.* = .invalid;
                 continue;
             },
         };
-        if (!shareable(&operator)) {
-            operator.deinit();
-            continue;
-        }
         slot.* = .{ .compiled = operator };
     }
     return compiled;
-}
-
-/// Whether one compiled operator can serve concurrent transactions: everything
-/// except a regex on zig-regex's backtracking engine, whose match state lives in
-/// the compiled pattern (see `CachedOperator`).
-fn shareable(operator: *const runtime_operator.RuntimeOperator) bool {
-    return switch (operator.*) {
-        .regex => |*regex| !backtracks(regex),
-        .identity => |*identity| !backtracks(&identity.regex),
-        .phrase, .ip, .compile_free => true,
-    };
-}
-
-fn backtracks(regex: *const operators.RegexOperator) bool {
-    const compiled = regex.compiled orelse return false;
-    return compiled.engine_type == .backtracking;
 }
 
 fn deinitOperators(allocator: std.mem.Allocator, compiled: []CachedOperator) void {
@@ -8620,11 +8600,10 @@ test "a transaction correlates with the incoming trace, and refuses a poisoned o
     try std.testing.expect(fresh.context.sampled());
 }
 
-test "a WAF shares compiled operators except backtracking regexes" {
-    // zig-regex keeps a backtracking pattern's match state inside the compiled
-    // pattern, so sharing one across transactions let concurrent matches corrupt
-    // each other and miss attacks (#83). Such a rule must compile per evaluation,
-    // and still match.
+test "a WAF compiles every literal operator once" {
+    // Rule 2 runs on zig-regex's backtracking engine (the lookahead selects it),
+    // which zig-waf only shares since zig-regex 0.5.1 made its searches
+    // thread-safe. The test after this one runs it concurrently.
     const input =
         \\SecRule REQUEST_URI "@rx ^/plain" "id:1,phase:1,pass,nolog"
         \\SecRule REQUEST_URI "@rx (?=[a-z/]*union)[a-z/]+select" "id:2,phase:1,deny,status:403"
@@ -8645,7 +8624,7 @@ test "a WAF shares compiled operators except backtracking regexes" {
     const Expected = enum { compiled, none };
     const expectations = [_]struct { id: u64, cached: Expected }{
         .{ .id = 1, .cached = .compiled },
-        .{ .id = 2, .cached = .none }, // backtracking: never shared
+        .{ .id = 2, .cached = .compiled }, // backtracking, shared since zig-regex 0.5.1
         .{ .id = 3, .cached = .compiled },
         .{ .id = 4, .cached = .none }, // macro: expanded per transaction
         .{ .id = 5, .cached = .none }, // unconditional: no operator
@@ -8672,4 +8651,64 @@ test "a WAF shares compiled operators except backtracking regexes" {
     try tx.evaluatePhase(std.testing.allocator, .request_headers);
     const decision = (try tx.intervention()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(?u32, 2), decision.rule_id);
+}
+
+const SharedBacktrackWorker = struct {
+    waf: *const Waf,
+    wrong: *std.atomic.Value(usize),
+    errors: *std.atomic.Value(usize),
+
+    const rounds = 500;
+
+    fn run(self: *const SharedBacktrackWorker) void {
+        for (0..rounds) |round| {
+            const attack = round % 2 == 0;
+            const blocked = self.isBlocked(if (attack) "/aaaaaaaa/union/select" else "/bbbbbbbb/select-union") catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            if (blocked != attack) _ = self.wrong.fetchAdd(1, .monotonic);
+        }
+    }
+
+    fn isBlocked(self: *const SharedBacktrackWorker, uri: []const u8) !bool {
+        var tx = self.waf.newTransaction();
+        defer tx.deinit();
+        try tx.processConnection("192.0.2.1", 1234, "198.51.100.1", 443);
+        try tx.processUri(uri, "GET", "HTTP/1.1");
+        try tx.processRequestHeaders();
+        try tx.evaluatePhase(std.testing.allocator, .request_headers);
+        return (try tx.intervention()) != null;
+    }
+};
+
+test "transactions on several threads share one backtracking regex correctly" {
+    // Before zig-regex 0.5.1, sharing a backtracking pattern let concurrent
+    // matches overwrite each other's state: in a C ABI race test, about one attack
+    // in seven passed and most clean requests were blocked. The clean URI
+    // contains both literals the pattern requires, so zig-regex's literal
+    // prefilter cannot reject it and skip the engine that used to race.
+    const input =
+        \\SecRule REQUEST_URI "@rx (?=[a-z/]*union)[a-z/]+select" "id:1,phase:1,deny,status:403"
+    ;
+    var parsed = try seclang.parser.parseBytes(std.testing.allocator, "shared-backtrack.conf", input, .{}, .{});
+    defer parsed.deinit();
+    var documents = [_]seclang.parser.Document{parsed.document};
+    const plan = try compiled_plan.compile(std.testing.allocator, &parsed.registry, &documents, .{});
+    defer plan.deinit();
+    var builder = Builder.init(std.testing.allocator);
+    builder.setRetainedPlan(plan);
+    const waf = try builder.build();
+    defer waf.deinit() catch unreachable;
+    try std.testing.expect(waf.operators[0] == .compiled);
+
+    var wrong = std.atomic.Value(usize).init(0);
+    var errors = std.atomic.Value(usize).init(0);
+    const worker: SharedBacktrackWorker = .{ .waf = waf, .wrong = &wrong, .errors = &errors };
+    var threads: [4]std.Thread = undefined;
+    for (&threads) |*thread| thread.* = try std.Thread.spawn(.{}, SharedBacktrackWorker.run, .{&worker});
+    for (&threads) |*thread| thread.join();
+
+    try std.testing.expectEqual(@as(usize, 0), errors.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 0), wrong.load(.acquire));
 }

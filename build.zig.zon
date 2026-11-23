@@ -9,8 +9,8 @@
             .hash = "zig_injection-0.1.0-7QN34L8yCADbOW8gYvKFhQfRT61WgGxTRNgSmUmd64a5",
         },
         .regex = .{
-            .url = "https://registry.pantry.dev/zig/packages/zig-regex/0.2.1/tarball",
-            .hash = "zig_regex-0.2.1-omky0ZgdGQA1p3_ZDMPQ2PxIxqVzXZH8NhVTeHal08R3",
+            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.1.tar.gz",
+            .hash = "zig_regex-0.5.1-omky0eRfJgD3H36kQj4jlWdvdzdTQTTUCAnJrursdkTg",
         },
         .xml = .{
             .url = "https://registry.pantry.dev/zig/packages/zig-xml/0.1.0/tarball",

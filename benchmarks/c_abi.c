@@ -111,11 +111,10 @@ int main(int argc, char **argv) {
     /* Patterns sized like CRS's: alternations, classes and quantifiers that take
      * the regex compiler real work, and phrase lists that build an automaton. The
      * URI they inspect matches none of them, so every rule runs its operator once
-     * and fires nothing. Each stays on zig-regex's Thompson engine: no `(?i)`,
-     * lazy quantifier, repeated group or lookaround, any of which moves a pattern
-     * to the backtracking engine. That engine keeps its match state in the
-     * compiled regex, so the WAF compiles such a pattern per evaluation rather
-     * than share it; this gate guards the patterns it does share. */
+     * and fires nothing. Each stays on zig-regex's Thompson engine (no `(?i)`,
+     * lazy quantifier, repeated group or lookaround), whose cost is steady
+     * enough to gate on. The WAF shares backtracking patterns the same way; the
+     * engine tests cover those. */
     static const char *patterns[] = {
         "(?:union|select|insert|update|delete)[\\s/*]+(?:all[\\s/*]+)?(?:select|from|into)",
         "<script[^>]*>",
