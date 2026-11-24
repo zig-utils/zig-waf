@@ -264,28 +264,57 @@ pub const RegexOutcome = struct {
 /// shared. An empty pattern always matches, mirroring the pinned engines.
 pub const RegexOperator = struct {
     compiled: ?regex.Regex,
+    /// True when the pattern compiled for spans only (see `compileWithFlags`):
+    /// it matches exactly as it would with captures, but only capture field 0,
+    /// the whole match, is filled.
+    spans_only: bool = false,
+
+    /// The flags every `@rx` is compiled with: ModSecurity 3.0.16's
+    /// `PCRE2_DOTALL | PCRE2_MULTILINE`, without `PCRE2_UTF` (#90). Coraza
+    /// prepends `(?sm)` to the same effect. CRS is written against these
+    /// semantics: `.` matches a newline, `^` and `$` match at line breaks, and
+    /// the pattern and the input are bytes, so escapes such as `\x{ff}` are
+    /// byte values and `(?i)` folds ASCII only.
+    pub const default_flags: regex.common.CompileFlags = .{ .bytes = true, .dot_all = true, .multiline = true };
 
     pub fn compile(allocator: std.mem.Allocator, pattern: []const u8) RegexCompileError!RegexOperator {
-        return compileWithFlags(allocator, pattern, .{});
+        return compileWithFlags(allocator, pattern, default_flags);
     }
 
+    /// Compile with capture groups, as `capture` and `TX:1`..`TX:9` need. When
+    /// zig-regex refuses that compile as too complex, the pattern is compiled
+    /// again for spans only (#89). zig-regex refuses a capturing compile when
+    /// the pattern needs its backtracking engine and could backtrack
+    /// exponentially there; without captures the same pattern runs on its
+    /// linear engine, which matches the same inputs at the same start and
+    /// cannot blow up. ModSecurity and Coraza run every such pattern, so
+    /// refusing it would silently disable the rule (CRS has 13 of them, among
+    /// them most of the Unix command-injection rules, and each reads only
+    /// `TX:0`).
     pub fn compileWithFlags(allocator: std.mem.Allocator, pattern: []const u8, flags: regex.common.CompileFlags) RegexCompileError!RegexOperator {
         if (pattern.len == 0) return .{ .compiled = null };
         const compiled = regex.Regex.compileWithFlags(allocator, pattern, flags) catch |err| {
-            const widened: anyerror = err;
-            return switch (widened) {
-                error.OutOfMemory => error.OutOfMemory,
-                error.TooManyStates,
-                error.TooManyCaptures,
-                error.TooManyAlternations,
-                error.PatternTooComplex,
-                error.NestingTooDeep,
-                error.StackOverflow,
-                => error.RegexProgramTooComplex,
-                else => error.InvalidRegexPattern,
-            };
+            const mapped = mapCompileError(err);
+            if (mapped != error.RegexProgramTooComplex) return mapped;
+            const spans = regex.Regex.compileWithoutCaptures(allocator, pattern, flags) catch |spans_err|
+                return mapCompileError(spans_err);
+            return .{ .compiled = spans, .spans_only = true };
         };
         return .{ .compiled = compiled };
+    }
+
+    fn mapCompileError(err: anyerror) RegexCompileError {
+        return switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.TooManyStates,
+            error.TooManyCaptures,
+            error.TooManyAlternations,
+            error.PatternTooComplex,
+            error.NestingTooDeep,
+            error.StackOverflow,
+            => error.RegexProgramTooComplex,
+            else => error.InvalidRegexPattern,
+        };
     }
 
     pub fn deinit(self: *RegexOperator) void {
@@ -1044,6 +1073,56 @@ test "empty rx pattern always matches like the pinned engines" {
 
 test "invalid rx pattern is a distinguishable compile error" {
     try std.testing.expectError(error.InvalidRegexPattern, RegexOperator.compile(std.testing.allocator, "(unterminated"));
+}
+
+test "rx matches across lines like ModSecurity's PCRE2_DOTALL | PCRE2_MULTILINE" {
+    // CRS 942230's `select.*?having` must see a payload split by a newline (#90).
+    var dotall = try RegexOperator.compile(std.testing.allocator, "select.*?having");
+    defer dotall.deinit();
+    var worker = dotall.worker();
+    defer worker.deinit();
+    try std.testing.expect(worker.evaluate("1 select password from users\nhaving 1=1--").matched);
+
+    // `^` and `$` match at line breaks.
+    var anchored = try RegexOperator.compile(std.testing.allocator, "^admin$");
+    defer anchored.deinit();
+    var anchored_worker = anchored.worker();
+    defer anchored_worker.deinit();
+    try std.testing.expect(anchored_worker.evaluate("user=guest\nadmin\n").matched);
+}
+
+test "rx patterns and inputs are bytes, as in non-UTF PCRE2" {
+    // CRS 941310 and 933180 write bytes as `\x{be}`; a UTF-8 compile rejected
+    // them and disabled the rule (#89).
+    var operator = try RegexOperator.compile(std.testing.allocator, "\\x{bc}[^>\\x{be}]*[>\\x{be}]");
+    defer operator.deinit();
+    var worker = operator.worker();
+    defer worker.deinit();
+    try std.testing.expect(worker.evaluate("a\xbcscript\xbe").matched);
+    try std.testing.expect(!worker.evaluate("<script>").matched);
+}
+
+test "rx falls back to spans when a capturing compile is too complex" {
+    // With captures, zig-regex refuses this as exponential on its backtracker;
+    // ModSecurity runs it, so refusing would disable the rule (#89). For spans
+    // it runs on the linear engine.
+    var operator = try RegexOperator.compile(std.testing.allocator, "(x+x+)+y");
+    defer operator.deinit();
+    try std.testing.expect(operator.spans_only);
+    var worker = operator.worker();
+    defer worker.deinit();
+    const hit = worker.evaluate("--xxxxy--");
+    try std.testing.expect(hit.matched);
+    try std.testing.expectEqual(@as(u8, 1), hit.capture_count);
+    try std.testing.expectEqualStrings("xxxxy", hit.captures[0]);
+    // The input that makes a backtracker exponential stays linear.
+    const no_y: [4096]u8 = @splat('x');
+    try std.testing.expect(!worker.evaluate(&no_y).matched);
+
+    // A pattern whose capturing compile succeeds keeps its groups.
+    var groups = try RegexOperator.compile(std.testing.allocator, "(a+)(b+)");
+    defer groups.deinit();
+    try std.testing.expect(!groups.spans_only);
 }
 
 test "rxGlobal counts every non-overlapping match and keeps first captures" {
