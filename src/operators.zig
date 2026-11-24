@@ -268,6 +268,15 @@ pub const RegexOperator = struct {
     /// it matches exactly as it would with captures, but only capture field 0,
     /// the whole match, is filled.
     spans_only: bool = false,
+    /// The same pattern compiled for spans only, which answers whether an input
+    /// matches (#87). Most evaluations do not match, and zig-regex keeps the
+    /// lazy DFA of a shared `Regex.isMatch` warm between calls and across
+    /// threads (since zig-regex 0.5.2), where a `Matcher` made for one
+    /// evaluation starts cold and rebuilds it. On CRS that is most of the
+    /// request path: a clean GET went from 6.5 ms to 0.6 ms. The capturing
+    /// `compiled` only runs once this says the input matches. Null when
+    /// `compiled` is itself span-only, which then answers directly.
+    tester: ?regex.Regex = null,
 
     /// The flags every `@rx` is compiled with: ModSecurity 3.0.16's
     /// `PCRE2_DOTALL | PCRE2_MULTILINE`, without `PCRE2_UTF` (#90). Coraza
@@ -300,7 +309,18 @@ pub const RegexOperator = struct {
                 return mapCompileError(spans_err);
             return .{ .compiled = spans, .spans_only = true };
         };
-        return .{ .compiled = compiled };
+        // A span-only compile of a pattern that compiled with captures cannot be
+        // refused as too complex; any other failure leaves `find` to answer, as it
+        // did before.
+        const tester = regex.Regex.compileWithoutCaptures(allocator, pattern, flags) catch |err| switch (err) {
+            error.OutOfMemory => {
+                var owned = compiled;
+                owned.deinit();
+                return error.OutOfMemory;
+            },
+            else => null,
+        };
+        return .{ .compiled = compiled, .tester = tester };
     }
 
     fn mapCompileError(err: anyerror) RegexCompileError {
@@ -319,11 +339,16 @@ pub const RegexOperator = struct {
 
     pub fn deinit(self: *RegexOperator) void {
         if (self.compiled) |*compiled| compiled.deinit();
+        if (self.tester) |*tester| tester.deinit();
         self.* = undefined;
     }
 
     pub fn worker(self: *const RegexOperator) Worker {
-        return .{ .matcher = if (self.compiled) |*compiled| compiled.matcher() else null };
+        const compiled = if (self.compiled) |*value| value else return .{ .matcher = null };
+        return .{
+            .matcher = compiled.matcher(),
+            .tester = if (self.tester) |*tester| tester else if (self.spans_only) compiled else null,
+        };
     }
 
     /// A memoizing worker keeps a bounded per-worker LRU of recent `@rx`
@@ -385,6 +410,9 @@ pub const RegexOperator = struct {
 
     pub const Worker = struct {
         matcher: ?regex.Regex.Matcher,
+        /// The operator's shared span-only `Regex` (see `RegexOperator.tester`).
+        /// It is read concurrently by every worker, which zig-regex allows.
+        tester: ?*const regex.Regex = null,
         memo: ?Memo = null,
 
         pub fn deinit(self: *Worker) void {
@@ -425,8 +453,10 @@ pub const RegexOperator = struct {
 
         fn evaluateUncached(self: *Worker, input: []const u8) RegexOutcome {
             if (self.matcher == null) return regexAlwaysMatch();
+            if (self.rejects(input)) |outcome| return outcome;
             const matcher = &self.matcher.?;
-            var match = (matcher.find(input) catch |err| return regexRuntimeFailure(err)) orelse return .{};
+            var match = (matcher.find(input) catch |err| return regexRuntimeFailure(err)) orelse
+                return self.spanMatch(input);
             defer match.deinit(matcher.re.allocator);
             var outcome = RegexOutcome{ .matched = true, .match_count = 1 };
             regexFillCaptures(&outcome, match);
@@ -438,16 +468,43 @@ pub const RegexOperator = struct {
         /// Global evaluation is not memoized.
         pub fn evaluateGlobal(self: *Worker, allocator: std.mem.Allocator, input: []const u8) RegexOutcome {
             if (self.matcher == null) return regexAlwaysMatch();
+            if (self.rejects(input)) |outcome| return outcome;
             const matcher = &self.matcher.?;
             const matches = matcher.findAll(allocator, input) catch |err| return regexRuntimeFailure(err);
             defer {
                 for (matches) |*match| match.deinit(allocator);
                 allocator.free(matches);
             }
-            if (matches.len == 0) return .{};
+            if (matches.len == 0) return self.spanMatch(input);
             var outcome = RegexOutcome{ .matched = true, .match_count = @intCast(matches.len) };
             regexFillCaptures(&outcome, matches[0]);
             return outcome;
+        }
+
+        /// The capturing search found nothing. With a tester, that tester has
+        /// just reported a match, and the two disagree. zig-regex's capturing
+        /// backtracker misses some matches its linear engine and PCRE2 find (for
+        /// `^(?:[^']*?'[^']*?'[^']*?)*?'` on `a'b'c'`), so the span-only
+        /// engine's answer stands, with field 0 from a span-only search, as on
+        /// the fallback in `compileWithFlags`.
+        fn spanMatch(self: *const Worker, input: []const u8) RegexOutcome {
+            const tester = self.tester orelse return .{};
+            var span_matcher = tester.matcher();
+            defer span_matcher.deinit();
+            var match = (span_matcher.find(input) catch |err| return regexRuntimeFailure(err)) orelse return .{};
+            defer match.deinit(span_matcher.re.allocator);
+            var outcome = RegexOutcome{ .matched = true, .match_count = 1 };
+            regexFillCaptures(&outcome, match);
+            return outcome;
+        }
+
+        /// The outcome when the shared tester settles the evaluation without a
+        /// capturing search: no match, or a runtime error. Null when the input
+        /// matches, or when there is no tester, and a search must run.
+        fn rejects(self: *const Worker, input: []const u8) ?RegexOutcome {
+            const tester = self.tester orelse return null;
+            const matched = tester.isMatch(input) catch |err| return regexRuntimeFailure(err);
+            return if (matched) null else .{};
         }
     };
 };
@@ -1102,6 +1159,68 @@ test "rx patterns and inputs are bytes, as in non-UTF PCRE2" {
     try std.testing.expect(!worker.evaluate("<script>").matched);
 }
 
+test "rx tests with a shared span-only regex and captures only on a match" {
+    var operator = try RegexOperator.compile(std.testing.allocator, "id=([0-9]+)");
+    defer operator.deinit();
+    try std.testing.expect(operator.tester != null);
+    // Workers, one per thread in the engine, share the one tester.
+    var first = operator.worker();
+    defer first.deinit();
+    var second = operator.worker();
+    defer second.deinit();
+    try std.testing.expect(!first.evaluate("name=x").matched);
+    const hit = second.evaluate("a&id=42&b");
+    try std.testing.expect(hit.matched);
+    try std.testing.expectEqualStrings("id=42", hit.captures[0]);
+    try std.testing.expectEqualStrings("42", hit.captures[1]);
+    try std.testing.expectEqual(@as(u32, 2), first.evaluateGlobal(std.testing.allocator, "id=1 id=2").match_count);
+    try std.testing.expect(!first.evaluateGlobal(std.testing.allocator, "none").matched);
+}
+
+test "rx decides a match the way the span-only engine and PCRE2 do" {
+    // Lazy quantifiers, alternation order, captures in alternations and inline
+    // modifiers send the capturing compile to zig-regex's backtracker while the
+    // test runs on its linear engine. Whether a match exists must not depend on
+    // which one answers.
+    const patterns = [_][]const u8{
+        "(?i)select.*?from",
+        "(a|ab)(c|bcd)(d*)",
+        "(?i)(?:on|in)(?:load|error)\\s*=",
+        "^(?:[^']*?'[^']*?'[^']*?)*?'",
+        "(?i:UNION)\\s+all",
+        "\\bcat\\b.*?/etc/",
+        "x{2,4}?y",
+    };
+    const inputs = [_][]const u8{
+        "",       "select 1 from t", "SELECT\nfrom", "abcd",       "abcdd",           " onload =",   "INERROR=1",
+        "a'b'c'", "it's",            "union ALL",    "Union  all", "cat /etc/passwd", "concat /etc", "xxy",
+        "xy",     "xxxxxy",
+    };
+    for (patterns) |pattern| {
+        var operator = try RegexOperator.compile(std.testing.allocator, pattern);
+        defer operator.deinit();
+        const tester = &(operator.tester orelse continue);
+        var worker = operator.worker();
+        defer worker.deinit();
+        for (inputs) |input| {
+            try std.testing.expectEqual(try tester.isMatch(input), worker.evaluate(input).matched);
+        }
+    }
+
+    // PCRE2 10.47 (PCRE2_DOTALL | PCRE2_MULTILINE) matches [0,6) and [0,9) here,
+    // and nothing in `a'b'`; zig-regex 0.5.2's capturing backtracker finds no
+    // match in any of them.
+    var quotes = try RegexOperator.compile(std.testing.allocator, "^(?:[^']*?'[^']*?'[^']*?)*?'");
+    defer quotes.deinit();
+    var worker = quotes.worker();
+    defer worker.deinit();
+    const odd = worker.evaluate("a'b'c'");
+    try std.testing.expect(odd.matched);
+    try std.testing.expectEqualStrings("a'b'c'", odd.captures[0]);
+    try std.testing.expect(worker.evaluate("1' or 'a'='a").matched);
+    try std.testing.expect(!worker.evaluate("a'b'").matched);
+}
+
 test "rx falls back to spans when a capturing compile is too complex" {
     // With captures, zig-regex refuses this as exponential on its backtracker;
     // ModSecurity runs it, so refusing would disable the rule (#89). For spans
@@ -1109,8 +1228,11 @@ test "rx falls back to spans when a capturing compile is too complex" {
     var operator = try RegexOperator.compile(std.testing.allocator, "(x+x+)+y");
     defer operator.deinit();
     try std.testing.expect(operator.spans_only);
+    // The span-only compile is its own tester.
+    try std.testing.expect(operator.tester == null);
     var worker = operator.worker();
     defer worker.deinit();
+    try std.testing.expect(worker.tester != null);
     const hit = worker.evaluate("--xxxxy--");
     try std.testing.expect(hit.matched);
     try std.testing.expectEqual(@as(u8, 1), hit.capture_count);

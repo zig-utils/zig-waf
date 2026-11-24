@@ -70,6 +70,21 @@ PCRE's, because the linear engine reports the longest match from that start.
 Thirteen CRS 4.28 patterns take this path, most of them Unix command-injection
 rules, and every one of them reads only `TX:0`, in its log message.
 
+Most values match no rule, so `@rx` first asks only whether a value matches,
+and looks for captures only when it does (#87). Each capturing pattern is also
+compiled for spans only, as `RegexOperator.tester`, and every worker asks that
+one shared regex through zig-regex's `isMatch`. Since zig-regex 0.5.2 that call
+keeps its lazy DFAs warm across calls and threads, where a `Worker`'s own
+matcher builds them again for each value it is created for. When the tester
+says no, the capturing engine never runs. When it says yes and the capturing
+engine finds nothing, the value still matches, with field `0` only: zig-regex's
+backtracker misses some matches PCRE2 finds, such as
+`^(?:[^']*?'[^']*?'[^']*?)*?'` on `a'b'c'`, and the linear engine agrees with
+PCRE2 there. The cost is memory: the spans-only compiles of CRS 4.28's patterns
+take about 60 MB, against 15 MB for the capturing ones, so a WAF with CRS loaded
+holds about 90 MiB resident instead of 35 MiB (see the
+[benchmark lab](benchmark-lab.md)).
+
 - **`@rx`** returns the leftmost match with capture fields `0..9`. Field `0` is
   the full match; fields `1..9` are the first nine parenthesized groups. A
   non-participating optional group is reported as present `false`, distinct from

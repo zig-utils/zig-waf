@@ -192,3 +192,48 @@ all five PL1 Unix command-injection rules (932230, 932235, 932250, 932260 and
 932340), which now run for the first time. zig-regex takes 0.5 to 2 ms per search
 on their command lists, where PCRE2 with JIT takes about 25 µs. Making zig-regex
 fast on CRS's patterns is zig-utils/zig-regex#56.
+
+### After cutting zig-waf's own request cost (#87)
+
+Most of that time was not the searches themselves. Each value got a fresh
+zig-regex matcher, which built its lazy DFAs from nothing, so no rule ever ran
+warm. zig-regex 0.5.2 keeps the DFAs behind its shared `isMatch` warm across
+calls and threads, and zig-waf now asks that shared regex whether a value
+matches before it looks for captures (see [operators](operators.md)). The same
+lab on the same machine, 2,000 requests per run, Coraza included:
+
+| Scenario | zig-waf 5666abd | zig-waf with #87 | ModSecurity 3.0.16 | Coraza 3.7.0 |
+| --- | ---: | ---: | ---: | ---: |
+| `crs-get` | 6.78 ms | 0.65 ms | 0.86 ms | 0.67 ms |
+| `crs-get-h2` | — | 0.65 ms | 0.84 ms | 0.67 ms |
+| `crs-attacks` | — | 0.71 ms | 0.89 ms | 0.79 ms |
+| `crs-form-post` | 20.40 ms | 1.15 ms | 1.46 ms | 5.21 ms |
+| `crs-json-post` | 95.54 ms | 1.66 ms | 4.91 ms | 7.09 ms |
+| `crs-mixed` | — | 0.70 ms | 0.87 ms | 0.71 ms |
+| `crs-mixed`, 4 threads | — | 0.75 ms | 1.38 ms | 0.76 ms |
+
+p50 per request; 5666abd was recorded only for the three scenarios #87 set out
+to cut. All three engines decided every request the same way, with zero
+mismatches in every row. zig-waf now has the lowest median on every CRS
+scenario. On the bodies the lead is clear; on GETs and the mixed run it is 2 to
+4% ahead of Coraza, which is within this lab's run-to-run noise. On the 4-thread
+mixed run it serves 4,791 requests per second against ModSecurity's 2,784 and
+Coraza's 4,863. It also allocates less than
+before: 3,684 allocations and 576 KiB for a clean GET, down from 6,222 and
+1.1 MiB at `f6a40a2`.
+
+Two costs came with it:
+
+- **Memory.** With CRS loaded zig-waf holds about 90 MiB resident, against
+  ModSecurity's 36 MiB and Coraza's 70 MiB, and 35 MiB before. Almost all of it
+  is the second, spans-only compile of each pattern: about 60 MB for CRS's 294
+  patterns, against 15 MB for the capturing compiles. Compiling the second one
+  only for the 164 patterns that need zig-regex's backtracker would save about
+  4 MB, so the fix belongs in zig-regex's compiled programs, not here. CRS also
+  takes about 70 ms to load instead of 36 to 40 ms, still faster than
+  ModSecurity's 180 to 200 ms.
+- **The first requests.** The DFAs are built while requests run, so the first
+  requests after a load are slower. Timed from the first request with no
+  warm-up: a clean GET takes 9.4 ms, then 3.3 and 4.4 ms, and settles at about
+  0.6 ms by the tenth. The form takes 19.8 ms and the JSON body 23.4 ms the
+  first time, then 1.1 to 1.5 ms and 1.6 to 2.0 ms.

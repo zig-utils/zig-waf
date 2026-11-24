@@ -9,8 +9,8 @@
             .hash = "zig_injection-0.1.0-7QN34L8yCADbOW8gYvKFhQfRT61WgGxTRNgSmUmd64a5",
         },
         .regex = .{
-            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.1.tar.gz",
-            .hash = "zig_regex-0.5.1-omky0eRfJgD3H36kQj4jlWdvdzdTQTTUCAnJrursdkTg",
+            .url = "https://github.com/zig-utils/zig-regex/archive/refs/tags/v0.5.2.tar.gz",
+            .hash = "zig_regex-0.5.2-omky0dCcJgDzo9aqhQ4PqnI-0lyhzmNRqvN9uaVAyDVF",
         },
         // Only the benchmark lab (`zig build lab`) uses it, for its process
         // memory sampler, so nothing else fetches it.
