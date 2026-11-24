@@ -534,7 +534,11 @@ fn validate(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator
     var failures: usize = 0;
     while (args.next()) |path| {
         files += 1;
-        if (!try validateFile(gpa, io, path)) failures += 1;
+        var buffer: [4096]u8 = undefined;
+        var stderr = std.Io.File.stderr().writerStreaming(io, &buffer);
+        const valid = try validateFile(gpa, io, path, &stderr.interface);
+        try stderr.interface.flush();
+        if (!valid) failures += 1;
     }
     if (files == 0) {
         std.debug.print("zig-waf validate: no files given\n", .{});
@@ -544,11 +548,11 @@ fn validate(gpa: std.mem.Allocator, io: std.Io, args: *std.process.Args.Iterator
     if (failures != 0) std.process.exit(1);
 }
 
-/// Validate a single config; returns true when it parses, compiles, and passes
-/// directive validation. Diagnostics are printed to stderr.
-fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
+/// Validate a single config; returns true when it parses, compiles, passes
+/// directive validation, and builds an engine. Diagnostics go to `out`.
+fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8, out: *std.Io.Writer) !bool {
     const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(max_config_bytes)) catch |err| {
-        std.debug.print("{s}: cannot read: {t}\n", .{ path, err });
+        try out.print("{s}: cannot read: {t}\n", .{ path, err });
         return false;
     };
     defer gpa.free(bytes);
@@ -560,7 +564,7 @@ fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
         .diagnostic => |value| {
             const rendered = try waf.seclang.diagnostic.renderHuman(gpa, &parsed.registry, value, .{});
             defer gpa.free(rendered);
-            std.debug.print("{s}", .{rendered});
+            try out.print("{s}", .{rendered});
             return false;
         },
         .document => |document| {
@@ -574,18 +578,37 @@ fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
                 provider = provider_storage.provider();
             }
             const compiled = waf.plan.compileWithProvider(gpa, &parsed.registry, &documents, .{}, provider) catch |failure| {
-                std.debug.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
+                try out.print("{s}: plan compilation failed: {t}\n", .{ path, failure });
                 return false;
             };
             defer compiled.deinit();
             switch (waf.directives.validatePlan(compiled, .full())) {
                 .valid => {
-                    std.debug.print("{s}: ok ({d} rule(s))\n", .{ path, compiled.rules.len });
+                    // Building the engine compiles every operator, which is where a
+                    // pattern zig-regex rejects is found. A plan alone would pass a
+                    // rule set the engine then refuses to load (#89).
+                    var recorder = waf.debug_log.Recorder.init(gpa, .err, .{});
+                    defer recorder.deinit();
+                    var builder = waf.engine.Builder.init(gpa);
+                    builder.setRetainedPlan(compiled);
+                    builder.setDebugLog(&recorder);
+                    const engine = builder.build() catch |err| {
+                        for (recorder.items()) |record| {
+                            if (record.rule_id) |id|
+                                try out.print("{s}: rule {d}: {s}\n", .{ path, id, record.message })
+                            else
+                                try out.print("{s}: {s}\n", .{ path, record.message });
+                        }
+                        try out.print("{s}: cannot build engine: {t}\n", .{ path, err });
+                        return false;
+                    };
+                    engine.deinit() catch unreachable;
+                    try out.print("{s}: ok ({d} rule(s))\n", .{ path, compiled.rules.len });
                     return true;
                 },
                 .diagnostic => |diagnostic| {
                     const location = try compiled.sourceLocation(diagnostic.primary.source, diagnostic.primary.start);
-                    std.debug.print("{s}:{d}:{d}: {s}: {s}\n", .{
+                    try out.print("{s}:{d}:{d}: {s}: {s}\n", .{
                         path,                 location.line,      location.column,
                         diagnostic.code.id(), diagnostic.message,
                     });
@@ -594,4 +617,23 @@ fn validateFile(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !bool {
             }
         },
     }
+}
+
+test "validate refuses a rule set whose operator does not compile" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "good.conf", .data = "SecRule ARGS \"@rx (?i)union.*select\" \"id:1,phase:2,deny\"\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "bad.conf", .data = "SecRule ARGS \"@rx (unterminated\" \"id:2,phase:2,deny\"\n" });
+    const good = try tmp.dir.realPathFileAlloc(std.testing.io, "good.conf", std.testing.allocator);
+    defer std.testing.allocator.free(good);
+    const bad = try tmp.dir.realPathFileAlloc(std.testing.io, "bad.conf", std.testing.allocator);
+    defer std.testing.allocator.free(bad);
+    var report: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer report.deinit();
+    try std.testing.expect(try validateFile(std.testing.allocator, std.testing.io, good, &report.writer));
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "good.conf: ok (1 rule(s))") != null);
+    report.clearRetainingCapacity();
+    try std.testing.expect(!try validateFile(std.testing.allocator, std.testing.io, bad, &report.writer));
+    // The rule is named, not just the error.
+    try std.testing.expect(std.mem.indexOf(u8, report.written(), "rule 2: @rx does not compile") != null);
 }

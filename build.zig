@@ -280,8 +280,12 @@ pub fn build(b: *std.Build) void {
     const sqlite_test_step = b.step("sqlite-test", "Run SQLite backend tests");
     sqlite_test_step.dependOn(&run_sqlite_tests.step);
 
+    const cli_tests = b.addTest(.{ .root_module = cli_module });
+    const run_cli_tests = b.addRunArtifact(cli_tests);
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+    test_step.dependOn(&run_cli_tests.step);
     test_step.dependOn(&run_c_api_tests.step);
     test_step.dependOn(&run_c_smoke.step);
     test_step.dependOn(&run_c_smoke_shared.step);

@@ -1,4 +1,7 @@
-//! Compile and validate deployable CRS files as one ordered configuration.
+//! Compile and validate deployable CRS files as one ordered configuration, and
+//! build an engine from it, so every operator compiles as it will in production.
+//! A CRS rule zig-waf cannot compile fails this step rather than shipping
+//! switched off (#89).
 
 const std = @import("std");
 const waf = @import("waf");
@@ -39,7 +42,11 @@ pub fn main(init: std.process.Init) !void {
         input_bytes += bytes.len;
     }
 
-    const compiled = waf.plan.compile(init.gpa, &registry, documents.items, .{}) catch |failure| {
+    // `@pmFromFile` data is read next to the rule file that names it, as
+    // ModSecurity and Coraza resolve it, so the phrase lists are CRS's own.
+    var data_files: DataFiles = .{ .io = init.io };
+    const provider: waf.plan.DataProvider = .{ .context = &data_files, .readFn = DataFiles.read };
+    const compiled = waf.plan.compileWithProvider(init.gpa, &registry, documents.items, .{}, provider) catch |failure| {
         std.debug.print("ordered CRS plan compilation failed: {t}\n", .{failure});
         return error.CrsPlanCompileFailed;
     };
@@ -56,6 +63,18 @@ pub fn main(init: std.process.Init) !void {
             return error.CrsDirectiveValidationFailed;
         },
     }
+
+    var recorder = waf.debug_log.Recorder.init(init.gpa, .err, .{});
+    defer recorder.deinit();
+    var builder = waf.engine.Builder.init(init.gpa);
+    builder.setRetainedPlan(compiled);
+    builder.setDebugLog(&recorder);
+    const engine = builder.build() catch |failure| {
+        for (recorder.items()) |record| std.debug.print("CRS rule {?d}: {s}\n", .{ record.rule_id, record.message });
+        std.debug.print("ordered CRS engine build failed: {t}\n", .{failure});
+        return error.CrsEngineBuildFailed;
+    };
+    defer engine.deinit() catch unreachable;
     const configuration = waf.directives.Configuration.init(compiled, .full()).configuration;
     std.debug.print(
         "ordered CRS roots={d} files={d} bytes={d} directives={d} rules={d} plan_owned_bytes={d} fingerprint={x}\n",
@@ -90,6 +109,15 @@ fn collectRoot(
         try paths.append(allocator, try std.fs.path.join(allocator, &.{ canonical_root, entry.path }));
     }
 }
+
+const DataFiles = struct {
+    io: std.Io,
+
+    fn read(context: *anyopaque, allocator: std.mem.Allocator, base_dir: []const u8, filename: []const u8) anyerror![]u8 {
+        const self: *DataFiles = @ptrCast(@alignCast(context));
+        return waf.seclang.include.readDataFileAlloc(allocator, self.io, base_dir, base_dir, filename, 8 * 1024 * 1024, false);
+    }
+};
 
 fn isConfiguration(name: []const u8) bool {
     return std.mem.endsWith(u8, name, ".conf") or std.mem.endsWith(u8, name, ".conf.example");

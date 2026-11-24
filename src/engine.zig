@@ -168,7 +168,19 @@ pub const ClockSource = struct {
     }
 };
 
-pub const ConfigError = error{ InvalidLimit, MissingPersistentBackendFeature, InvalidDirectiveConfiguration, InvalidExecutionPlan, MissingRuleReference };
+pub const ConfigError = error{
+    InvalidLimit,
+    MissingPersistentBackendFeature,
+    InvalidDirectiveConfiguration,
+    InvalidExecutionPlan,
+    MissingRuleReference,
+    /// A rule's operator parameter does not compile: an `@rx` pattern zig-regex
+    /// rejects, an `@ipMatch` list that does not parse. ModSecurity and Coraza
+    /// refuse such a rule set at load, and so does zig-waf (#89): accepting it
+    /// would publish a WAF with that rule silently switched off. The rule is named
+    /// in the debug log at level `err`.
+    InvalidOperatorParameter,
+};
 pub const DeinitError = error{TransactionsActive};
 
 pub const Intervention = struct {
@@ -349,11 +361,11 @@ pub const Builder = struct {
             return error.MissingRuleReference;
     }
 
-    fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) std.mem.Allocator.Error!*Waf {
+    fn allocate(self: *const Builder, owned_plan: ?*compiled_plan.Plan) (error{InvalidOperatorParameter} || std.mem.Allocator.Error)!*Waf {
         const waf = try self.allocator.create(Waf);
         errdefer self.allocator.destroy(waf);
         const compiled_operators = if (owned_plan) |value|
-            try compileOperators(self.allocator, value, self.config.plugins)
+            try compileOperators(self.allocator, value, self.config.plugins, self.config.debug_log)
         else
             @as([]CachedOperator, &.{});
         errdefer deinitOperators(self.allocator, compiled_operators);
@@ -433,16 +445,16 @@ const CachedOperator = union(enum) {
     /// produced a value.
     none,
     compiled: runtime_operator.RuntimeOperator,
-    /// The parameter does not compile. Such a rule never matches, as it did when
-    /// the compile was retried, and failed, on every evaluation.
-    invalid,
 };
 
+/// Compile every rule's literal operator parameter, or refuse the rule set when
+/// one does not compile (see `ConfigError.InvalidOperatorParameter`).
 fn compileOperators(
     allocator: std.mem.Allocator,
     plan: *const compiled_plan.Plan,
     plugins: ?*const plugin.Registry,
-) std.mem.Allocator.Error![]CachedOperator {
+    log: ?*debug_log.Recorder,
+) (error{InvalidOperatorParameter} || std.mem.Allocator.Error)![]CachedOperator {
     const compiled = try allocator.alloc(CachedOperator, plan.rules.len);
     @memset(compiled, .none);
     errdefer deinitOperators(allocator, compiled);
@@ -456,8 +468,11 @@ fn compileOperators(
         const operator = runtime_operator.RuntimeOperator.compile(allocator, name, parameter) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             else => {
-                slot.* = .invalid;
-                continue;
+                if (log) |recorder| {
+                    const rule_id: ?u32 = if (rule.external_id) |id| std.math.cast(u32, id) else null;
+                    recorder.print(.err, std.math.cast(u3, rule.phase), rule_id, "@{s} does not compile: {t}", .{ name, err });
+                }
+                return error.InvalidOperatorParameter;
             },
         };
         slot.* = .{ .compiled = operator };
@@ -469,7 +484,7 @@ fn deinitOperators(allocator: std.mem.Allocator, compiled: []CachedOperator) voi
     if (compiled.len == 0) return;
     for (compiled) |*slot| switch (slot.*) {
         .compiled => |*operator| operator.deinit(),
-        .none, .invalid => {},
+        .none => {},
     };
     allocator.free(compiled);
 }
@@ -3069,7 +3084,6 @@ pub const Transaction = struct {
         const shared: ?*const runtime_operator.RuntimeOperator = if (rule_index < self.waf.operators.len)
             switch (self.waf.operators[rule_index]) {
                 .compiled => |*operator| operator,
-                .invalid => return null,
                 .none => null,
             }
         else
@@ -8638,7 +8652,6 @@ test "a WAF compiles every literal operator once" {
         const actual: Expected = switch (waf.operators[index]) {
             .compiled => .compiled,
             .none => .none,
-            .invalid => return error.TestUnexpectedResult,
         };
         try std.testing.expectEqual(expected.cached, actual);
     }

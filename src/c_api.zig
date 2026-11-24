@@ -689,6 +689,9 @@ fn mapError(err: anyerror) Status {
     return switch (err) {
         error.OutOfMemory => .out_of_memory,
         error.InvalidLimit,
+        // A rule set whose operator does not compile is a configuration error,
+        // like the parse and compile errors that already return invalid_config.
+        error.InvalidOperatorParameter,
         error.InvalidInterventionStatus,
         error.InvalidConnectionAddress,
         error.InvalidMethod,
