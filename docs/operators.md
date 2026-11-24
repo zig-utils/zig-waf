@@ -53,6 +53,23 @@ request workers. Create one reusable `Worker` per worker thread so the mutable
 lazy-DFA and NFA caches — which already memoize automaton construction across
 evaluations — are never shared across threads.
 
+Every pattern is compiled with ModSecurity 3.0.16's semantics, which CRS is
+written against (#90): ModSecurity passes `PCRE2_DOTALL | PCRE2_MULTILINE` and
+no `PCRE2_UTF`, and Coraza prepends `(?sm)`. So `.` matches a newline, `^` and
+`$` match at line breaks, and the pattern and input are bytes: `\x{ff}` is the
+byte `0xff`, and `(?i)` folds ASCII letters only (`RegexOperator.default_flags`).
+
+A pattern is compiled with capture groups. When zig-regex refuses that compile
+as too complex, it is compiled again for spans only (#89), and
+`RegexOperator.spans_only` is set. zig-regex refuses a capturing compile when
+the pattern needs its backtracking engine and could backtrack exponentially
+there; without captures, the same pattern runs on its linear engine, which finds
+a match for exactly the same inputs, starting at the same position. Only capture
+field `0`, the whole match, is filled then, and its end can be longer than
+PCRE's, because the linear engine reports the longest match from that start.
+Thirteen CRS 4.28 patterns take this path, most of them Unix command-injection
+rules, and every one of them reads only `TX:0`, in its log message.
+
 - **`@rx`** returns the leftmost match with capture fields `0..9`. Field `0` is
   the full match; fields `1..9` are the first nine parenthesized groups. A
   non-participating optional group is reported as present `false`, distinct from
@@ -71,7 +88,12 @@ evaluations — are never shared across threads.
 Invalid or over-complex patterns are rejected before publication with a
 distinguishable `RegexCompileError` (`InvalidRegexPattern`,
 `RegexProgramTooComplex`, `OutOfMemory`), so a ruleset never publishes a pattern
-that fails at request time. A bounded runtime error — match limit, step limit,
+that fails at request time. `Builder.build` refuses the whole rule set with
+`error.InvalidOperatorParameter` (`ZIG_WAF_ERROR_INVALID_CONFIG` through the C
+ABI) and names the rule in the debug log at level `err`, as ModSecurity and
+Coraza refuse to load it. Before #89 such a rule loaded switched off. `zig-waf
+validate` and `zig build test-crs-configuration` build the engine, so they
+report it too. A bounded runtime error — match limit, step limit,
 or oversized input — is not a match: `RegexOutcome` reports it through
 `runtime_error` and `limit_exceeded`, exactly as ModSecurity sets
 `TX.MSC_PCRE_ERROR` and `TX.MSC_PCRE_LIMITS_EXCEEDED` and does not match.

@@ -84,7 +84,7 @@ the same pinned commits for its parser and inventory tests.
 | `no-rules` | base only | One clean GET: what embedding the engine costs before any rule runs |
 | `crs-get` | CRS PL1 | Five clean browser GETs with seven headers and a cookie |
 | `crs-get-h2` | CRS PL1 | The same GETs with protocol `HTTP/2.0` |
-| `crs-attacks` | CRS PL1 | One attack per family: SQL injection, XSS, path traversal, command injection, PHP wrapper injection |
+| `crs-attacks` | CRS PL1 | One attack per family: SQL injection, XSS, path traversal, command injection, PHP wrapper injection; and `host=x && uname -a`, which only the rules in #89 detect |
 | `crs-form-post` | CRS PL1 | A clean 973-byte urlencoded form |
 | `crs-json-post` | CRS PL1 | A clean 741-byte JSON order, parsed by the JSON body processor |
 | `crs-mixed` | CRS PL1 | Eight clean requests to two attacks, run on 1 and 4 threads sharing one engine |
@@ -172,3 +172,23 @@ row group rather than the absolute times. The single-run tails (p99.9 over
 
 The CRS request path, and the body path above all, is where zig-waf has the most
 to gain, and this lab is the measurement to judge that work by.
+
+### After the rule fixes (#89, #90)
+
+The first run above measured a zig-waf that silently skipped 18 CRS rules,
+because zig-regex could not compile their patterns (#89), and that compiled
+`@rx` without dotall (#90). With both fixed, every CRS rule runs. The same lab on
+the same machine, 2,000 requests per run:
+
+| Scenario | zig-waf f6a40a2 | zig-waf with #89 and #90 | ModSecurity 3.0.16 | Coraza 3.7.0 |
+| --- | ---: | ---: | ---: | ---: |
+| `crs-get` | 1.42 ms | 6.78 ms | 0.85 ms | 0.66 ms |
+| `crs-form-post` | 8.39 ms | 20.40 ms | 1.45 ms | 5.11 ms |
+| `crs-json-post` | 11.09 ms | 95.54 ms | 4.69 ms | 6.69 ms |
+
+p50 per request. All three engines decided every request the same way, including
+`host=x && uname -a`, which zig-waf let through before. The added time is almost
+all five PL1 Unix command-injection rules (932230, 932235, 932250, 932260 and
+932340), which now run for the first time. zig-regex takes 0.5 to 2 ms per search
+on their command lists, where PCRE2 with JIT takes about 25 µs. Making zig-regex
+fast on CRS's patterns is zig-utils/zig-regex#56.
